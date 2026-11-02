@@ -1,0 +1,32 @@
+# ---- 构建产物 ----
+app/build/
+build/
+.gradle/
+.kotlin/
+
+# ---- 可随时整体删除的临时/垃圾目录 ----
+.tmp/
+.work/
+base/
+tools/
+
+# ---- 第三方 jar（wrapper 例外）----
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# ---- 签名材料（每台机器自己生成）----
+*.keystore
+*.jks
+
+# ---- APK 产物 ----
+*.apk
+
+# ---- 本地说明文件（不入库）----
+AGENTS.md
+
+# ---- 系统与编辑器 ----
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+*.log

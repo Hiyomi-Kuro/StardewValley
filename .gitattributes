@@ -1,0 +1,11 @@
+# 文本文件统一 LF；Windows 批处理和 PowerShell 脚本用 CRLF
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# app/src/main 下的游戏内容必须逐字节保真（assets/res/dex/so 等），禁止任何行尾转换
+app/src/main/** -text
+
+# Gradle wrapper 的 jar 是二进制
+gradle/wrapper/gradle-wrapper.jar binary
