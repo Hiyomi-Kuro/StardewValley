@@ -1,0 +1,30 @@
+<Project>
+
+  <!--
+    可选：用"游戏自带的程序集"当参考程序集编译。
+
+    为什么需要：运行时对 BCL 做了 ILLink 裁剪，而且 Android 的 facade 与桌面 net8.0 不一致
+    （实测 `AppContext` / `RuntimeInformation.Architecture` / `RuntimeFeature` 都解析不到）。
+    如果按桌面 net8.0 编译，这些问题只会在**设备运行时**以 TypeLoadException 出现；
+    换成 Android 参考程序集后，同样的引用会在**编译期**报错。
+
+    用法：
+      dotnet build Mod/ModFramework.Runtime -p:AndroidRefsDir=D:\...\.tmp\phase0\refs
+
+    不传 AndroidRefsDir 时行为与普通 net8.0 构建完全一致。
+  -->
+
+  <PropertyGroup Condition="'$(AndroidRefsDir)' != ''">
+    <DisableImplicitFrameworkReferences>true</DisableImplicitFrameworkReferences>
+    <NoStdLib>true</NoStdLib>
+    <NoConfig>true</NoConfig>
+    <!-- 这些是运行时实际形态，编译期不该被 SDK 覆盖 -->
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <EnableDefaultItems>true</EnableDefaultItems>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(AndroidRefsDir)' != ''">
+    <Reference Include="$(AndroidRefsDir)\*.dll" Private="false" />
+  </ItemGroup>
+
+</Project>

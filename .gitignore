@@ -10,6 +10,10 @@ build/
 base/
 tools/
 
+# 例外：Mod Framework 的工具源码要入库（历史遗留的 tools/ 仍然忽略）
+!Tools/
+!Tools/**
+
 # ---- 第三方 jar（wrapper 例外）----
 *.jar
 !gradle/wrapper/gradle-wrapper.jar
@@ -30,3 +34,7 @@ Thumbs.db
 .vscode/
 .idea/
 *.log
+
+# ---- Python 缓存（Tools/ 下的脚本）----
+__pycache__/
+*.pyc

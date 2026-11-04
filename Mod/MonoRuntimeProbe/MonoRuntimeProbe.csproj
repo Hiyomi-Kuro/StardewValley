@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    MonoRuntimeProbe —— Phase 0 的运行时探针。
+
+    设计约束（重要）：
+    1. 目标框架固定 net8.0（游戏运行时是 .NETCoreApp v8.0，见 docs/audit/runtime-feasibility.md）。
+    2. 不引用 StardewValley.dll 等游戏程序集：本机没有参考程序集，
+       而且我们希望探针在"游戏程序集未加载"时也能跑。对游戏类型的访问一律走反射（按名字解析）。
+    3. 不引用 Mono.Android：避免探针只能在 Android 上编译。
+       需要 Android 路径时由调用方（Bootstrap）传入。
+    4. 只依赖 BCL。
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>MonoRuntimeProbe</AssemblyName>
+    <RootNamespace>MonoRuntimeProbe</RootNamespace>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+    <!-- 模组 DLL 需要能被 Assembly.Load(byte[]) 读取；不要裁剪、不要 ReadyToRun -->
+    <PublishTrimmed>false</PublishTrimmed>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <DebugType>portable</DebugType>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <Deterministic>true</Deterministic>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 外部依赖测试：同目录下的第二个程序集 -->
+    <ProjectReference Include="..\MonoRuntimeProbe.Dependency\MonoRuntimeProbe.Dependency.csproj">
+      <Private>true</Private>
+    </ProjectReference>
+  </ItemGroup>
+
+</Project>

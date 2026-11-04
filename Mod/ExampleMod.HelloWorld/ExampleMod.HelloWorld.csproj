@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    最小编译期验证：模组能否**静态引用**游戏程序集里的类型。
+
+    这不是可运行的模组，而是"SDK 地基是否成立"的证据：
+    如果这个工程能用 Android 参考程序集编译通过，说明模组作者可以在
+    Visual Studio / Rider 里直接 `using StardewValley;` 并调用 `Game1`。
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName>ExampleMod.HelloWorld</AssemblyName>
+    <RootNamespace>ExampleMod.HelloWorld</RootNamespace>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+</Project>
