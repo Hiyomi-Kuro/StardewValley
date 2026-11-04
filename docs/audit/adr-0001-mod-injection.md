@@ -1,8 +1,8 @@
 # ADR-0001：模组注入点与运行时路线
 
-- 状态：**Proposed**（Phase 0 结论，待真机实验 E1–E6 转 Accepted）
-- 日期：2026-11-04
-- 关联：`docs/audit/runtime-feasibility.md`、`docs/audit/decompile-report.md`
+- 状态：**Proposed**（Phase 0 结论 + Phase 0.5 复核；转 Accepted 的门槛见 §6，尚未满足）
+- 日期：2026-11-04（Phase 0.5 复核：2026-11-05）
+- 关联：`docs/audit/runtime-feasibility.md`、`docs/audit/decompile-report.md`、`docs/audit/phase0.5-report.md`
 - 决策者：Phase 0 审计
 
 ---
@@ -38,8 +38,16 @@
 
 ### D1. 采用 Route A（动态 IL）为主路线，Harmony 为可选增强（Route D 形态）
 
-- Loader 通过 `Assembly.Load(byte[])` 加载用户 DLL，依赖 MonoVM 的 JIT 执行。
+- Loader 通过 **`Assembly.LoadFrom(string)`** 加载用户 DLL，依赖 MonoVM 的 JIT 执行。
+  - **已完成决策 (2026-11-04 装机实测，Phase 0.5 复核)**：`Assembly.LoadFrom(string)` 是唯一可用入口；
+    同一路径下 `Assembly.Load(byte[])` 在本 APK 的 ILLink 裁剪后**不存在**（编译期 CS1503，
+    设备上 `MissingMethodException`，见 `runtime-feasibility.md` §6.5、`phase0-status.md` §3.15）。
+  - **被否决方案**：`Assembly.Load(byte[])` 只保留为历史记录与复现开关
+    （`ModInjector --loader-api load`），不得再作为实现方案。
+  - 架构后果：模组 DLL 必须是**磁盘上可读的文件**（`Mods/`），因此 `Bootstrap.Start()` 先 `File.Exists` 再 `LoadFrom`；
+    "从内存字节加载"在这个运行时不可用。
 - Harmony **默认关闭**；开启时按 H1（选择性 JIT detour）→ H2（构建期去 AOT）递进，任一步失败必须能整体回退，且不得影响 Events/Content/Data/Config/Reflection API。
+  - Phase 0 实测已把 H1 判死（缺 `Reflection.Emit`），详见 §6.1 与 `runtime-feasibility.md` §7.2。
 
 ### D2. 注入点在托管侧：`StardewValley.MainActivity.OnCreatePartTwo` 首行
 
@@ -83,8 +91,16 @@
 - 新增 `ModFramework.Bootstrap`（自包含，仅用 BCL）；
 - 在 `MainActivity.OnCreatePartTwo` **首条指令前**插入 `call Bootstrap.Start()`；
 - 强制更新 MVID（否则 AOT 镜像/缓存会认为程序集未变）；
-- `Start()` 的逻辑：`Mods/ModFramework.Runtime.dll` 存在 → `Assembly.Load(bytes)` → 反射调 `Loader.Start()`，
-  整段包在 `catch (Exception) {}` 里，**任何失败都不影响游戏启动**。
+- `Start()` 的逻辑（与 `Tools/ModInjector/Program.cs` 的 `EmitBootstrap` 一一对应）：
+  `Mods/ModFramework.Runtime.dll` 存在 → `Assembly.LoadFrom(path)` → `Assembly.GetType("ModFramework.Runtime.Loader")`
+  → `GetMethod("Start")` → `Invoke(null, null)`。每一步失败都抛**带阶段号**的异常
+  （`stage-1:file-missing` / `stage-2:assembly-null` / `stage-3:type-null` / `stage-4:method-null`）；
+  stage-5 在 `Loader.Start()` 返回**非 null** 时把该字符串当异常抛出。
+  整段包在 `catch (Exception) { }` 里，**任何失败都不影响游戏启动**。
+- 该 catch 同时意味着：正式构建里阶段异常**不会进 logcat**。诊断需要
+  `--no-catch`（catch 里 `rethrow`，会以 `JavaProxyThrowable` 出现），见 §6.1 与 `phase0.5-report.md` §6。
+- 默认 `--loader-api loadfrom`（2026-11-05 修正：此前默认是已不可用的 `load(byte[])`，
+  会让默认构建在 `Start()` 的 JIT 阶段失败并被 catch 吞掉，表现为"模组装不上但游戏正常"）。
 
 代价：`StardewValley.dll` 被改动 → 其 AOT 镜像失效 → 回退 JIT（§5.2 已列）。
 
@@ -201,6 +217,20 @@ S1 优先：它修正的正是被校验的那个字段，且若不生效可以�
 
 → E1/E2 尚未在 **ARM64 真机**复现，Phase 1 仍不启动。
 
+### 6.2 Phase 0.5 复核结论（2026-11-05）
+
+| 门槛 | 状态 | 说明 |
+| --- | --- | --- |
+| E1 动态加载 + IL 执行 | 模拟器 PASS / 真机 **BLOCKED** | 目前只有 MuMu 12（x86_64 + `libnb.so` 翻译）；无物理 ARM64 设备（见 `phase0.5-report.md` §7） |
+| E2 反射访问 `Game1` | 模拟器 PASS / 真机 **BLOCKED** | 同上；统计数字（576 方法 / 532 字段）是模拟器反射结果，不可外推 |
+| E3 事件钩子 | 间接 PASS（模拟器） | 仅有"注入点执行 + 事件用例"的证据，未做 tick/day 驱动 |
+| E4 去 AOT 回退 | NOT RUN | 已被 E5 结论取代（JIT 本就在，缺的是 `Reflection.Emit`） |
+| E5 Harmony | FAIL（当前工具链） | 见 §6.1；缺 `Reflection.Emit` + 缺 AArch64 指令缓存刷新手段 |
+| E6 独立管理器存储通道 | NOT RUN | 需第二台设备或 Android 14 |
+
+**因此 ADR 维持 Proposed**：§6 第 1、2 条要求"真机"，当前证据只到模拟器。
+不得因为模拟器通过而改 Accepted。
+
 ---
 
 ## 7. 外部参考、先例与许可证
@@ -228,3 +258,15 @@ S1 优先：它修正的正是被校验的那个字段，且若不生效可以�
 1. 不引入完整 SMAPI 源码树（LGPL 传染性与体积都不划算）；SDK 的 API 形状自行实现。
 2. 若后续需要 Harmony，以 **NuGet 引用 MIT 包**的方式引入 `0Harmony.dll`，并随包附带 LICENSE。
 3. 文档中凡引用外部结论（如 profiled AOT 默认值、先例可用性）必须标注"外部参考，未独立验证"。
+
+---
+
+## 8. 变更记录
+
+| 日期 | 阶段 | 改了什么 | 为什么 / 证据 |
+| --- | --- | --- | --- |
+| 2026-11-04 | Phase 0 | 初版：D1 选 `Assembly.Load(byte[])`；D3 计划新增程序集条目 | 当时只有静态审计 |
+| 2026-11-04 | Phase 0 | D3 追加修订：改为"Bootstrap 合并进 `StardewValley.dll`" | 装机实测被 `libmonodroid` 的大小校验拒绝（§D3 追加修订） |
+| 2026-11-05 | Phase 0.5 | D1 改为 `Assembly.LoadFrom(string)`，`Load(byte[])` 降级为历史/否决方案 | 源码（`Loader.cs`、`ModInjector` 注入的 IL）与设备异常都只走 `LoadFrom`；`Load(byte[])` 在裁剪后的运行时不存在 |
+| 2026-11-05 | Phase 0.5 | D3 的 `Start()` 描述改为与注入 IL 一致的 5 阶段 + 吞异常语义；补充"默认 `--loader-api loadfrom`" | `Tools/ModInjector/Program.cs` 默认值曾是 `load(byte[])`（缺陷，已修）；见 `phase0.5-report.md` §5 |
+| 2026-11-05 | Phase 0.5 | 新增 §6.2 复核表：E1/E2 只在模拟器通过，ADR 维持 Proposed | 本机只有 x86_64 模拟器；真机 E1/E2 = BLOCKED |

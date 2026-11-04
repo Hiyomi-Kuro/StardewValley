@@ -23,6 +23,12 @@
     verify  <blob> [--expect <name>=<sha256> ...]
                                          结构校验 + 可选的内容哈希校验
     selftest <blob>                      LZ4 编解码往返自测（58 条全过）
+
+通用选项：
+    --manifest <path>   assemblies.manifest 路径（默认与 blob 同目录）
+    --blob-id <id>      清单里的 Blob ID（000=主存储，001=架构存储）。
+                        省略时按"清单行数 == entry_count"自动判定；
+                        判定不唯一时直接报错，不会退回默认值。
 """
 
 import hashlib
@@ -138,9 +144,10 @@ def lz4_compress(src: bytes) -> bytes:
 # --------------------------------------------------------------------------- store
 
 class Store:
-    def __init__(self, path, manifest=None):
+    def __init__(self, path, manifest=None, store_id=None):
         self.path = path
         self.manifest = manifest
+        self.store_id = store_id
         self.data = open(path, "rb").read()
         d = self.data
         magic, self.version, self.entry_count, self.total_count = struct.unpack_from("<IIII", d, 0)
@@ -176,7 +183,7 @@ class Store:
             return lz4_decompress(p[12:], ulen), idx
         return p, None
 
-    def names(self):
+    def manifest_rows(self):
         mpath = self.manifest or os.path.join(os.path.dirname(os.path.abspath(self.path)), MANIFEST)
         rows = []
         if os.path.exists(mpath):
@@ -185,8 +192,42 @@ class Store:
                 if len(parts) != 5 or parts[0] == "Hash":
                     continue
                 rows.append((parts[2], int(parts[3]), parts[4]))
-        rows.sort(key=lambda r: (r[0], r[1]))
-        return [r[2] for r in rows if r[0] == "000"]
+        return rows
+
+    def names(self):
+        """本存储的条目名，按条目下标排序。
+
+        必须按清单的 Blob ID 过滤：架构存储（001）的第一个条目是
+        System.Collections.Concurrent，而不是主存储（000）的
+        _Microsoft.Android.Resource.Designer。以前写死 "000"，导致
+        extract 架构 blob 时把 System.Private.CoreLib 写成前者的文件名
+        （内容与文件名不符的静默错标）。
+        """
+        rows = self.manifest_rows()
+        if not rows:
+            return []
+        store_id = self.store_id
+        if store_id is None:
+            counts = {}
+            for sid, _, _ in rows:
+                counts[sid] = counts.get(sid, 0) + 1
+            matches = [sid for sid, n in counts.items() if n == self.entry_count]
+            if len(matches) != 1:
+                raise ValueError(
+                    "cannot infer manifest store id for entry_count=%d (per-id row counts: %s); "
+                    "pass --blob-id" % (self.entry_count, sorted(counts.items())))
+            store_id = matches[0]
+        selected = [(idx, name) for sid, idx, name in rows if sid == store_id]
+        if not selected:
+            raise ValueError("no manifest rows for store id " + str(store_id))
+        if len(selected) != self.entry_count:
+            raise ValueError(
+                "store %s has %d manifest rows but the blob has %d entries; wrong --blob-id?"
+                % (store_id, len(selected), self.entry_count))
+        selected.sort()
+        if [i for i, _ in selected] != list(range(len(selected))):
+            raise ValueError("manifest indices for store %s are not contiguous" % store_id)
+        return [name for _, name in selected]
 
     def rebuild(self, replacements):
         """replacements: {entry_index: raw_bytes}；返回新的 blob 字节。"""
@@ -234,9 +275,14 @@ def cmd_list(store):
 def cmd_extract(store, outdir):
     os.makedirs(outdir, exist_ok=True)
     names = store.names()
+    if names and len(names) != store.entry_count:
+        raise SystemExit("manifest names (%d) != store entries (%d); refusing to mislabel"
+                         % (len(names), store.entry_count))
     for e in store.entries:
         raw, _ = store.decode(e)
-        nm = names[e["index"]] if e["index"] < len(names) else "entry%02d" % e["index"]
+        if names and raw[:2] != b"MZ":
+            raise SystemExit("entry %d is not a PE; refusing to write it" % e["index"])
+        nm = names[e["index"]] if names else "entry%02d" % e["index"]
         path = os.path.join(outdir, nm + ".dll")
         open(path, "wb").write(raw)
         print("%-46s %9d bytes sha256=%s" % (nm, len(raw), hashlib.sha256(raw).hexdigest()[:16]))
@@ -311,16 +357,21 @@ def cmd_selftest(store):
 def main(argv):
     argv = list(argv)
     manifest = None
+    store_id = None
     if "--manifest" in argv:
         i = argv.index("--manifest")
         manifest = argv[i + 1]
+        del argv[i:i + 2]
+    if "--blob-id" in argv:
+        i = argv.index("--blob-id")
+        store_id = argv[i + 1]
         del argv[i:i + 2]
 
     if len(argv) < 3:
         print(__doc__)
         return 2
     cmd, blob = argv[1], argv[2]
-    store = Store(blob, manifest)
+    store = Store(blob, manifest, store_id)
     if cmd == "list":
         cmd_list(store)
         return 0

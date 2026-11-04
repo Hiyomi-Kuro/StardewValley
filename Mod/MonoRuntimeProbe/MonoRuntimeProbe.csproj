@@ -20,7 +20,7 @@
     <AssemblyName>MonoRuntimeProbe</AssemblyName>
     <RootNamespace>MonoRuntimeProbe</RootNamespace>
     <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
-    <!-- 模组 DLL 需要能被 Assembly.Load(byte[]) 读取；不要裁剪、不要 ReadyToRun -->
+    <!-- 模组 DLL 由 Assembly.LoadFrom(string) 从磁盘加载；不要裁剪、不要 ReadyToRun -->
     <PublishTrimmed>false</PublishTrimmed>
     <PublishReadyToRun>false</PublishReadyToRun>
     <DebugType>portable</DebugType>

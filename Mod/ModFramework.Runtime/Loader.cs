@@ -5,8 +5,12 @@ namespace ModFramework.Runtime;
 /// <summary>
 /// Bootstrap 通过反射调用的入口：<c>ModFramework.Runtime.Loader.Start()</c>。
 ///
-/// 约定：**成功返回 null，失败返回诊断字符串**（Bootstrap 会把非 null 变成异常抛出，
-/// 这样消息不会被 TargetInvocationException 吞掉）。
+/// 返回契约（Bootstrap 依赖它）：
+///   * **成功 → 返回 null**；
+///   * **有探测项失败 → 返回诊断字符串**，Bootstrap 会把它包成异常。
+/// 两种情况下完整报告都会写到 <c>&lt;自身目录&gt;/loader-report.txt</c>，
+/// 因为正式构建里 Bootstrap 的 catch 会吞掉异常（不能让模组问题挡住游戏启动），
+/// 只靠异常消息在默认构建里是取不到诊断的。
 ///
 /// 结构上刻意"每个 BCL 依赖一个独立方法"：如果某个 API 被 ILLink 裁剪，
 /// 只有那一个方法的 JIT 会失败，异常在调用点被 catch 住，其余探测照常进行——
@@ -17,25 +21,27 @@ public static class Loader
     public static string? Start()
     {
         var report = "";
-        report += Probe("locate", LocateSelf);
-        report += Probe("mods-exists", ModsExists);
-        report += Probe("write-log", WriteLog);
-        report += Probe("probe-run", RunProbe);
+        var ok = true;
+        ok &= Probe("locate", LocateSelf, ref report);
+        ok &= Probe("mods-exists", ModsExists, ref report);
+        ok &= Probe("write-log", WriteLog, ref report);
+        ok &= Probe("probe-run", RunProbe, ref report);
 
-        // 诊断构建：无论成败都把报告带回去，让 Bootstrap 抛出来，logcat 就能看到。
-        // 等确认哪些 API 存活后，改成"成功返回 null"。
-        return "loader-report: " + report;
+        var saveNote = SaveReport(report);
+        return ok ? null : "loader-report: " + report + saveNote;
     }
 
-    private static string Probe(string name, Func<string> body)
+    private static bool Probe(string name, Func<string> body, ref string report)
     {
         try
         {
-            return name + "=" + body() + "; ";
+            report += name + "=" + body() + "; ";
+            return true;
         }
         catch (Exception ex)
         {
-            return name + "!=" + ex.GetType().Name + ": " + ex.Message + "; ";
+            report += name + "!=" + ex.GetType().Name + ": " + ex.Message + "; ";
+            return false;
         }
     }
 
@@ -67,6 +73,21 @@ public static class Loader
         File.WriteAllText(Path.Combine(BaseDir(), "loader.log"),
             "loader-entered " + DateTimeOffset.Now.ToString("O") + Environment.NewLine + "self=" + Where());
         return "ok";
+    }
+
+    /// <summary>把完整探测报告落盘；写失败只作为附注返回，不改变成功/失败判定。</summary>
+    private static string SaveReport(string report)
+    {
+        try
+        {
+            File.WriteAllText(Path.Combine(BaseDir(), "loader-report.txt"),
+                "loader-report " + DateTimeOffset.Now.ToString("O") + Environment.NewLine + report);
+            return "";
+        }
+        catch (Exception ex)
+        {
+            return " (report-save-failed: " + ex.GetType().Name + ": " + ex.Message + ")";
+        }
     }
 
     private static string RunProbe()

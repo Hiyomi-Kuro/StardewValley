@@ -201,7 +201,8 @@ internal static class IlChecks
                 return (pop, push);
             }
             case Code.Castclass:
-                return (0, 0);
+                // castclass pops one object reference and pushes one reference.
+                return (1, 1);
             case Code.Dup:
                 return (1, 2);
             case Code.Newobj:

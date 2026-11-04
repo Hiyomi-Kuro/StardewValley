@@ -4,9 +4,13 @@
 - 目标产物：`docs/audit/runtime-feasibility.md`
 - 版本绑定：`com.chucklefish.stardewvalley` 1.6.15.0 (versionCode 239)
 - 报告状态：**静态审计完成；运行时实验已在模拟器上完成 E1/E2，真机复现待做**
-  （见 `phase0-status.md` §3.22/§3.23）
-- 生成时间：2026-11-04
-- 证据根目录：`.tmp/phase0/evidence/`（本机，可重建，见 §11）
+  （见 `phase0-status.md` §3.22/§3.23；Phase 0.5 复核见 `phase0.5-report.md`）
+- 生成时间：2026-11-04（Phase 0.5 修订：2026-11-05）
+- 证据根目录：`.tmp/phase0/evidence/`（**已不在本机**，见下）
+
+> 证据可得性（Phase 0.5 标注）：本报告写于 2026-11-04，所引用的 `.tmp/phase0/` 目录已在后续清理中删除。
+> 文中所有【观测】仍是对当时日志/字节的忠实记录，但**当前无法用原始文件复核**；
+> 需要重新取证的部分，以 `phase0.5-evidence-index.md` 的"可复核/不可复核"标注为准。
 
 > 本报告区分三类结论：**【观测】** 直接来自文件字节/符号/元数据；**【推断】** 由观测按已知运行时语义推导，未在设备上执行验证；**【未知】** 当前无证据。
 > 任何标为【推断】的运行时能力，在真机实验完成前都不得当作"已通过"。
@@ -462,7 +466,11 @@ Failed to load AOT module '%s' while running in aot-only mode because a dependen
 > 这条修订很重要：最初以为"去 AOT 就能让 Harmony 用起来"，实测后发现 JIT 本来就在、
 > 真正缺的是 `Reflection.Emit`。也就是说 **H2 无论怎么做都不可能让 Harmony 工作**。
 
-## 6.5 破坏性发现：`Assembly.Load(byte[])` 在运行时**不存在**（真机、已证明 APK 身份）
+## 6.5 破坏性发现：`Assembly.Load(byte[])` 在运行时**不存在**（MuMu 模拟器、已证明 APK 身份）
+
+> 标题修正（Phase 0.5）：原文写作"真机"，但当时唯一的设备是 MuMu 12 模拟器
+> （x86_64 + `libnb.so`，`dumpsys` 与 `getprop` 见 `phase0.5-report.md` §7）。
+> 结论本身（该方法在本运行时不存在）另有编译期证据支撑，与设备无关。
 
 在"注入已确认执行"（§3.13 的 `bootstrap-ran` 证据）之后，用带身份证明的部署流程
 （`Tools/deploy-apk.ps1`，设备端 `sha256sum $(pm path …)` 与本地产物一致）
@@ -529,7 +537,6 @@ drwxrws---  10126  1078  /sdcard/Android/data/com.chucklefish.stardewvalley
 ## 9. 技术决策
 
 ### 9.1 路线选择
-
 **Route A（支持动态 IL）→ 主路线**，同时保留 Route D 的兼容形态。
 
 依据：
@@ -543,17 +550,24 @@ drwxrws---  10126  1078  /sdcard/Android/data/com.chucklefish.stardewvalley
 
 ```
 APK 构建期（一次性，由本工程完成）
-  ├─ ModFramework.Bootstrap.dll   → 写入 assemblies 存储（新增条目）
+  ├─ ModFramework.Bootstrap 类型 → 合并进 StardewValley.dll 自身（Cecil，不新增容器条目）
+  │     （Phase 0 曾计划新增 assemblies 条目，已否决，见 ADR-0001 D3）
   └─ StardewValley.dll 的 MainActivity.OnCreatePartTwo 首行插入 call Bootstrap.Start()
 
 运行时（每次启动）
-  Bootstrap.Start()
-    ├─ 读 Mods/ 目录（app 专属外部目录）
-    ├─ 解析 manifest.json → 依赖拓扑 → 状态机
-    ├─ Assembly.Load(File.ReadAllBytes(mod.dll))   ← 依赖 JIT
-    ├─ 反射找 EntryClass / Mod 子类 → Entry(helper)
-    └─ 事件总线（由框架自身的 tick 钩子驱动）
+  Bootstrap.Start()            ← 已实现（合并进 StardewValley.dll 的 IL）
+    ├─ File.Exists(Mods/ModFramework.Runtime.dll)
+    ├─ Assembly.LoadFrom(path)                       ← 唯一可用加载入口（不是 Load(byte[])）
+    ├─ 反射取 ModFramework.Runtime.Loader::Start 并 Invoke
+    └─ Loader.Start()          ← 已实现（Phase 0 版本）
+         ├─ 写 loader.log / loader-report.txt
+         ├─ 可选：加载并执行 MonoRuntimeProbe（探针，产出 probe.txt）
+         └─ 解析 manifest.json → 依赖拓扑 → 模组入口调用     ← **尚未实现（Phase 1）**
 ```
+
+> 【未实现】上面的"解析 manifest / 依赖拓扑 / 模组入口调用 / 事件总线"是 Phase 1 目标，
+> 当前代码**没有**任何模组入口发现或调用逻辑：`ExampleMod.HelloWorld` 只用于编译期验证，
+> Runtime 只会加载探针。Phase 0.5 的调用链审计结论见 `phase0.5-report.md` §4。
 
 **为什么改 `StardewValley.dll` 而不改 dex**：改 dex 需要 d8 工具链与新类；改托管 IL 只需 Mono.Cecil，而且项目已具备"重打包 → 签名"的完整流水线（AGENTS.md §4）。
 
@@ -568,16 +582,21 @@ APK 构建期（一次性，由本工程完成）
 
 ## 10. 待完成的实验（Phase 0 阻塞项）
 
-| ID | 目的 | 方法 | 通过标准 | 状态 |
-| --- | --- | --- | --- | --- |
-| E1 | 动态程序集加载 + IL 执行 | 注入 `ModRuntimeProbe.dll`，`Assembly.Load(bytes)`，调用静态/实例/泛型方法 | 日志出现三段返回值 | 待设备 |
-| E2 | 反射访问游戏类型 | `probe` 反射 `StardewValley.Game1`，读一个静态字段/调用无副作用方法 | 返回预期值 | 待设备 |
-| E3 | 事件钩子可行性 | 在 `OnCreatePartTwo` 前后打点，验证 tick/day 事件可被驱动 | 事件按序触发 | 待设备 |
-| E4 | 去 AOT 回退 | 移除 `libaot-StardewValley.dll.so` 重打包 | 游戏启动到标题界面；记录启动耗时/内存 | 待设备 |
-| E5 | Harmony Prefix/Postfix/Original | `HarmonyDemo` 对 JIT 方法与 AOT 方法各打一次 | JIT 通过；AOT 明确失败并给出诊断 | 待设备 |
-| E6 | 独立管理器存储通道 | SAF / 共享目录 / 游戏端导入三条路径 | 至少一条在 Android 12 + Android 14 真机可用 | 待设备 |
+> Phase 0.5 状态更新（2026-11-05）：下表"状态"列是 Phase 0 早期的"待设备"。
+> 实际结果：E1/E2 = **模拟器 PASS / 真机 BLOCKED**；E3 = 模拟器间接 PASS；
+> E4 = NOT RUN（被 E5 取代）；E5 = 当前工具链 FAIL；E6 = NOT RUN。
+> 逐项证据见 `phase0.5-report.md` §7 与 §9 状态矩阵。
 
-> 当前环境只有模拟器（x86_64 + ARM 翻译），E1–E6 的结论在真机上可能不同。**在真机通过前，本报告不得宣称任何运行时能力"已实现"。**
+| ID | 目的 | 方法 | 通过标准 | 状态（Phase 0.5 复核） |
+| --- | --- | --- | --- | --- |
+| E1 | 动态程序集加载 + IL 执行 | 注入探针，`Assembly.LoadFrom(path)` + `Loader.Start()`，调用静态/实例/泛型方法 | 日志出现三段返回值 | 模拟器 PASS / 真机 BLOCKED |
+| E2 | 反射访问游戏类型 | `probe` 反射 `StardewValley.Game1`，枚举类型/成员（只读） | 返回预期值 | 模拟器 PASS / 真机 BLOCKED |
+| E3 | 事件钩子可行性 | 在 `OnCreatePartTwo` 前后打点，验证 tick/day 事件可被驱动 | 事件按序触发 | 模拟器间接 PASS（仅注入点 + 事件用例） |
+| E4 | 去 AOT 回退 | 移除 `libaot-StardewValley.dll.so` 重打包 | 游戏启动到标题界面；记录启动耗时/内存 | NOT RUN（JIT 本来就在，无必要） |
+| E5 | Harmony Prefix/Postfix/Original | `HarmonyDemo` 对 JIT 方法与 AOT 方法各打一次 | JIT 通过；AOT 明确失败并给出诊断 | FAIL（缺 `Reflection.Emit`；原生 detour 崩溃 T12） |
+| E6 | 独立管理器存储通道 | SAF / 共享目录 / 游戏端导入三条路径 | 至少一条在 Android 12 + Android 14 真机可用 | NOT RUN（需真机） |
+
+> 当前环境只有模拟器（x86_64 + `libnb.so` 翻译），E1–E6 的结论在真机上可能不同。**在真机通过前，本报告不得宣称任何运行时能力"已实现"。**
 
 ---
 
@@ -615,3 +634,15 @@ StardewValley.dll 587ff5ff9c258679004977bbeec359aba86649bd3e4860ddcaa428df8f07e0
 5. `application_config` 前 12 字节的精确字段序（当前按已知 layout 对齐，`uses_mono_aot=1` 可信，其余布尔位含义待与官方头文件比对）。
 6. 真机上的 JIT/AOT 行为（模拟器结论不可外推）。
 7. Android 14+ 对 `Android/data` 的访问策略（影响 E6 方案选择）。
+
+---
+
+## 13. 变更记录（Phase 0.5，2026-11-05）
+
+| 位置 | 改动 | 原因 |
+| --- | --- | --- |
+| 页首 | 增加"证据可得性"说明 | `.tmp/phase0/evidence/*` 已删除，不能继续声称可复核 |
+| §6.5 标题 | "真机" → "MuMu 模拟器" | 当时设备是 x86_64 模拟器 + `libnb.so`，不是 ARM64 真机 |
+| §9.2 | 架构图改为真实实现：Bootstrap 合并进 `StardewValley.dll`；`Assembly.LoadFrom`；标注 manifest/入口/事件未实现 | 原图写的是"新增程序集条目 + `Load(byte[])`"，与 ADR D3 和源码都不一致 |
+| §10 | 状态列填入 Phase 0.5 复核结果（模拟器/真机分开） | 原文一律"待设备"，与 §3.22/§3.23 已通过的结论矛盾 |
+| §11 | 未改动，但表格里的 `.tmp/phase0/*` 路径已失效 | 保留为历史；重建脚本不存在，见 `phase0.5-evidence-index.md` |

@@ -80,6 +80,11 @@ payload      : 'XALZ' + u32 descriptor_index + u32 uncompressed_length + LZ4 blo
 | `StardewValley.Mobile.MobileDisplay` | — | `SetupDisplaySettings()` |
 | `Microsoft.Xna.Framework.GameComponent` / `GameTime` | — | MonoGame 基类，`Run()` 启动主循环 |
 
+> 口径说明（Phase 0.5）：上表的"方法/字段"是**按类型自身声明**统计的；
+> 探针 T07 报的 `Game1 576 方法 / 532 字段` 是**反射枚举**（`GetMethods/GetFields` +
+> `NonPublic|Instance|Static`，包含继承成员）。两者不是同一口径，**不要互相引用或当成矛盾**。
+> 差异逐项归属未复核。
+
 ---
 
 ## 5. 启动调用链（IL 级）

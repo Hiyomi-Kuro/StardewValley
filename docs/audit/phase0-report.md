@@ -1,9 +1,11 @@
 # Phase 0 结论备忘（一页版）
 
-- 日期：2026-11-04
+- 日期：2026-11-04（Phase 0.5 复核：2026-11-05）
 - 范围：星露谷 Android 1.6.15.0（`com.chucklefish.stardewvalley`，versionCode 239）
 - 状态：**Phase 0 交付完成；Phase 1 未启动（门控未满足）**
 - 详细过程：`phase0-status.md`（40 KB，按轮次记录，含全部失败路径）
+- 证据可得性：本页引用的 `.tmp/phase0/evidence/*` 已不在本机（`.tmp/` 被清空）。
+  数字与结论来自当时的记录，**当前无法用原始日志复核**；详见 `phase0.5-evidence-index.md` §1。
 
 ---
 
@@ -15,7 +17,7 @@
 
 ---
 
-## 2. 能力矩阵（全部为设备实测）
+## 2. 能力矩阵（**MuMu 12 模拟器**实测：x86_64 + ARM 翻译；不是真机）
 
 | 能力 | 结论 | 证据 |
 | --- | --- | --- |
@@ -118,3 +120,16 @@
 - 设备：MuMu 12 模拟器，Android 12 / API 32，x86_64 + ARM 翻译层。**非真机**。
 - 本机：无 .NET SDK（用项目内私有 SDK `.tmp/phase0/dotnet`）、无 Ghidra、无 NDK。
 - 仓库：所有改动在工作区未提交；`.tmp/` 已 gitignore；原版 APK 与 blob 未改动。
+
+---
+
+## 8. 变更记录（Phase 0.5，2026-11-05）
+
+| 改动 | 原因 |
+| --- | --- |
+| §2 标题改为"MuMu 12 模拟器实测" | 原文"全部为设备实测"容易被读成真机结论 |
+| 页首增加"证据可得性"说明 | `.tmp/phase0/evidence/*` 已不存在，数字不能声称可复核 |
+| 复核 `Assembly.LoadFrom` / `Load(byte[])` 的表述 | 与 `Loader.cs`、`ModInjector` 注入 IL 对齐（见 `phase0.5-report.md` §4） |
+
+本页其余结论（MonoVM 版本、AOT `normal`、65 个程序集、T12 崩溃、`Reflection.Emit` 缺失）
+未发现与源码/文档冲突，但原始日志已缺失，统一按"记录在案、待真机复核"处理。

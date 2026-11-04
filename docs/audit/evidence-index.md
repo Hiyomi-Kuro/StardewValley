@@ -1,12 +1,26 @@
 # 证据索引（Phase 0）
 
+> ## 证据可得性（Phase 0.5，2026-11-05）
+>
+> **本页列出的 `.tmp/phase0/...` 全部已不在本机**（`.tmp/` 被清空；它本来就在 `.gitignore` 里）。
+> 因此：
+> 1. 下表的路径是**历史记录**，不是可打开的文件；
+> 2. "重建全部本机证据"的脚本（`extract_assemblies.py`、`xa_reloc.py` 等）**也一并丢失**，
+>    当前无法按原样重放；
+> 3. 与之相关的数字（MonoVM 版本、65 个程序集、AOT `normal`、APK/blob 哈希、探针 8/8 PASS）
+>    只能当"当时的记录"引用，**不要再写成"可复核"**；
+> 4. Phase 0.5 重新取证并**可复核**的部分，见 `phase0.5-evidence-index.md`。
+>
+> 原始 APK、`assemblies*.blob`、`jniLibs` 仍在仓库里，所以程序集提取/容器校验这类
+> **从仓库输入可重建**的证据可以重新生成（Phase 0.5 已重做，见 `phase0.5-evidence-index.md` §2）。
+
 所有证据分三类存放：
 
 - **入库（git）**：`docs/audit/`、`Mod/`（源码与文档）
-- **本机、可重建**：`.tmp/phase0/`（脚本、提取物、日志；`.tmp/` 已 gitignore）
+- **本机、可重建**：`.tmp/phase0/`（脚本、提取物、日志；`.tmp/` 已 gitignore）— **现已丢失**
 - **外部引用**：报告里标注 URL 的网页（未独立复现的，一律标注"外部参考"）
 
-重建全部本机证据：
+重建全部本机证据（**脚本已不在，以下命令仅作历史记录**）：
 
 ```powershell
 $py = "<python with dnfile>"
@@ -17,6 +31,17 @@ python  .tmp/phase0/work/dump_strings.py <file>    # 全量字符串
 python  .tmp/phase0/work/xa_aotmode.py             # AOT 模式名 + rodata
 python  .tmp/phase0/work/xa_reloc.py               # 重定位解析（决定性证据）
 python  .tmp/phase0/work/mk_dexapk.py              # 生成 dex-only APK 供 JADX
+```
+
+现在**仍然可用**的等价入口（Phase 0.5 建立）：
+
+```powershell
+# 65 个程序集（58 主存储 + 7 架构存储），按清单正确命名
+python Tools/AssemblyStore/store.py extract app/src/main/apkroot/assemblies/assemblies.blob <out> --manifest app/src/main/apkroot/assemblies/assemblies.manifest
+python Tools/AssemblyStore/store.py extract app/src/main/apkroot/assemblies/assemblies.arm64_v8a.blob <out> --manifest app/src/main/apkroot/assemblies/assemblies.manifest
+
+# 注入器 + 容器链的离线回归（27 项）
+python Tools/tests/test_mod_pipeline.py
 ```
 
 ---
@@ -39,6 +64,16 @@ libxamarin-app    11384d74daa734ed5b11cbf048978686c7afbb2a7f3224df53609805035132
 libmonodroid      0a9e1e9cd54d7f4375aa6dec1fa227a6116450b9f90af1ee2e01f3f0bf6c8f65
 StardewValley.dll 587ff5ff9c258679004977bbeec359aba86649bd3e4860ddcaa428df8f07e047
 ```
+
+Phase 0.5 复核：
+
+- `assemblies.blob` 的 `c8ee504e…` **可复核**（仓库文件，Phase 0.5 重新算过，一致）；
+- `StardewValley.dll` 的 `587ff5ff…` **已复核一致**：Phase 0.5 从 blob 条目 10
+  （`descriptor_index=7`）解出 9,280,000 字节，SHA-256 与记录完全相同——这条也反证了
+  `Tools/AssemblyStore` 的 LZ4 解码链路是对的；
+- **APK 的 `258d7d92…` 不可复核**：该路径当前产物是 `65e1e2af…`（388,967,580 字节，
+  2026-11-04 22:57 构建），与文档记录**不是同一个文件**。两者大小相同但哈希不同，
+  说明这条记录对应的是另一次构建；引用 APK 身份时必须重新计算，不能沿用本行。
 
 ## 2. 运行时能力（核心）
 
