@@ -67,6 +67,14 @@ internal static class ErrorCodes
     internal const string GameVersionInvalid = "MF0504";
     internal const string FrameworkVersionInvalid = "MF0505";
 
+    /// <summary>
+    /// Phase 1.1.1: the running framework version could not be determined at all, so a declared
+    /// range cannot be enforced. Deliberately distinct from <see cref="FrameworkVersionInvalid"/>
+    /// (a version was read but does not parse) and from <see cref="FrameworkVersionUnsupported"/>
+    /// (a known version that does not satisfy the range).
+    /// </summary>
+    internal const string FrameworkVersionUnknown = "MF0506";
+
     // ---- loader level ---------------------------------------------------------
     internal const string LoaderReentered = "MF0901";
     internal const string ModsRootMissing = "MF0902";
@@ -126,6 +134,7 @@ internal static class ErrorCodes
             case GameVersionUnknown: return "the game version could not be determined, so the declared range cannot be enforced";
             case GameVersionInvalid: return "the detected game version is not a valid semantic version";
             case FrameworkVersionInvalid: return "the runtime framework version is not a valid semantic version";
+            case FrameworkVersionUnknown: return "the runtime framework version could not be determined, so the declared range cannot be enforced";
             case LoaderReentered: return "the loader was called re-entrantly; the second call was ignored";
             case ModsRootMissing: return "the mods root directory does not exist";
             case ModsRootUnreadable: return "the mods root directory could not be enumerated";

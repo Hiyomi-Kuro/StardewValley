@@ -71,17 +71,21 @@ internal sealed class ModLogger : IModLogger
             sb.Append(message == null ? "" : message);
             if (exception != null)
             {
+                // The mod log is persisted and routinely pasted into issue reports. An exception
+                // message or stack trace quotes absolute source and data paths, so both go
+                // through the same scrubber the loader report uses; the exception type and the
+                // scrubbed reason are kept.
                 sb.AppendLine();
                 sb.Append("  exception: ");
                 sb.Append(exception.GetType().FullName);
                 sb.Append(": ");
-                sb.Append(exception.Message);
+                sb.Append(PathScrubber.Scrub(exception.Message ?? ""));
                 var stack = exception.StackTrace;
                 if (!string.IsNullOrEmpty(stack))
                 {
                     sb.AppendLine();
                     sb.Append("  stack: ");
-                    sb.Append(stack);
+                    sb.Append(PathScrubber.Scrub(stack!));
                 }
             }
             sb.Append(Environment.NewLine);

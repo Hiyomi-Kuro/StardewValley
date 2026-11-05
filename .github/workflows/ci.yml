@@ -68,9 +68,16 @@ jobs:
           dotnet build Tools/tests/FixtureMods/PlainLib/PlainLib.csproj -c Release --artifacts-path "$RUNNER_TEMP/artifacts" -v q
 
       # test_loader.py also builds the parameterised identity variants (same simple name at two
-      # versions, same identity with different content, ...) and runs the whole Phase 1.1
-      # regression set: LegacyProbe removal, fail-closed version gates, assembly preflight,
-      # dependency propagation and the logger degradation report.
+      # versions, same identity with different content, ...) and runs the whole regression set:
+      #   * Phase 1.1   - LegacyProbe removal, fail-closed version gates, assembly preflight,
+      #                   dependency propagation, logger degradation;
+      #   * Phase 1.1.1 - dependency pre-propagation and the preflight fixed point (A), secure
+      #                   content identity with an injected digest collision (B), host
+      #                   fail-closed matching (C), PE/CLI boundary and fuzz samples (D),
+      #                   framework-version Known/Unknown/Invalid (E), report/log path
+      #                   redaction (F).
+      # The parser differential over the 65 reference assemblies is local-only (those files may
+      # not be uploaded), so it is listed as SKIPPED below - never as passed.
       - name: loader host tests (no game assemblies)
         run: python Tools/tests/test_loader.py --dotnet dotnet --artifacts "$RUNNER_TEMP/artifacts"
 
@@ -78,5 +85,6 @@ jobs:
         run: |
           echo "SKIPPED: test_mod_pipeline.py needs the game's StardewValley.dll and the assemblies container."
           echo "SKIPPED: the example-mod build (Mod/ExampleMod.HelloWorld) needs AndroidRefsDir."
+          echo "SKIPPED: the parser differential over the 65 reference assemblies needs \`--refs\`."
           echo "SKIPPED: any device/E1/E2 evidence needs an ARM64 physical device (BLOCKED, see docs/audit/phase0.5-device-checklist.md)."
           echo "Nothing above was reported as passed."

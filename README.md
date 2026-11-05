@@ -56,8 +56,9 @@ apktool.yml         → decoded/apktool.yml
 | --- | --- |
 | 支持的游戏版本 | **1.6.15.0**（versionCode 239）。版本绑定：清单/资源/程序集都强相关，不做多版本兼容 |
 | 可构建的 APK | ✅ 直达标题界面，无更新/隐私/实名弹窗 |
-| Mod Framework：Manifest 发现 / 校验 / 依赖排序 / 加载 / 入口调用 | ✅ **离线实现完成**（宿主测试 206 项） |
+| Mod Framework：Manifest 发现 / 校验 / 依赖排序 / 加载 / 入口调用 | ✅ **离线实现完成**（宿主测试 283 项） |
 | Mod Framework：Phase 1.1 加固 | ✅ **离线实现完成**：裸 DLL 不执行 · 版本门禁 Fail-Closed · 加载前程序集身份预检 · 日志降级进报告（见 [`docs/audit/phase1.1-report.md`](docs/audit/phase1.1-report.md)） |
+| Mod Framework：Phase 1.1.1 预检正确性与安全加固 | ✅ **离线实现完成**：依赖失败不再误伤无关 mod · 内容相等改逐字节判定（去掉 FNV 回退）· 宿主匹配 Fail-Closed · PE/CLI 逐层边界 · 框架版本 Unknown/Invalid 分离 · 报告与日志脱敏（见 [`docs/audit/phase1.1.1-report.md`](docs/audit/phase1.1.1-report.md)） |
 | Mod Framework：ARM64 真机验证 | ❌ **BLOCKED**（无物理设备；只有 x86_64 模拟器） |
 | Mod Framework：设备上验证 `AssemblyName` 元数据读取与 SHA-256 | ❌ **BLOCKED**（只有编译期证据，见 phase1.1 报告 §3） |
 | Harmony / 方法补丁 / 事件钩子 / SMAPI 兼容 | ❌ **未实现**（Phase 2 及以后） |
@@ -67,14 +68,18 @@ apktool.yml         → decoded/apktool.yml
 > `IModEntry.Initialize`，失败被隔离"。**不能**保证在真机上跑过——那一步仍缺设备。
 > `.NET` mod dll 在游戏进程内以完整权限执行，manifest 校验**不是**安全沙箱。
 
-### Loader 的四条硬语义（Phase 1.1）
+### Loader 的硬语义（Phase 1.1 / 1.1.1）
 
 | 语义 | 含义 |
 | --- | --- |
 | 只有 manifest 包会执行 | Mods 根目录下的裸 DLL（含历史遗留的 `MonoRuntimeProbe.dll`）不会被加载；报告固定写 `probe=not-run-by-loader`。探针改为显式诊断启动，见 [`Mod/MonoRuntimeProbe/README.md`](Mod/MonoRuntimeProbe/README.md) |
-| 版本门禁 Fail-Closed | `gameVersion`/`frameworkVersion` 只有 `"*"` 才免除校验；显式范围遇到版本未知/无法解析 → 拒绝（`MF0503`/`MF0504`/`MF0505`），拒绝发生在入口 DLL 加载之前 |
+| 版本门禁 Fail-Closed | `gameVersion`/`frameworkVersion` 只有 `"*"` 才免除校验；显式范围遇到版本未知/无法解析 → 拒绝（`MF0503`/`MF0504`/`MF0505`/`MF0506`），拒绝发生在入口 DLL 加载之前。框架版本读不到时**不再**伪造成 `0.0.0` |
 | 加载前身份预检 | 所有 `entryAssembly`/`privateAssemblies` 在**第一次 `Assembly.LoadFrom` 之前**完成元数据读取与冲突判定；同名不同身份/内容 → 双方拒绝（`MF0206`），同身份同内容 → 确定性共享一个代表文件 |
+| 依赖失败优先、冲突重算 | 依赖了失败 mod 的下游先被排除，再重新计算冲突；不会把无关健康 mod 一起拒绝（`preflight-rounds=` 可验证收敛） |
+| 内容身份 | "内容相同"只由**逐字节比较**决定；SHA-256 仅用于快速否定，FNV/CRC 不再是共享许可。无法比较 → 拒绝（Fail-Closed） |
+| 宿主程序集复用 | 必须身份四项（Name/Version/Culture/公钥字节）全等 + 宿主文件可读 + 内容逐字节相同；否则 `MF0207`，不再"复用 + warning" |
 | 日志降级可见 | `logs/<id>.log` 写不进去时报告记 `log-status=degraded` + 异常类型（不含路径），mod 状态仍是 `Initialized` |
+| 报告/日志不含绝对路径 | `locate=` / `mods-root=` / `dir=` 只保留末段或包内相对名；异常消息里的绝对路径脱敏为 `<path>` |
 
 冲突与版本规则写进 [`docs/modding/manifest-spec.md`](docs/modding/manifest-spec.md) §3.4 / §5。
 
@@ -132,13 +137,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Tools\tests\run-all.ps1 -Ref
 | CI 离线检查（13 项：Python/PS 语法、UTF-8、mojibake、manifest 夹具、schema、隐私、CI 结构） | `python Tools/tests/test_ci_offline.py` | ❌ |
 | 隐私扫描 | `python Tools/privacy-scan.py` | ❌ |
 | adb 解析自测（10 项，不连设备） | `powershell -File Tools/tests/test_device_precheck.ps1` | ❌ |
-| Loader 单元 + 宿主（206 项） | `python Tools/tests/test_loader.py --dotnet dotnet` | 示例 mod 部分需要（缺则 SKIP） |
+| Loader 单元 + 宿主（283 项） | `python Tools/tests/test_loader.py --dotnet dotnet` | 示例 mod 与 65 程序集差分需要（缺则 SKIP） |
 | 注入 / 容器 / Loader 契约（27 项） | `python Tools/tests/test_mod_pipeline.py` | ✅ |
 | E0 只读设备预检 | `powershell -File Tools/device-precheck.ps1` | ❌（需要设备） |
 
 **CI（`.github/workflows/ci.yml`）只跑不需要游戏程序集的部分**：
 `test_ci_offline.py`、`privacy-scan.py`、ModInjector/Runtime/FixtureMod 构建、`test_loader.py`（无 `--refs`）。
-依赖游戏程序集的套件在 CI 里显式标 **SKIPPED**，不会伪装成通过。
+依赖游戏程序集的套件（含 65 程序集的解析差分 `--diff-refs`）在 CI 里显式标 **SKIPPED**，不会伪装成通过。
 任何 E1/E2 设备证据都没有——那需要一台 ARM64 物理设备。
 
 ## 二次开发
@@ -190,7 +195,8 @@ public sealed class Entry : IModEntry
    | 想用 | 实际 | 替代 |
    | --- | --- | --- |
    | `AssemblyName.GetAssemblyName(path)` | ❌ 被裁掉 | `AssemblyMetadata.cs` 自己读 PE/CLI 元数据 |
-   | `SHA256.Create()` / `HashAlgorithm` | ❌ 被裁掉 | `SHA256.HashData(byte[])`（存在），否则 FNV-1a 回退 |
+   | `AssemblyName.GetPublicKey()` | ❌ 被裁掉（Phase 1.1.1 实测） | `GetPublicKeyToken()`；完整公钥 → Token 由 `PublicKeyToken.cs` 按 ECMA-335 派生 |
+   | `SHA256.Create()` / `HashAlgorithm` | ❌ 被裁掉 | `SHA256.HashData(byte[])`（存在）；**没有**弱摘要回退，拿不到就退回逐字节比较 |
    | `FileInfo` / `DirectoryInfo` | ❌ 被裁掉 | `File.OpenRead` + `FileStream.Length` |
    | `Assembly.LoadFrom` | ✅ 存在 | 唯一可用的外部程序集加载方式 |
 

@@ -44,6 +44,15 @@ internal sealed class ModRecord
 
     internal string ErrorMessage { get; private set; } = "";
 
+    /// <summary>
+    /// Why this mod failed, as a stable category rather than a narrative:
+    /// <c>root-cause</c> (this mod's own problem), <c>assembly-conflict</c> / <c>host-conflict</c>
+    /// (direct preflight rejection) or <c>dependency-blocked</c> (a required dependency failed
+    /// first). Phase 1.1.1 added it so a mod that is both downstream and in a conflict group can
+    /// still be diagnosed from one line of the report.
+    /// </summary>
+    internal string FailureKind { get; private set; } = "";
+
     internal string AssemblyPath { get; private set; } = "";
 
     /// <summary>
@@ -94,6 +103,7 @@ internal sealed class ModRecord
     {
         ErrorCode = code;
         ErrorMessage = message;
+        FailureKind = ClassifyFailure(code);
         State = ModState.Failed;
         History.Add("Failed(" + code + ")");
     }
@@ -102,8 +112,21 @@ internal sealed class ModRecord
     {
         ErrorCode = code;
         ErrorMessage = message;
+        FailureKind = ClassifyFailure(code);
         State = ModState.Skipped;
         History.Add("Skipped(" + code + ")");
+    }
+
+    /// <summary>Maps a stable error code to the report's failure category.</summary>
+    internal static string ClassifyFailure(string code)
+    {
+        switch (code)
+        {
+            case ErrorCodes.AssemblyIdentityConflict: return "assembly-conflict";
+            case ErrorCodes.HostAssemblyConflict: return "host-conflict";
+            case ErrorCodes.DependencyFailed: return "dependency-blocked";
+            default: return "root-cause";
+        }
     }
 
     internal string DescribeHistory()

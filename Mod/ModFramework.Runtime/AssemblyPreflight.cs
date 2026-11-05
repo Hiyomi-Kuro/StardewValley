@@ -19,9 +19,80 @@ internal sealed class GateProblem
     internal string Message { get; }
 }
 
+/// <summary>What one preflight finding is about, so the loader can decide whether it still holds.</summary>
+internal enum PreflightEventKind
+{
+    /// <summary>A simple name declared by several mods with different identity or content.</summary>
+    ModConflict = 0,
+
+    /// <summary>A declaration whose identity matches no loaded host assembly.</summary>
+    HostConflict = 1,
+
+    /// <summary>Content equality with the loaded host assembly could not be proven.</summary>
+    HostUnverifiable = 2,
+
+    /// <summary>Several loaded host assemblies share the identity, so the reuse target is ambiguous.</summary>
+    HostAmbiguous = 3,
+
+    /// <summary>One representative file is shared by several mods.</summary>
+    Shared = 4,
+
+    /// <summary>The mod reuses the host's already loaded instance.</summary>
+    HostShare = 5,
+}
+
 /// <summary>
-/// Outcome of the global assembly preflight: which mods are rejected, and for the rest,
+/// One preflight finding, kept as data instead of a pre-rendered line.
+///
+/// The preflight runs several times while the loader removes doomed mods, and a finding from an
+/// early round is <b>not</b> automatically still true: a mod rejected as a conflict co-owner can
+/// become healthy once the mod it conflicted with is excluded for an unrelated reason. Rendering
+/// at the end, filtered by the final outcome, is what keeps the report truthful without also
+/// losing the evidence for mods that really were rejected.
+/// </summary>
+internal sealed class PreflightEvent
+{
+    internal PreflightEventKind Kind;
+
+    internal string SimpleName = "";
+
+    /// <summary>Owning mod ids, in the preflight's deterministic order.</summary>
+    internal List<string> Owners { get; } = new();
+
+    /// <summary>Owner text for the rendered line, parallel to <see cref="Owners"/>.</summary>
+    internal List<string> OwnerLabels { get; } = new();
+
+    /// <summary>Identity text per owner, for the rendered line.</summary>
+    internal string Identities = "";
+
+    /// <summary>Extra detail: a reason, a candidate count or a content verdict.</summary>
+    internal string Detail = "";
+
+    /// <summary>Stable sort key: identical findings from different rounds collapse onto it.</summary>
+    internal string Key => Kind + "|" + SimpleName + "|" + Identities + "|" + Join(OwnerLabels);
+
+    private static string Join(List<string> values)
+    {
+        var text = "";
+        for (var i = 0; i < values.Count; i++)
+        {
+            if (i > 0)
+            {
+                text += ",";
+            }
+            text += values[i];
+        }
+        return text;
+    }
+}
+
+/// <summary>
+/// Outcome of one global assembly preflight pass: which mods are rejected, and for the rest,
 /// which file (if any) the loader is allowed to load for every declared assembly.
+///
+/// <see cref="AssemblyPreflight.Analyze"/> is a pure function of its input list: it does no
+/// dependency propagation. Turning rejections into "and so are their dependents" - and
+/// re-running until stable - is the loader's job (see <c>Loader.RunCore</c>).
 /// </summary>
 internal sealed class AssemblyPreflightResult
 {
@@ -31,20 +102,13 @@ internal sealed class AssemblyPreflightResult
     internal Dictionary<string, GateProblem> Rejections { get; } =
         new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Report lines, already path-free, emitted before any assembly is loaded.</summary>
-    internal List<string> Lines { get; } = new();
+    /// <summary>Findings of this pass, rendered later by the loader.</summary>
+    internal List<PreflightEvent> Events { get; } = new();
 
     internal int DeclaredFiles { get; set; }
 
-    internal int ConflictGroups { get; set; }
-
-    internal int SharedClaims { get; set; }
-
-    internal int HostSharedClaims { get; set; }
-
-    internal int HostUnverifiedClaims { get; set; }
-
-    internal bool AnyConflict => ConflictGroups > 0;
+    /// <summary><c>sha256+full-bytes</c> or <c>full-bytes-only</c>: what a content match rests on.</summary>
+    internal string ContentPolicy { get; set; } = "sha256+full-bytes";
 
     internal void SetClaims(string modId, List<AssemblyClaim> claims)
     {
@@ -74,14 +138,18 @@ internal sealed class AssemblyPreflightResult
         return null;
     }
 
-    internal string Summary()
+    private static string? Join(List<string> values)
     {
-        return "assemblies=" + DeclaredFiles +
-               " conflicts=" + ConflictGroups +
-               " shared=" + SharedClaims +
-               " host-shared=" + HostSharedClaims +
-               " host-unverified=" + HostUnverifiedClaims +
-               " rejected=" + Rejections.Count;
+        var text = "";
+        for (var i = 0; i < values.Count; i++)
+        {
+            if (i > 0)
+            {
+                text += ",";
+            }
+            text += values[i];
+        }
+        return text;
     }
 }
 
@@ -91,22 +159,33 @@ internal sealed class AssemblyPreflightResult
 /// Runs to completion <b>before</b> the loader calls <c>Assembly.LoadFrom</c> for any mod, and
 /// only reads bytes: no assembly is loaded, no type is resolved, no static constructor runs.
 ///
-/// Rules (documented in <c>docs/modding/manifest-spec.md</c> §3.3 and
-/// <c>docs/audit/phase1.1-report.md</c>):
+/// Rules (documented in <c>docs/modding/manifest-spec.md</c> §3.4 and
+/// <c>docs/audit/phase1.1.1-report.md</c>):
 ///
 /// 1. Every declared <c>entryAssembly</c> / <c>privateAssemblies</c> file must exist, be
 ///    readable and be a managed assembly, otherwise the owning mod is rejected
 ///    (<c>MF0201</c> / <c>MF0205</c>).
-/// 2. A simple name already provided by an assembly the host has loaded is authoritative:
-///    same identity and same content -&gt; the mod reuses the host instance (<c>ShareFromHost</c>);
-///    same identity but unreadable host bytes -&gt; reuse with an explicit warning; anything
-///    else -&gt; rejected (<c>MF0207</c>).
-/// 3. Otherwise all claims with the same simple name must agree on identity <i>and</i> content.
-///    If they do, one representative is chosen deterministically and loaded once. If they do
-///    not, every owner is rejected (<c>MF0206</c>) - never "first loaded wins".
+/// 2. A simple name already provided by an assembly the host has loaded is authoritative, but
+///    only when exactly one loaded assembly has the <i>same identity</i> (name, version,
+///    culture, public-key bytes) <i>and</i> its file content is proven byte-identical
+///    (<c>ShareFromHost</c>). An ambiguous candidate set, an unreadable host image or
+///    unprovable content is a rejection (<c>MF0207</c>) - never a silent reuse.
+/// 3. Otherwise all claims with the same simple name must agree on identity <b>and</b> content,
+///    where "same content" always means a full byte comparison (a digest is only a negative
+///    filter). If they do, one representative is chosen deterministically and loaded once. If
+///    they do not, every owner is rejected (<c>MF0206</c>) - never "first loaded wins".
 /// </summary>
 internal static class AssemblyPreflight
 {
+    /// <summary>
+    /// Test seam: replaces the host snapshot with a caller-supplied list so host-identity cases
+    /// that cannot be produced in a desktop test process (unreadable location, several loaded
+    /// copies, a different public key) become reachable. <c>null</c> in production, where the
+    /// snapshot always comes from <see cref="HostAssemblyIdentity.Snapshot"/>. Tests restore it
+    /// in a <c>finally</c> block.
+    /// </summary>
+    internal static List<HostAssemblyIdentity>? HostSnapshotForTests;
+
     internal static AssemblyPreflightResult Analyze(List<ModManifest> eligible)
     {
         var result = new AssemblyPreflightResult();
@@ -132,8 +211,9 @@ internal static class AssemblyPreflight
         }
 
         result.DeclaredFiles = all.Count;
+        result.ContentPolicy = DescribeContentPolicy(all);
 
-        var host = HostAssemblyIdentity.Snapshot();
+        var host = HostSnapshotForTests ?? HostAssemblyIdentity.Snapshot();
         var hostByName = new Dictionary<string, List<HostAssemblyIdentity>>(StringComparer.OrdinalIgnoreCase);
         for (var i = 0; i < host.Count; i++)
         {
@@ -182,8 +262,28 @@ internal static class AssemblyPreflight
             }
         }
 
-        result.Lines.Insert(0, "preflight=" + result.Summary());
         return result;
+    }
+
+    /// <summary>
+    /// What actually authorizes a content match, stated in the report so a reader never has to
+    /// guess whether a weak digest was involved.
+    /// </summary>
+    private static string DescribeContentPolicy(List<AssemblyClaim> claims)
+    {
+        if (claims.Count == 0)
+        {
+            return "sha256+full-bytes";
+        }
+        for (var i = 0; i < claims.Count; i++)
+        {
+            if (claims[i].Digest.Length == 0)
+            {
+                return "full-bytes-only";
+            }
+        }
+        // A digest is only a negative filter; equality always needs the byte comparison.
+        return "sha256+full-bytes";
     }
 
     // --------------------------------------------------------------- reading
@@ -241,28 +341,74 @@ internal static class AssemblyPreflight
         for (var i = 0; i < group.Count; i++)
         {
             var claim = group[i];
-            HostAssemblyIdentity? match = FindHostMatch(hostMatches, claim);
-            if (match == null)
+
+            // 1. Identity: every loaded assembly with the same simple name is a *candidate*;
+            //    only one with the exact identity may be reused.
+            var candidates = new List<HostAssemblyIdentity>();
+            var differences = "";
+            for (var h = 0; h < hostMatches.Count; h++)
             {
-                var hostVersions = DescribeHostVersions(hostMatches);
+                string difference;
+                if (AssemblyIdentityComparison.SameIdentity(claim.Identity, hostMatches[h], out difference))
+                {
+                    candidates.Add(hostMatches[h]);
+                }
+                else if (differences.Length == 0)
+                {
+                    differences = difference;
+                }
+            }
+
+            if (candidates.Count == 0)
+            {
                 Reject(result, claim.ModId, ErrorCodes.HostAssemblyConflict,
                     claim.RoleText + " assembly \"" + claim.DeclaredName + "\" is \"" + claim.IdentityText +
-                    "\", which collides with the already loaded host assembly " +
-                    "\"" + simpleName + "\" (" + hostVersions + ")");
-                result.Lines.Add("preflight-conflict=" + simpleName + " kind=host owner=" + claim.ModId +
-                                 " role=" + claim.RoleText + " identity=" + claim.IdentityText);
+                    "\", which collides with the already loaded host assembly \"" + simpleName + "\" (" +
+                    DescribeHostVersions(hostMatches) + "; " +
+                    (differences.Length == 0 ? "different identity" : differences) + ")");
+                AddEvent(result, PreflightEventKind.HostConflict, simpleName, claim, "", claim.IdentityText);
                 continue;
             }
 
-            var content = VerifyHostContent(match, claim);
-            if (content == HostContentCheck.Different)
+            if (candidates.Count > 1)
+            {
+                // Several loaded assemblies share this identity. Picking one would make the
+                // result depend on enumeration order, and each copy could differ in content.
+                Reject(result, claim.ModId, ErrorCodes.HostAssemblyConflict,
+                    claim.RoleText + " assembly \"" + claim.DeclaredName + "\" matches " + candidates.Count +
+                    " already loaded host assemblies named \"" + simpleName +
+                    "\" with the same identity, so the host instance to reuse is ambiguous");
+                AddEvent(result, PreflightEventKind.HostAmbiguous, simpleName, claim,
+                    "candidates=" + candidates.Count, simpleName);
+                continue;
+            }
+
+            var match = candidates[0];
+
+            // 2. Content: reuse requires proof, not resemblance.
+            string contentReason;
+            var verdict = VerifyHostContent(match, claim, out contentReason);
+            if (verdict != ContentVerdict.Same)
             {
                 Reject(result, claim.ModId, ErrorCodes.HostAssemblyConflict,
-                    claim.RoleText + " assembly \"" + claim.DeclaredName + "\" has the same identity \"" +
-                    claim.IdentityText + "\" as a host assembly but different content (" +
-                    claim.Digest + ")");
-                result.Lines.Add("preflight-conflict=" + simpleName + " kind=host-content owner=" + claim.ModId +
-                                 " role=" + claim.RoleText + " identity=" + claim.IdentityText);
+                    claim.RoleText + " assembly \"" + claim.DeclaredName + "\" has identity \"" +
+                    claim.IdentityText + "\" matching the loaded host assembly \"" + simpleName +
+                    "\", but content equality could not be " +
+                    (verdict == ContentVerdict.Different ? "ruled out: " : "proven: ") + contentReason);
+                AddEvent(result, PreflightEventKind.HostUnverifiable, simpleName, claim,
+                    "reason=" + (verdict == ContentVerdict.Different ? "content-differs" : "content-unverifiable"),
+                    simpleName);
+                continue;
+            }
+
+            if (match.Assembly == null)
+            {
+                // Identity and content agree, but there is no instance to hand to the mod.
+                Reject(result, claim.ModId, ErrorCodes.HostAssemblyConflict,
+                    claim.RoleText + " assembly \"" + claim.DeclaredName + "\" matches the loaded host assembly \"" +
+                    simpleName + "\" but that instance is no longer available");
+                AddEvent(result, PreflightEventKind.HostUnverifiable, simpleName, claim,
+                    "reason=instance-unavailable", simpleName);
                 continue;
             }
 
@@ -271,116 +417,38 @@ internal static class AssemblyPreflight
             // known, so the report's assembly= line never names a file that was not loaded.
             claim.CanonicalPath = string.IsNullOrEmpty(match.Location) ? claim.Path : match.Location;
             claim.CanonicalModId = "host";
-            claim.HostAssembly = FindLoadedAssembly(match);
-            result.HostSharedClaims++;
-            result.Lines.Add("preflight-host-share=" + simpleName + " owner=" + claim.ModId +
-                             " role=" + claim.RoleText + " content=" + (content == HostContentCheck.Same ? "same" : "unverified"));
-            if (content == HostContentCheck.Unverifiable)
-            {
-                result.HostUnverifiedClaims++;
-                result.Lines.Add("preflight-warning=" + simpleName +
-                                 " the loaded host assembly has no readable file, so content equality could not be proven");
-            }
+            claim.HostAssembly = match.Assembly;
+            AddEvent(result, PreflightEventKind.HostShare, simpleName, claim,
+                "role=" + claim.RoleText + " content=same", match.SimpleName);
         }
     }
 
-    private enum HostContentCheck
+    private static ContentVerdict VerifyHostContent(
+        HostAssemblyIdentity host,
+        AssemblyClaim claim,
+        out string reason)
     {
-        Same = 0,
-        Different = 1,
-        Unverifiable = 2,
-    }
-
-    private static HostContentCheck VerifyHostContent(HostAssemblyIdentity host, AssemblyClaim claim)
-    {
+        reason = "";
         var location = host.Location;
-        if (string.IsNullOrEmpty(location) || !File.Exists(location))
+        if (string.IsNullOrEmpty(location))
         {
-            return HostContentCheck.Unverifiable;
+            reason = "the loaded host assembly has no readable file location";
+            return ContentVerdict.Unverifiable;
         }
-        try
+        if (!File.Exists(location))
         {
-            byte[] bytes;
-            string error;
-            if (!AssemblyClaimReader.TryReadAll(location, out bytes, out error))
-            {
-                return HostContentCheck.Unverifiable;
-            }
-            var digest = AssemblyClaimReader.ComputeDigest(bytes);
-            return string.Equals(digest, claim.Digest, StringComparison.Ordinal)
-                ? HostContentCheck.Same
-                : HostContentCheck.Different;
+            reason = "the loaded host assembly's file is no longer present";
+            return ContentVerdict.Unverifiable;
         }
-        catch (Exception)
-        {
-            return HostContentCheck.Unverifiable;
-        }
-    }
 
-    private static Assembly? FindLoadedAssembly(HostAssemblyIdentity match)
-    {
-        var loaded = AppDomain.CurrentDomain.GetAssemblies();
-        for (var i = 0; i < loaded.Length; i++)
+        long hostLength;
+        string lengthError;
+        if (!ContentIdentity.TryGetLength(location, out hostLength, out lengthError))
         {
-            var assembly = loaded[i];
-            if (assembly == null || assembly.IsDynamic)
-            {
-                continue;
-            }
-            AssemblyName? name;
-            try
-            {
-                name = assembly.GetName();
-            }
-            catch (Exception)
-            {
-                continue;
-            }
-            if (name == null || string.IsNullOrEmpty(name.Name))
-            {
-                continue;
-            }
-            if (!string.Equals(name.Name, match.SimpleName, StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-            if (!string.Equals(HostAssemblyIdentity.NormalizeVersion(name.Version), match.VersionText,
-                    StringComparison.Ordinal))
-            {
-                continue;
-            }
-            return assembly;
+            reason = lengthError;
+            return ContentVerdict.Unverifiable;
         }
-        return null;
-    }
-
-    private static HostAssemblyIdentity? FindHostMatch(List<HostAssemblyIdentity> hostMatches, AssemblyClaim claim)
-    {
-        for (var i = 0; i < hostMatches.Count; i++)
-        {
-            var host = hostMatches[i];
-            if (!string.Equals(host.SimpleName, claim.Identity.Name, StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-            if (!string.Equals(host.VersionText, claim.Identity.VersionText, StringComparison.Ordinal))
-            {
-                continue;
-            }
-            if (!SameCulture(host.Culture, claim.Identity.Culture))
-            {
-                continue;
-            }
-            // A strong-name mismatch is a hard difference; two signed sides cannot be compared
-            // for *token* equality without SHA-1, so they are treated as matching here and the
-            // content check above decides. Both-unsigned is the normal mod case.
-            if (host.HasPublicKey != claim.Identity.IsStrongNamed)
-            {
-                continue;
-            }
-            return host;
-        }
-        return null;
+        return ContentIdentity.CompareFiles(location, hostLength, claim.Path, claim.Length, out reason);
     }
 
     private static string DescribeHostVersions(List<HostAssemblyIdentity> hostMatches)
@@ -393,6 +461,15 @@ internal static class AssemblyPreflight
                 text += "; ";
             }
             text += "Version=" + hostMatches[i].VersionText;
+            var culture = AssemblyIdentityComparison.NormalizeCulture(hostMatches[i].Culture);
+            if (culture.Length > 0)
+            {
+                text += " Culture=" + culture;
+            }
+            if (hostMatches[i].PublicKeyToken.Length > 0)
+            {
+                text += " PublicKeyToken=" + AssemblyFileIdentity.ToHex(hostMatches[i].PublicKeyToken);
+            }
         }
         return text.Length == 0 ? "unknown version" : text;
     }
@@ -403,6 +480,11 @@ internal static class AssemblyPreflight
         if (byVersion != 0)
         {
             return byVersion;
+        }
+        var byCulture = string.Compare(a.Culture, b.Culture, StringComparison.Ordinal);
+        if (byCulture != 0)
+        {
+            return byCulture;
         }
         return string.Compare(a.Location, b.Location, StringComparison.Ordinal);
     }
@@ -416,60 +498,150 @@ internal static class AssemblyPreflight
             return;
         }
 
-        var same = true;
-        var first = group[0];
-        for (var i = 1; i < group.Count; i++)
+        var ordered = new List<AssemblyClaim>(group);
+        ordered.Sort(CompareClaims);
+        var canonical = ordered[0];
+
+        // 1. Identity first: identical bytes must never let two different identities share.
+        for (var i = 1; i < ordered.Count; i++)
         {
-            if (!string.Equals(group[i].IdentityText, first.IdentityText, StringComparison.Ordinal) ||
-                !string.Equals(group[i].Digest, first.Digest, StringComparison.Ordinal))
+            string difference;
+            if (!AssemblyIdentityComparison.SameIdentity(canonical.Identity, ordered[i].Identity, out difference))
             {
-                same = false;
-                break;
+                ConflictWithinMods(simpleName, ordered, result,
+                    "a different identity (" + ordered[i].ModId + ": " + ordered[i].IdentityText +
+                    "; " + difference + ")");
+                return;
             }
         }
 
-        if (same)
+        // 2. Content: a full byte comparison, with the digest used only to prove difference.
+        for (var i = 1; i < ordered.Count; i++)
         {
-            var ordered = new List<AssemblyClaim>(group);
-            ordered.Sort(CompareClaims);
-            var canonical = ordered[0];
-            for (var i = 0; i < group.Count; i++)
+            ContentVerdict verdict;
+            string reason;
+            var proven = CompareClaimContent(canonical, ordered[i], out verdict, out reason);
+            if (!proven)
             {
-                var claim = group[i];
-                claim.CanonicalPath = canonical.Path;
-                claim.CanonicalModId = canonical.ModId;
-                claim.Resolution = ReferenceEquals(claim, canonical)
-                    ? AssemblyResolution.Load
-                    : AssemblyResolution.ShareFromClaim;
-                if (claim.Resolution == AssemblyResolution.ShareFromClaim)
-                {
-                    result.SharedClaims++;
-                }
+                ConflictWithinMods(simpleName, ordered, result,
+                    "content equality could not be proven between " + canonical.ModId + " and " +
+                    ordered[i].ModId + ": " + reason);
+                return;
             }
-            result.Lines.Add("preflight-shared=" + simpleName + " canonical=" + canonical.ModId +
-                             " representative=" + canonical.DeclaredName + " owners=" + group.Count);
-            return;
+            if (verdict != ContentVerdict.Same)
+            {
+                ConflictWithinMods(simpleName, ordered, result,
+                    "a different content (" + ordered[i].ModId + ": " + ordered[i].ContentText +
+                    "; " + reason + ")");
+                return;
+            }
         }
 
-        result.ConflictGroups++;
-        var owners = "";
+        // 3. Same identity and same content: one deterministic representative, loaded once.
+        for (var i = 0; i < ordered.Count; i++)
+        {
+            var claim = ordered[i];
+            claim.CanonicalPath = canonical.Path;
+            claim.CanonicalModId = canonical.ModId;
+            claim.Resolution = ReferenceEquals(claim, canonical)
+                ? AssemblyResolution.Load
+                : AssemblyResolution.ShareFromClaim;
+        }
+
+        var shared = new PreflightEvent
+        {
+            Kind = PreflightEventKind.Shared,
+            SimpleName = simpleName,
+            Detail = canonical.ModId + "|" + canonical.DeclaredName + "|" + ordered.Count,
+        };
+        for (var i = 0; i < ordered.Count; i++)
+        {
+            shared.Owners.Add(ordered[i].ModId);
+            shared.OwnerLabels.Add(ordered[i].ModId);
+        }
+        result.Events.Add(shared);
+    }
+
+    /// <summary>
+    /// Compares the content of two claims. The digest may only prove that they differ; proving
+    /// that they are the same always runs the full byte comparison, so a digest collision (or a
+    /// non-cryptographic fallback) can never authorize sharing.
+    /// </summary>
+    private static bool CompareClaimContent(
+        AssemblyClaim left,
+        AssemblyClaim right,
+        out ContentVerdict verdict,
+        out string reason)
+    {
+        reason = "";
+        if (left.Length != right.Length)
+        {
+            verdict = ContentVerdict.Different;
+            reason = "different length";
+            return true;
+        }
+        if (left.Digest.Length > 0 && right.Digest.Length > 0 &&
+            !string.Equals(left.Digest, right.Digest, StringComparison.Ordinal))
+        {
+            // Sound for any deterministic digest: identical bytes cannot produce two digests.
+            verdict = ContentVerdict.Different;
+            reason = "different content digest";
+            return true;
+        }
+
+        verdict = ContentIdentity.CompareFiles(left.Path, left.Length, right.Path, right.Length, out reason);
+        return verdict != ContentVerdict.Unverifiable;
+    }
+
+    private static void ConflictWithinMods(
+        string simpleName,
+        List<AssemblyClaim> ordered,
+        AssemblyPreflightResult result,
+        string reason)
+    {
+        var conflict = new PreflightEvent
+        {
+            Kind = PreflightEventKind.ModConflict,
+            SimpleName = simpleName,
+            Detail = reason,
+        };
         var identities = "";
-        for (var i = 0; i < group.Count; i++)
+        for (var i = 0; i < ordered.Count; i++)
         {
-            var claim = group[i];
+            var claim = ordered[i];
             if (i > 0)
             {
-                owners += ",";
                 identities += ",";
             }
-            owners += claim.ModId + "(" + claim.RoleText + ":" + claim.DeclaredName + ")";
-            identities += claim.IdentityText + " content=" + claim.Digest;
+            identities += claim.IdentityText + " content=" + claim.ContentText;
+            conflict.Owners.Add(claim.ModId);
+            conflict.OwnerLabels.Add(claim.ModId + "(" + claim.RoleText + ":" + claim.DeclaredName + ")");
             Reject(result, claim.ModId, ErrorCodes.AssemblyIdentityConflict,
-                "assembly \"" + simpleName + "\" is declared by more than one mod with a different " +
-                "identity or different content: " + claim.IdentityText + " (" + claim.Digest + ")");
+                "assembly \"" + simpleName + "\" is declared by more than one mod with " + reason +
+                " [" + claim.IdentityText + " content=" + claim.ContentText + "]");
         }
-        result.Lines.Add("preflight-conflict=" + simpleName + " kind=mod owners=" + owners +
-                         " identities=" + identities);
+        conflict.Identities = identities;
+        result.Events.Add(conflict);
+    }
+
+    private static void AddEvent(
+        AssemblyPreflightResult result,
+        PreflightEventKind kind,
+        string simpleName,
+        AssemblyClaim claim,
+        string detail,
+        string identityText)
+    {
+        var e = new PreflightEvent
+        {
+            Kind = kind,
+            SimpleName = simpleName,
+            Detail = detail,
+            Identities = identityText,
+        };
+        e.Owners.Add(claim.ModId);
+        e.OwnerLabels.Add(claim.ModId + "(" + claim.RoleText + ":" + claim.DeclaredName + ")");
+        result.Events.Add(e);
     }
 
     private static int CompareClaims(AssemblyClaim a, AssemblyClaim b)
@@ -492,13 +664,6 @@ internal static class AssemblyPreflight
     private static void SortMods(List<ModManifest> mods)
     {
         mods.Sort((a, b) => string.Compare(a.Id, b.Id, StringComparison.Ordinal));
-    }
-
-    private static bool SameCulture(string a, string b)
-    {
-        var left = a.Length == 0 || a == "neutral" ? "" : a;
-        var right = b.Length == 0 || b == "neutral" ? "" : b;
-        return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
     }
 
     private static void Reject(AssemblyPreflightResult result, string modId, string code, string message)

@@ -46,13 +46,15 @@ internal sealed class AssemblyClaim
 
     internal long Length;
 
-    /// <summary><c>sha256:&lt;hex&gt;</c>, or <c>fnv1a64:&lt;len&gt;:&lt;hex&gt;</c> when SHA-256 is unavailable.</summary>
+    /// <summary>
+    /// <c>sha256:&lt;hex&gt;</c> when the runtime provides SHA-256, otherwise empty. An empty digest
+    /// means "no fast filter available" and forces every comparison onto the full byte path; it
+    /// is never replaced by a non-cryptographic fingerprint.
+    /// </summary>
     internal string Digest = "";
 
-    /// <summary>Path-free identity text used in the report and in the comparison.</summary>
+    /// <summary>Path-free identity text, for the report only. Never used to decide equality.</summary>
     internal string IdentityText = "";
-
-    internal string PublicKeyFingerprint = "";
 
     internal AssemblyResolution Resolution = AssemblyResolution.Load;
 
@@ -64,14 +66,17 @@ internal sealed class AssemblyClaim
     internal Assembly? HostAssembly;
 
     internal string RoleText => Role == AssemblyClaimRole.Entry ? "entry" : "private";
+
+    /// <summary><c>sha256:…</c> or <c>unverified</c>: what the report prints for content.</summary>
+    internal string ContentText => Digest.Length == 0 ? "unverified" : Digest;
 }
 
 /// <summary>
 /// Reads declared assembly files into <see cref="AssemblyClaim"/> values.
 ///
 /// The whole file is read once and kept only for the duration of one claim: the same buffer
-/// answers both "is this a managed assembly and what is its identity?" and "what is its
-/// content digest?", so a content-hash failure cannot be a separate, silently skipped path.
+/// answers both "is this a managed assembly and what is its identity?" and "what is its content
+/// digest?", so a content-hash failure cannot be a separate, silently skipped path.
 /// </summary>
 internal static class AssemblyClaimReader
 {
@@ -114,7 +119,6 @@ internal static class AssemblyClaimReader
             return false;
         }
 
-        var publicKeyFingerprint = Fingerprint(identity.PublicKey);
         claim.ModId = modId;
         claim.Role = role;
         claim.DeclaredName = declaredName;
@@ -122,8 +126,7 @@ internal static class AssemblyClaimReader
         claim.Identity = identity;
         claim.Length = bytes.Length;
         claim.Digest = ComputeDigest(bytes);
-        claim.PublicKeyFingerprint = publicKeyFingerprint;
-        claim.IdentityText = identity.Describe(publicKeyFingerprint);
+        claim.IdentityText = identity.Describe();
         claim.Resolution = AssemblyResolution.Load;
         claim.CanonicalPath = absolutePath;
         claim.CanonicalModId = modId;
@@ -168,56 +171,55 @@ internal static class AssemblyClaimReader
         }
         catch (Exception ex)
         {
-            error = ex.GetType().Name + ": " + ex.Message;
+            // Type and a path-free reason only: an IO message quotes the absolute file name.
+            error = PathScrubber.Describe(ex);
             return false;
         }
     }
 
     /// <summary>
-    /// Content identity. SHA-256 when the runtime provides it, otherwise a deterministic
-    /// FNV-1a 64 fingerprint over the same bytes. The fallback is not a weakening of the
-    /// policy: content equality is still decided deterministically, and the digest is
-    /// prefixed so the report says which one was used.
+    /// Content digest - SHA-256 only, or nothing.
+    ///
+    /// Phase 1.1 fell back to FNV-1a 64 and then used digest-string equality to decide that two
+    /// DLLs were "the same content". FNV-1a 64 is not collision resistant, so it could not carry
+    /// that decision. This digest is now only ever a fast <i>negative</i> filter: see
+    /// <see cref="ContentIdentity"/>, which performs the full byte comparison that actually
+    /// authorizes sharing.
     /// </summary>
     internal static string ComputeDigest(byte[] bytes)
     {
-        if (!DisableSha256ForTests)
+        var overrideForTests = DigestOverrideForTests;
+        if (overrideForTests != null)
         {
-            try
-            {
-                var hash = SHA256.HashData(bytes);
-                return "sha256:" + ToHex(hash);
-            }
-            catch (Exception)
-            {
-                // fall through to the always-available fingerprint
-            }
+            return overrideForTests(bytes);
         }
-        return "fnv1a64:" + bytes.Length.ToString() + ":" + Fnv1a64(bytes).ToString("x16");
+        if (DisableSha256ForTests)
+        {
+            return "";
+        }
+        try
+        {
+            var hash = SHA256.HashData(bytes);
+            return "sha256:" + ToHex(hash);
+        }
+        catch (Exception)
+        {
+            // No cryptographic digest on this runtime: the caller must fall back to the full
+            // byte comparison, which is why the return value is empty rather than weaker.
+            return "";
+        }
     }
 
-    /// <summary>Test seam: forces the digest fallback so the fallback path is covered.</summary>
+    /// <summary>Test seam: forces "SHA-256 unavailable" so the byte-comparison path is covered.</summary>
     internal static bool DisableSha256ForTests;
 
-    internal static string Fingerprint(byte[] publicKey)
-    {
-        if (publicKey.Length == 0)
-        {
-            return "none";
-        }
-        if (!DisableSha256ForTests)
-        {
-            try
-            {
-                return "sha256:" + ToHex(SHA256.HashData(publicKey));
-            }
-            catch (Exception)
-            {
-                // fall through
-            }
-        }
-        return "fnv1a64:" + Fnv1a64(publicKey).ToString("x16");
-    }
+    /// <summary>
+    /// Test seam: replaces the production digest computation with a caller-supplied function so
+    /// a digest collision can be injected deterministically. <c>null</c> in production, where the
+    /// only digest ever used is SHA-256 (see <see cref="ComputeDigest"/>). Tests must restore the
+    /// previous value in a <c>finally</c> block.
+    /// </summary>
+    internal static Func<byte[], string>? DigestOverrideForTests;
 
     internal static string ToHex(byte[] value)
     {
@@ -228,22 +230,16 @@ internal static class AssemblyClaimReader
         }
         return sb.ToString();
     }
-
-    private static ulong Fnv1a64(byte[] bytes)
-    {
-        var hash = 14695981039346656037UL;
-        for (var i = 0; i < bytes.Length; i++)
-        {
-            hash ^= bytes[i];
-            hash *= 1099511628211UL;
-        }
-        return hash;
-    }
 }
 
 /// <summary>
-/// The identity of an <b>already loaded</b> assembly, reduced to the same shape as
-/// <see cref="AssemblyClaim"/> so the two can be compared without ever loading the file.
+/// The identity of an <b>already loaded</b> assembly, kept in exactly the shape the comparison
+/// needs: simple name, version, culture, public-key bytes and the loaded instance itself.
+///
+/// Phase 1.1 reduced this to <c>HasPublicKey</c> (a boolean), which cannot distinguish two
+/// differently-signed assemblies, and re-searched the AppDomain by name and version, which could
+/// return the wrong instance. Both are fixed here: the key is kept as bytes and the instance is
+/// carried along.
 /// </summary>
 internal sealed class HostAssemblyIdentity
 {
@@ -253,15 +249,35 @@ internal sealed class HostAssemblyIdentity
 
     internal string Culture = "";
 
-    internal bool HasPublicKey;
-
     internal string Location = "";
+
+    /// <summary>Full public key when the runtime exposes one; empty otherwise.</summary>
+    internal byte[] PublicKey = Array.Empty<byte>();
+
+    /// <summary>Public key token when the runtime exposes one; empty otherwise.</summary>
+    internal byte[] PublicKeyToken = Array.Empty<byte>();
+
+    /// <summary>The exact loaded instance, so a reuse cannot pick a look-alike assembly.</summary>
+    internal Assembly? Assembly;
 
     internal string Describe()
     {
         return SimpleName + ", Version=" + VersionText +
                ", Culture=" + (Culture.Length == 0 ? "neutral" : Culture) +
-               ", PublicKey=" + (HasPublicKey ? "present" : "none");
+               ", PublicKey=" + DescribeKey();
+    }
+
+    private string DescribeKey()
+    {
+        if (PublicKey.Length > 0)
+        {
+            return "full(" + PublicKey.Length + " bytes)";
+        }
+        if (PublicKeyToken.Length > 0)
+        {
+            return "token:" + AssemblyFileIdentity.ToHex(PublicKeyToken);
+        }
+        return "none";
     }
 
     /// <summary>Snapshot of every non-dynamic assembly the process already has loaded.</summary>
@@ -298,15 +314,21 @@ internal sealed class HostAssemblyIdentity
             {
                 identity.Culture = "";
             }
+            identity.Assembly = assembly;
+
+            // The trimmed BCL has no AssemblyName.GetPublicKey() (verified by compiling against
+            // the game's own reference assemblies), so the token is the only strong-name identity
+            // the host can expose. The token is compared as bytes - never as a presence flag.
             try
             {
                 var token = name.GetPublicKeyToken();
-                identity.HasPublicKey = token != null && token.Length > 0;
+                identity.PublicKeyToken = token ?? Array.Empty<byte>();
             }
             catch (Exception)
             {
-                identity.HasPublicKey = false;
+                identity.PublicKeyToken = Array.Empty<byte>();
             }
+
             try
             {
                 identity.Location = assembly.Location ?? "";

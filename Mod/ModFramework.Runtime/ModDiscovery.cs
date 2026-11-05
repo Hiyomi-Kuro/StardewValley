@@ -31,7 +31,8 @@ internal static class ModDiscovery
         if (!Directory.Exists(modsRoot))
         {
             result.RootExists = false;
-            result.Warnings.Add("mods root does not exist: " + modsRoot);
+            // Report the root by its last segment only: a warning is persisted in the report.
+            result.Warnings.Add("mods root \"" + PathScrubber.Leaf(modsRoot) + "\" does not exist");
             return result;
         }
         result.RootExists = true;
@@ -43,7 +44,7 @@ internal static class ModDiscovery
         }
         catch (Exception ex)
         {
-            result.Warnings.Add("mods root could not be enumerated: " + ex.GetType().Name + ": " + ex.Message);
+            result.Warnings.Add("mods root could not be enumerated: " + PathScrubber.Describe(ex));
             result.RootExists = false;
             return result;
         }

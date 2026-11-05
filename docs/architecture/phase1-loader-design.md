@@ -33,9 +33,13 @@
 | `Contracts.cs` | `IModEntry` / `IModContext` / `IModLogger` / `ModLogLevel` | — |
 | `ErrorCodes.cs` | 稳定错误码 + 文案 | ✅ 单元 |
 | `PathRules.cs` | 包内路径判定（`IsInside`），Loader 与预检共用 | ✅ 单元 |
-| `AssemblyMetadata.cs` | **Phase 1.1**：只读 PE/CLI 元数据（Assembly 表行 0），不加载程序集 | ✅ 单元 |
-| `AssemblyIdentity.cs` | **Phase 1.1**：声明文件 → 身份 + 内容摘要；宿主已加载程序集的同形身份 | ✅ 单元 |
-| `AssemblyPreflight.cs` | **Phase 1.1**：全局冲突判定、宿主冲突判定、确定性代表文件选择 | ✅ 宿主 |
+| `AssemblyMetadata.cs` | **Phase 1.1**：只读 PE/CLI 元数据（Assembly 表行 0），不加载程序集；1.1.1 重写为逐层容器边界校验 + `Assembly.Flags` | ✅ 单元 |
+| `AssemblyIdentity.cs` | **Phase 1.1**：声明文件 → 身份 + 内容摘要；宿主已加载程序集的同形身份；1.1.1 起摘要只用 SHA-256（无弱回退），宿主快照保留公钥字节与实例引用 | ✅ 单元 |
+| `AssemblyPreflight.cs` | **Phase 1.1**：全局冲突判定、宿主冲突判定、确定性代表文件选择；1.1.1 起宿主匹配 Fail-Closed，发现项改为结构化事件 | ✅ 宿主 |
+| `AssemblyIdentityComparison.cs` | **Phase 1.1.1**：唯一的身份比较规则（Name/Version/Culture/公钥字节），file↔file 与 file↔host 共用 | ✅ 单元 |
+| `ContentIdentity.cs` | **Phase 1.1.1**：内容相等的最终判据（固定缓冲逐字节比较），摘要只做快速否定 | ✅ 单元 |
+| `PublicKeyToken.cs` | **Phase 1.1.1**：ECMA-335 公钥 Token 派生（自实现 SHA-1，仅用于编码，不作为安全原语） | ✅ 单元 |
+| `PathScrubber.cs` | **Phase 1.1.1**：报告/日志的绝对路径脱敏（异常类型保留，路径变 `<path>`） | ✅ 单元 |
 
 依赖方向是单向的：`Loader` → 其它；预检三件套只依赖 `PathRules`/`ErrorCodes`/`ModManifest`，
 不依赖 `Loader`（因此可以单独测试，也不会反过来加载任何东西）。
@@ -58,18 +62,20 @@ Loader.Run(modsRoot)
 │   ├── DFS 找环 → 环上 MF0403
 │   └── Kahn 拓扑排序（就绪集按 id 排序）
 ├── 门禁 1：版本兼容（按拓扑序预判，不加载任何东西）
-│   └── 显式范围 + 未知/非法/不满足 → MF0503 / MF0504 / MF0505 / MF0501 / MF0502
+│   └── 显式范围 + 未知/非法/不满足 → MF0503 / MF0504 / MF0505 / MF0506 / MF0501 / MF0502
+├── 失败集合：先归并"根因"，再做依赖传播（Phase 1.1.1）
+│   ├── manifest / 依赖解析 / 版本门禁 → 根因
+│   └── 必需依赖落在失败集合 → 下游 MF0404（可选依赖不阻断）
 ├── 门禁 2：全局程序集身份预检（Phase 1.1，一次覆盖所有仍存活的 mod）
-│   ├── 只读 PE/CLI 元数据 + 内容摘要（不 LoadFrom、不执行代码）
+│   ├── 只读 PE/CLI 元数据 + 内容比较（不 LoadFrom、不执行代码）
 │   ├── 同名不同身份/内容        → 双方 MF0206
-│   ├── 与宿主已加载同名同身份冲突 → MF0207
+│   ├── 与宿主同身份但内容不可证明/候选不唯一 → MF0207（Fail-Closed）
 │   ├── 损坏 / 非托管            → MF0205；文件缺失 → MF0201
-│   └── preflight-stage=complete   ← 这一行之前没有任何 assembly-load=
+│   └── **不动点**：预检拒绝 → 再传播依赖 → 重算冲突（见下）
+├── preflight-stage=complete   ← 这一行之前没有任何 assembly-load=
 ├── 逐个（按拓扑序）：
-│   ├── 依赖问题？            → Failed(码)
-│   ├── 版本门禁拒绝？        → Failed(码)
-│   ├── 预检拒绝？            → Failed(码)
-│   ├── 依赖未初始化？        → Failed(MF0404)
+│   ├── 已有终态归类？        → Failed(码 + kind)
+│   ├── 依赖未初始化？        → Failed(MF0404)（防御性兜底）
 │   └── LoadAndInitialize：
 │       ├── privateAssemblies（按声明序，走预检给出的 canonical 路径）→ MF0202
 │       ├── 入口程序集（同身份共享时复用已加载实例）      → MF0202
@@ -86,6 +92,45 @@ Loader.Run(modsRoot)
 > 因此第一个 mod 的 DLL 可能已经加载后才发现第二个 mod 的冲突。Phase 1.1 把两件事
 > 提到循环之前，并用 `preflight-stage=complete` / `assembly-load=` 两行在报告里
 > **可验证地**固定这个顺序。
+>
+> Phase 1.1.1 修的是"提到循环之前"之后剩下的顺序错误：Phase 1.1 只把**版本门禁**失败
+> 排除在预检输入之外，而"依赖了失败 mod"要等到逐个处理阶段才由 `FirstFailedDependency`
+> 发现。于是一个注定不能运行的 mod 仍会参与全局冲突判定，把无关的健康 mod 一起拖下水。
+
+### 3.1 预检不动点（Phase 1.1.1）
+
+两个互相依赖的集合：`dependencySet`（因必需依赖不能运行而阻断）与 `conflictSet`
+（被当前预检轮次拒绝）。每轮重复下面四步，直到 `conflictSet` 不再变化：
+
+```
+round:
+  1. 依赖闭包：对每个未内在失败、未在 dependencySet 的 mod，
+     若它有必需依赖落在 intrinsicFailures ∪ conflictSet ∪ dependencySet
+     → 加入 dependencySet，并从 conflictSet 中移除（依赖原因优先）
+  2. pool = 所有 mod − intrinsicFailures − dependencySet
+  3. preflight = Analyze(pool)
+  4. 预检拒绝分两类：
+     - intrinsic（MF0201 文件缺失 / MF0205 文件损坏 / MF0207 宿主冲突）
+       → 并入 intrinsicFailures，永久生效，继续下一轮
+     - 其余（只可能是 MF0206 对称冲突）→ 覆盖为**新的** conflictSet（不累加）
+```
+
+为什么不会误伤无关 mod：
+
+1. **依赖原因优先于冲突归类**：依赖了失败者的 mod 先被移出冲突集合，它的声明不再参与冲突判定。
+2. **冲突集合每轮重算而不是锁定**：冲突组因另一侧被排除而只剩一个成员时，该成员在下一轮
+   不再被拒绝，于是恢复为可加载——这正是 Phase 1.1 做不到的。
+3. **只有内在失败永久有效**：与别人无关的原因（自己文件坏了、与宿主冲突）不可撤销；
+   对称冲突永远重新计算。
+4. **确定性**：轮次只依赖 `plan.Order`（拓扑序 + id 序）与每个 manifest 自己的依赖声明顺序。
+5. **收敛**：每轮要么至少并入一个内在失败，要么把 conflictSet 换成一个更小的集合；
+   另有 `|plan.Order| * 2 + 4` 的轮次上限兜底（超限时用最后一次计算的状态，并写入
+   `preflight-rounds=`）。
+6. 所有 `Assembly.LoadFrom` 仍在循环**之后**，由 `preflight-stage=complete` 行保证。
+
+报告保留每一轮的结构化发现，但**按最终归类过滤后再输出**：只在早期轮次成立、后来因
+另一方被排除而消失的冲突不会出现在最终报告里；真正被拒绝的 mod 的证据（冲突组、宿主冲突、
+不可验证、候选不唯一）会保留。
 
 `Run` 的返回值只表达 **Loader 级**结果：
 
@@ -120,6 +165,8 @@ Discovered → ManifestValidated → DependenciesResolved → AssemblyLoaded
 | 两个包 id 相同 | 两个包都失败 | `MF0120`，不随机挑 |
 | 依赖缺失/版本不符 | 该 mod + 其下游 | 解析阶段标记 + 运行期 `MF0404` |
 | 循环依赖 | 环上所有 mod | DFS 记录整条环 |
+| 程序集同名冲突 | 冲突组内**所有直接拥有者** | `MF0206`，绝不 first-loaded-wins；依赖失败者不参与 |
+| 宿主已经加载了同名程序集 | 该 mod | 身份逐项 + 内容逐字节证明后才复用，否则 `MF0207` |
 | 入口 dll 缺失/改名 | 仅该 mod | `MF0201`/`MF0203` |
 | 入口类型不合法 | 仅该 mod | `MF0301..MF0307` |
 | 构造函数/`Initialize` 抛异常 | 仅该 mod + 其下游 | 每阶段 `try/catch`，异常写进该 mod 日志 |
@@ -183,3 +230,5 @@ Bootstrap（注入进 `StardewValley.dll` 的 IL）只做四件事：
 | 日期 | 变更 |
 | --- | --- |
 | 2026-11-05 | 初版：Phase 1 最小 Loader 的设计、时序、状态机、隔离矩阵 |
+| 2026-11-05 | Phase 1.1：裸 DLL 不执行、三态版本门禁、加载前程序集预检、日志降级进报告 |
+| 2026-11-05 | Phase 1.1.1：预检不动点（依赖优先、冲突重算、事件按最终归类过滤）、内容相等改为逐字节判定、宿主匹配 Fail-Closed、PE/CLI 逐层边界、框架版本 Unknown/Invalid 分离、报告与日志脱敏 |

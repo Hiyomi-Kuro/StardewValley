@@ -51,8 +51,8 @@ internal static class UnitTests
             identity.VersionText + " vs " + HostAssemblyIdentity.NormalizeVersion(loadedName.Version));
         t.Check("metadata_unsigned_fixture", !identity.IsStrongNamed, "the framework assembly is not strong-name signed");
         t.Check("metadata_identity_text_is_path_free",
-            identity.Describe("none").IndexOf('/') < 0 && identity.Describe("none").IndexOf('\\') < 0,
-            identity.Describe("none"));
+            identity.Describe().IndexOf('/') < 0 && identity.Describe().IndexOf('\\') < 0,
+            identity.Describe());
 
         AssemblyFileIdentity ignored;
         t.Check("metadata_rejects_empty",
@@ -83,24 +83,28 @@ internal static class UnitTests
         try
         {
             AssemblyClaimReader.DisableSha256ForTests = true;
-            var fallback = AssemblyClaimReader.ComputeDigest(bytes);
-            t.Check("metadata_digest_fallback_is_deterministic",
-                fallback.StartsWith("fnv1a64:", StringComparison.Ordinal) &&
-                string.Equals(fallback, AssemblyClaimReader.ComputeDigest(bytes), StringComparison.Ordinal), fallback);
-            t.Check("metadata_digest_fallback_differs",
-                !string.Equals(fallback, digest, StringComparison.Ordinal), fallback);
-            t.Check("metadata_key_fingerprint_fallback",
-                string.Equals(AssemblyClaimReader.Fingerprint(new byte[] { 1, 2, 3 }),
-                    AssemblyClaimReader.Fingerprint(new byte[] { 1, 2, 3 }), StringComparison.Ordinal),
-                AssemblyClaimReader.Fingerprint(new byte[] { 1, 2, 3 }));
+            // Phase 1.1.1: when SHA-256 is unavailable the digest is *empty*, never a weaker
+            // fingerprint. Content equality then falls back to the full byte comparison, which
+            // is the only thing allowed to prove that two files are the same.
+            var unavailable = AssemblyClaimReader.ComputeDigest(bytes);
+            t.Check("metadata_digest_unavailable_is_empty",
+                unavailable.Length == 0, unavailable.Length == 0 ? "(empty)" : unavailable);
+            t.Check("metadata_digest_has_no_weak_fallback",
+                !unavailable.StartsWith("fnv1a64", StringComparison.Ordinal) &&
+                !unavailable.StartsWith("crc", StringComparison.OrdinalIgnoreCase),
+                unavailable);
+            t.Check("metadata_digest_unavailable_is_stable",
+                string.Equals(unavailable, AssemblyClaimReader.ComputeDigest(bytes), StringComparison.Ordinal),
+                unavailable);
         }
         finally
         {
             AssemblyClaimReader.DisableSha256ForTests = previous;
         }
 
-        t.Check("metadata_fingerprint_none_for_unsigned",
-            string.Equals(AssemblyClaimReader.Fingerprint(Array.Empty<byte>()), "none", StringComparison.Ordinal), "none");
+        t.Check("metadata_identity_text_marks_unsigned",
+            identity.Describe().IndexOf("PublicKey=none", StringComparison.Ordinal) >= 0,
+            identity.Describe());
 
         t.Check("path_rules_inside", PathRules.IsInside("/mods/A", "/mods/A/x.dll"), "same directory prefix");
         t.Check("path_rules_rejects_sibling_prefix", !PathRules.IsInside("/mods/A", "/mods/AB/x.dll"), "AB is not inside A/");

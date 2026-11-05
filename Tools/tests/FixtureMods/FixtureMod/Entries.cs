@@ -31,12 +31,26 @@ public sealed class ThrowingEntry : IModEntry
     }
 }
 
+/// <summary>
+/// Phase 1.1.1: throws an exception whose message embeds the mod's own absolute directory.
+///
+/// A real mod does this all the time ("could not open ...\data.json"), so the loader has to
+/// prove that such a message never reaches the report or the mod log verbatim.
+/// </summary>
+public sealed class PathLeakEntry : IModEntry
+{
+    public void Initialize(IModContext context)
+    {
+        var path = Path.Combine(context.ModDirectory, "data.bin");
+        throw new IOException("could not open " + path);
+    }
+}
+
 /// <summary>Abstract: must be rejected before instantiation.</summary>
 public abstract class AbstractEntry : IModEntry
 {
     public abstract void Initialize(IModContext context);
 }
-
 /// <summary>No public parameterless constructor: must be rejected before instantiation.</summary>
 public sealed class NoDefaultCtorEntry : IModEntry
 {

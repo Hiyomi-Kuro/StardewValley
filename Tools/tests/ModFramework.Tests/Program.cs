@@ -11,6 +11,7 @@ internal static class Program
         var fixtureDir = "";
         var keepTemp = false;
         var helloWorldDir = "";
+        var diffRefsDir = "";
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -28,16 +29,27 @@ internal static class Program
                 case "--hello-world-dir":
                     if (i + 1 < args.Length) { helloWorldDir = args[++i]; }
                     break;
+                case "--diff-refs":
+                    if (i + 1 < args.Length) { diffRefsDir = args[++i]; }
+                    break;
                 case "--help":
                 case "-h":
                     Console.WriteLine("ModFramework.Tests [--repo-root <dir>] --fixture-mod-dir <dir>");
                     Console.WriteLine("  --repo-root        repository root (default: current directory)");
                     Console.WriteLine("  --fixture-mod-dir  directory containing FixtureMod.dll and FixtureMod.Dependency.dll");
+                    Console.WriteLine("  --hello-world-dir  build output of ExampleMod.HelloWorld (optional)");
+                    Console.WriteLine("  --diff-refs <dir>  run only the read-only parser differential over <dir>");
                     return 0;
                 default:
                     Console.WriteLine("unknown argument: " + args[i]);
                     return 2;
             }
+        }
+
+        if (diffRefsDir.Length > 0)
+        {
+            // Read-only evidence run: no mod is loaded, no file is modified.
+            return RefsDifferential.Run(diffRefsDir);
         }
 
         var runner = new TestRunner();
@@ -56,6 +68,9 @@ internal static class Program
             else
             {
                 HostTests.Run(runner, fixtureDir);
+                // Phase 1.1.1: dependency pre-propagation, secure content identity, host
+                // fail-closed matching, PE/CLI bounds, framework-version state and redaction.
+                Phase111Tests.Run(runner, fixtureDir);
                 if (helloWorldDir.Length > 0)
                 {
                     HostTests.HelloWorld(runner, helloWorldDir);

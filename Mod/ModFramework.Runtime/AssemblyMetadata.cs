@@ -3,6 +3,22 @@ using System.Text;
 namespace ModFramework.Runtime;
 
 /// <summary>
+/// ECMA-335 II.23.1.2 <c>Assembly.Flags</c>.
+/// </summary>
+internal static class AssemblyFlagBits
+{
+    /// <summary>
+    /// Bit 0x0001. When set, the <c>Assembly.PublicKey</c> blob holds a <b>full public key</b>;
+    /// when clear it holds a <b>public key token</b>. Treating every non-empty blob as a full key
+    /// is the defect this bit exists to prevent.
+    /// </summary>
+    internal const int PublicKey = 0x0001;
+
+    /// <summary>Bits 0x0E00: the assembly contains Windows Runtime content.</summary>
+    internal const int ContentTypeMask = 0x0E00;
+}
+
+/// <summary>
 /// Assembly identity read straight out of the file bytes, without loading the assembly.
 ///
 /// This exists because the shipped runtime does <b>not</b> contain
@@ -12,8 +28,8 @@ namespace ModFramework.Runtime;
 /// <c>Assembly.LoadFrom</c> is exactly the global side effect the preflight must run before.
 ///
 /// What is read: PE headers, the CLI header, the metadata root and the ECMA-335
-/// <c>Assembly</c> table row 0 (name, version, culture, public key). Nothing is executed and
-/// no static constructor can run.
+/// <c>Assembly</c> table row 0 (flags, name, version, culture, public key). Nothing is executed
+/// and no static constructor can run.
 /// </summary>
 internal sealed class AssemblyFileIdentity
 {
@@ -30,30 +46,90 @@ internal sealed class AssemblyFileIdentity
     /// <summary>Culture name; empty means neutral.</summary>
     internal string Culture = "";
 
-    /// <summary>Raw public key blob; empty means the assembly is not strong-name signed.</summary>
+    /// <summary>Raw ECMA-335 <c>Assembly.Flags</c> value (see <see cref="AssemblyFlagBits"/>).</summary>
+    internal int Flags;
+
+    /// <summary>
+    /// Full public key, present only when <see cref="AssemblyFlagBits.PublicKey"/> is set in
+    /// <see cref="Flags"/> and the blob is non-empty.
+    /// </summary>
     internal byte[] PublicKey = Array.Empty<byte>();
 
-    internal bool IsStrongNamed => PublicKey.Length > 0;
+    /// <summary>
+    /// Public key <i>token</i>, present only when the flag is clear and the blob is non-empty.
+    /// Never populated from a full key: deriving a token needs SHA-1, which this reader does not
+    /// use, so a mixed representation is compared as "not proven equal" instead of guessed.
+    /// </summary>
+    internal byte[] PublicKeyToken = Array.Empty<byte>();
+
+    internal bool IsStrongNamed => PublicKey.Length > 0 || PublicKeyToken.Length > 0;
+
+    internal bool HasFullPublicKey => PublicKey.Length > 0;
 
     internal string VersionText => Major + "." + Minor + "." + Build + "." + Revision;
 
     /// <summary>
-    /// Deterministic, path-free identity text. The public key is represented by its SHA-256
-    /// (or by a length marker when hashing is unavailable) because the *token* is defined as
-    /// the last 8 bytes of SHA-1 over the key and SHA-1 is not in the trimmed surface either.
-    /// Only equality matters here, and hashing the key preserves it.
+    /// Deterministic, path-free identity text for the report. It is <b>display only</b>: identity
+    /// equality is decided from the raw key bytes in
+    /// <see cref="AssemblyIdentityComparison"/>, never from this string.
     /// </summary>
-    internal string Describe(string publicKeyFingerprint)
+    internal string Describe()
     {
         return Name + ", Version=" + VersionText +
                ", Culture=" + (Culture.Length == 0 ? "neutral" : Culture) +
-               ", PublicKey=" + (IsStrongNamed ? publicKeyFingerprint : "none");
+               ", PublicKey=" + DescribeKey();
+    }
+
+    private string DescribeKey()
+    {
+        if (PublicKey.Length > 0)
+        {
+            return "full(" + PublicKey.Length + " bytes)";
+        }
+        if (PublicKeyToken.Length > 0)
+        {
+            return "token:" + ToHex(PublicKeyToken);
+        }
+        return "none";
+    }
+
+    internal static string ToHex(byte[] value)
+    {
+        var sb = new StringBuilder(value.Length * 2);
+        for (var i = 0; i < value.Length; i++)
+        {
+            sb.Append(value[i].ToString("x2"));
+        }
+        return sb.ToString();
     }
 }
 
 /// <summary>
 /// Minimal ECMA-335 metadata reader: enough to answer "which assembly is this file?" and
 /// "is this file a managed assembly at all?".
+///
+/// <para><b>Boundary model.</b> Every read is constrained by the container that owns the field,
+/// not by the file length. From the outside in:</para>
+/// <code>
+/// file
+///  └─ DOS header / PE signature / COFF header      (must fit the file)
+///      └─ optional header                           (must fit the file; its declared size owns the
+///          │                                         data-directory array)
+///          └─ data directory entry 14               (must exist per NumberOfRvaAndSizes and lie
+///              │                                     inside the optional header)
+///              └─ section raw data                  (the *whole* request must be file-backed)
+///                  └─ CLI header                    (at least the 72-byte IMAGE_COR20_HEADER)
+///                      └─ metadata root             (fully file-backed, BSJB signature)
+///                          └─ stream header/name    (inside the metadata root)
+///                              └─ stream Offset+Size (inside the metadata root)
+///                                  ├─ #~ table stream  (row counts, row sizes, the Assembly row)
+///                                  └─ #Strings/#Blob   (index, terminator and payload inside the heap)
+/// </code>
+/// <para>
+/// All arithmetic is 64-bit; a negated or overflowing offset can never be mistaken for a valid
+/// one. Unsupported or contradictory structures are refused with a stable message instead of a
+/// guess, and no message ever contains a host path.
+/// </para>
 /// </summary>
 internal static class ManagedAssemblyReader
 {
@@ -65,46 +141,36 @@ internal static class ManagedAssemblyReader
 
     private const uint MetadataSignature = 0x424A5342; // 'BSJB'
     private const int AssemblyTable = 0x20;
+    private const int MinOptionalHeaderSize = 2;
+    private const int MinCliHeaderSize = 72;
+    private const int MaxSections = 96;                // PE/COFF hard limit
+    private const int MaxStreamNameBytes = 32;         // ECMA-335: name including NUL
+    private const int MaxMetadataVersionBytes = 1024;
 
     internal static bool TryReadIdentity(byte[] bytes, out AssemblyFileIdentity identity, out string error)
     {
         identity = new AssemblyFileIdentity();
         error = "";
 
-        int metadataOffset;
-        if (!TryLocateMetadata(bytes, out metadataOffset, out error))
+        long metadataOffset;
+        long metadataSize;
+        if (!TryLocateMetadata(bytes, out metadataOffset, out metadataSize, out error))
         {
             return false;
         }
-
-        Heaps heaps;
-        TableHeader header;
-        if (!TryReadTableHeader(bytes, metadataOffset, out heaps, out header, out error))
-        {
-            return false;
-        }
-
-        if (header.RowCount[AssemblyTable] == 0)
-        {
-            error = "the file has no Assembly row (it is a netmodule, not an assembly)";
-            return false;
-        }
-
-        if (!TryReadAssemblyRow(bytes, heaps, header, out identity, out error))
-        {
-            return false;
-        }
-
-        return true;
+        return TryReadMetadata(bytes, metadataOffset, metadataSize, out identity, out error);
     }
 
     // ------------------------------------------------------------------ PE
 
-    private static bool TryLocateMetadata(byte[] bytes, out int metadataOffset, out string error)
+    private static bool TryLocateMetadata(byte[] bytes, out long metadataOffset, out long metadataSize, out string error)
     {
         metadataOffset = 0;
+        metadataSize = 0;
         error = "";
-        if (bytes.Length < 0x40)
+
+        var fileLength = (long)bytes.Length;
+        if (fileLength < 0x40)
         {
             error = "the file is too small to be a PE image";
             return false;
@@ -115,37 +181,45 @@ internal static class ManagedAssemblyReader
             return false;
         }
 
-        var peOffset = ReadInt32(bytes, 0x3C);
-        if (peOffset < 0 || peOffset > bytes.Length - 24)
+        var peOffset = (long)ReadUInt32(bytes, 0x3C);
+        if (peOffset < 0x40 || peOffset + 24 > fileLength)
         {
             error = "the PE header offset is outside the file";
             return false;
         }
-        if (bytes[peOffset] != (byte)'P' || bytes[peOffset + 1] != (byte)'E' ||
-            bytes[peOffset + 2] != 0 || bytes[peOffset + 3] != 0)
-        {
+        if (bytes[(int)peOffset] != (byte)'P' || bytes[(int)peOffset + 1] != (byte)'E' ||
+            bytes[(int)peOffset + 2] != 0 || bytes[(int)peOffset + 3] != 0)        {
             error = "missing the PE signature";
             return false;
         }
 
-        var sectionCount = ReadUInt16(bytes, peOffset + 6);
-        var optionalHeaderSize = ReadUInt16(bytes, peOffset + 20);
+        var sectionCount = (int)ReadUInt16(bytes, peOffset + 6);
+        var optionalHeaderSize = (int)ReadUInt16(bytes, peOffset + 20);
         var optionalHeader = peOffset + 24;
-        if (optionalHeaderSize < 2 || optionalHeader > bytes.Length - optionalHeaderSize)
+
+        if (optionalHeaderSize < MinOptionalHeaderSize)
+        {
+            error = "the optional header is truncated (SizeOfOptionalHeader=" + optionalHeaderSize + ")";
+            return false;
+        }
+        if (optionalHeader + optionalHeaderSize > fileLength)
         {
             error = "the optional header is outside the file";
             return false;
         }
 
         var magic = ReadUInt16(bytes, optionalHeader);
-        int dataDirectory;
-        if (magic == 0x10B) // PE32
+        long dataDirectoryInOptional;
+        long rvaCountInOptional;
+        if (magic == 0x10B)
         {
-            dataDirectory = optionalHeader + 96;
+            dataDirectoryInOptional = 96;
+            rvaCountInOptional = 92;
         }
-        else if (magic == 0x20B) // PE32+
+        else if (magic == 0x20B)
         {
-            dataDirectory = optionalHeader + 112;
+            dataDirectoryInOptional = 112;
+            rvaCountInOptional = 108;
         }
         else
         {
@@ -153,46 +227,105 @@ internal static class ManagedAssemblyReader
             return false;
         }
 
-        // Data directory entry 14 is the CLI header.
-        var cliEntry = dataDirectory + 14 * 8;
-        if (cliEntry + 8 > bytes.Length)
+        // The declared optional-header size owns the data-directory array: the count field and
+        // the array itself must both be inside it, not merely inside the file.
+        if (rvaCountInOptional + 4 > optionalHeaderSize)
         {
-            error = "the data directory does not fit in the file";
+            error = "the optional header is too small to hold NumberOfRvaAndSizes";
             return false;
         }
-        var cliRva = (int)ReadUInt32(bytes, cliEntry);
-        var cliSize = (int)ReadUInt32(bytes, cliEntry + 4);
+        var numberOfRvaAndSizes = (long)ReadUInt32(bytes, optionalHeader + rvaCountInOptional);
+        if (dataDirectoryInOptional + numberOfRvaAndSizes * 8 > optionalHeaderSize)
+        {
+            error = "the data directory array is outside the optional header";
+            return false;
+        }
+
+        // Data directory entry 14 is the CLI header, and it must be one of the declared entries.
+        const long cliDirectoryIndex = 14;
+        if (numberOfRvaAndSizes <= cliDirectoryIndex)
+        {
+            error = "the optional header declares no CLI data directory " +
+                    "(NumberOfRvaAndSizes=" + numberOfRvaAndSizes + ")";
+            return false;
+        }
+        var cliEntry = optionalHeader + dataDirectoryInOptional + cliDirectoryIndex * 8;
+        if (cliEntry + 8 > optionalHeader + optionalHeaderSize)
+        {
+            error = "the CLI data directory entry is outside the optional header";
+            return false;
+        }
+
+        var cliRva = (long)ReadUInt32(bytes, cliEntry);
+        var cliSize = (long)ReadUInt32(bytes, cliEntry + 4);
         if (cliRva == 0 || cliSize == 0)
         {
             error = "the file has no CLI header, so it is not a managed assembly";
             return false;
         }
 
+        // The section table itself must be complete before any RVA can be mapped.
         var sectionTable = optionalHeader + optionalHeaderSize;
-        var cliOffset = RvaToFileOffset(bytes, sectionTable, sectionCount, cliRva, cliSize);
-        if (cliOffset < 0)
+        if (sectionCount == 0)
         {
-            error = "the CLI header RVA does not map to any section";
+            error = "the file declares no sections";
+            return false;
+        }
+        if (sectionCount > MaxSections)
+        {
+            error = "the file declares an impossible number of sections (" + sectionCount + ")";
+            return false;
+        }
+        if (sectionTable + (long)sectionCount * 40 > fileLength)
+        {
+            error = "the section table is outside the file";
             return false;
         }
 
-        var metadataRva = (int)ReadUInt32(bytes, cliOffset + 8);
-        var metadataSize = (int)ReadUInt32(bytes, cliOffset + 12);
-        if (metadataRva == 0 || metadataSize == 0)
+        long cliOffset;
+        string mapError;
+        if (!TryMapRva(bytes, sectionTable, sectionCount, cliRva, cliSize, out cliOffset, out mapError))
+        {
+            error = "the CLI header " + mapError;
+            return false;
+        }
+        if (cliSize < MinCliHeaderSize)
+        {
+            error = "the CLI header is smaller than the " + MinCliHeaderSize + "-byte IMAGE_COR20_HEADER";
+            return false;
+        }
+
+        // The data directory's size and the header's own cb field must both cover the header;
+        // a truncated cb is how a caller would be tricked into reading fields that are not there.
+        var declaredHeaderSize = (long)ReadUInt32(bytes, cliOffset);
+        if (declaredHeaderSize < MinCliHeaderSize)
+        {
+            error = "the CLI header declares itself as " + declaredHeaderSize + " bytes, which is smaller than " +
+                    MinCliHeaderSize;
+            return false;
+        }
+        if (declaredHeaderSize > cliSize)
+        {
+            error = "the CLI header declares " + declaredHeaderSize + " bytes but its data directory entry only maps " +
+                    cliSize;
+            return false;
+        }
+
+        var metadataRva = (long)ReadUInt32(bytes, cliOffset + 8);
+        var declinedSize = (long)ReadUInt32(bytes, cliOffset + 12);
+        if (metadataRva == 0 || declinedSize == 0)
         {
             error = "the CLI header declares no metadata";
             return false;
         }
-
-        metadataOffset = RvaToFileOffset(bytes, sectionTable, sectionCount, metadataRva, metadataSize);
-        if (metadataOffset < 0)
+        if (!TryMapRva(bytes, sectionTable, sectionCount, metadataRva, declinedSize, out metadataOffset, out mapError))
         {
-            error = "the metadata RVA does not map to any section";
+            error = "the metadata root " + mapError;
             return false;
         }
-        if (metadataOffset + 16 > bytes.Length)
+        if (declinedSize < 20)
         {
-            error = "the metadata root is outside the file";
+            error = "the metadata root is smaller than its fixed header";
             return false;
         }
         if (ReadUInt32(bytes, metadataOffset) != MetadataSignature)
@@ -200,190 +333,293 @@ internal static class ManagedAssemblyReader
             error = "missing the BSJB metadata signature";
             return false;
         }
+
+        metadataSize = declinedSize;
         return true;
     }
 
-    private static int RvaToFileOffset(byte[] bytes, int sectionTable, int sectionCount, int rva, int size)
+    /// <summary>
+    /// Maps a full <c>[rva, rva + size)</c> request to a file offset.
+    ///
+    /// The whole request must be backed by section <b>raw data</b>: a range that only exists in
+    /// the virtual tail of a section (VirtualSize &gt; SizeOfRawData) has no bytes on disk and is
+    /// therefore refused, not shortened.
+    /// </summary>
+    private static bool TryMapRva(
+        byte[] bytes,
+        long sectionTable,
+        int sectionCount,
+        long rva,
+        long size,
+        out long fileOffset,
+        out string error)
     {
+        fileOffset = 0;
+        error = "";
+        if (size <= 0)
+        {
+            error = "has an empty size";
+            return false;
+        }
+        if (rva < 0 || rva > 0xFFFFFFFFL)
+        {
+            error = "has an out-of-range RVA";
+            return false;
+        }
+
         for (var i = 0; i < sectionCount; i++)
         {
-            var section = sectionTable + i * 40;
-            if (section + 40 > bytes.Length)
-            {
-                return -1;
-            }
-            var virtualSize = (int)ReadUInt32(bytes, section + 8);
-            var virtualAddress = (int)ReadUInt32(bytes, section + 12);
-            var rawSize = (int)ReadUInt32(bytes, section + 16);
-            var rawPointer = (int)ReadUInt32(bytes, section + 20);
-            var span = virtualSize > rawSize ? virtualSize : rawSize;
-            if (rva < virtualAddress || rva >= virtualAddress + span)
+            var section = sectionTable + (long)i * 40;
+            var virtualSize = (long)ReadUInt32(bytes, section + 8);
+            var virtualAddress = (long)ReadUInt32(bytes, section + 12);
+            var rawSize = (long)ReadUInt32(bytes, section + 16);
+            var rawPointer = (long)ReadUInt32(bytes, section + 20);
+
+            var virtualSpan = virtualSize > rawSize ? virtualSize : rawSize;
+            if (rva < virtualAddress || rva >= virtualAddress + virtualSpan)
             {
                 continue;
             }
-            var offset = rawPointer + (rva - virtualAddress);
-            if (offset < 0 || offset >= bytes.Length)
+
+            if (rva + size > virtualAddress + rawSize)
             {
-                return -1;
+                error = "is not fully backed by section " + i + " raw data";
+                return false;
             }
-            return offset;
+
+            var offset = rawPointer + (rva - virtualAddress);
+            if (offset < 0 || offset + size > bytes.Length)
+            {
+                error = "is outside the file";
+                return false;
+            }
+
+            fileOffset = offset;
+            return true;
         }
-        return -1;
+
+        error = "does not map to any section";
+        return false;
     }
 
     // ------------------------------------------------------------ metadata
 
     private sealed class Heaps
     {
-        internal int StringsOffset;
-        internal int StringsSize;
-        internal int BlobOffset;
-        internal int BlobSize;
+        internal long StringsOffset = -1;
+        internal long StringsSize;
+        internal long BlobOffset = -1;
+        internal long BlobSize;
         internal int StringIndexSize = 2;
         internal int BlobIndexSize = 2;
         internal int GuidIndexSize = 2;
+        internal bool Uncompressed;
     }
 
     private sealed class TableHeader
     {
-        internal readonly int[] RowCount = new int[64];
-        internal int RowsStart;
+        internal readonly long[] RowCount = new long[64];
+        internal long RowsStart;
+        internal long StreamEnd;
     }
 
-    private static bool TryReadTableHeader(byte[] bytes, int metadataOffset, out Heaps heaps, out TableHeader header, out string error)
+    private static bool TryReadMetadata(
+        byte[] bytes,
+        long root,
+        long rootSize,
+        out AssemblyFileIdentity identity,
+        out string error)
     {
-        heaps = new Heaps();
-        header = new TableHeader();
+        identity = new AssemblyFileIdentity();
         error = "";
 
-        var versionLength = (int)ReadUInt32(bytes, metadataOffset + 12);
-        if (versionLength < 0 || versionLength > 1024)
+        var rootEnd = root + rootSize;
+
+        var versionLength = (long)ReadUInt32(bytes, root + 12);
+        if (versionLength <= 0 || versionLength > MaxMetadataVersionBytes)
         {
             error = "the metadata version string length is out of range";
             return false;
         }
-        var position = metadataOffset + 16 + versionLength;
-        if (position + 4 > bytes.Length)
+        var position = root + 16 + versionLength;
+        if (position + 4 > rootEnd)
         {
-            error = "the metadata stream header is truncated";
+            error = "the metadata stream header is outside the metadata root";
             return false;
         }
 
-        var streamCount = ReadUInt16(bytes, position + 2);
+        var streamCount = (int)ReadUInt16(bytes, position + 2);
         position += 4;
 
-        var tablesOffset = -1;
-        var tablesSize = 0;
+        var heaps = new Heaps();
+        var header = new TableHeader();
+        var tablesFound = false;
+
         for (var i = 0; i < streamCount; i++)
         {
-            if (position + 8 > bytes.Length)
+            if (position + 8 > rootEnd)
             {
-                error = "a metadata stream header is truncated";
+                error = "a metadata stream header is outside the metadata root";
                 return false;
             }
-            var offset = (int)ReadUInt32(bytes, position);
-            var size = (int)ReadUInt32(bytes, position + 4);
+            var streamOffset = (long)ReadUInt32(bytes, position);
+            var streamSize = (long)ReadUInt32(bytes, position + 4);
             position += 8;
 
             var nameStart = position;
+            var nameLimit = nameStart + MaxStreamNameBytes;
+            if (nameLimit > rootEnd)
+            {
+                nameLimit = rootEnd;
+            }
             var nameEnd = nameStart;
-            while (nameEnd < bytes.Length && nameEnd < nameStart + 32 && bytes[nameEnd] != 0)
+            while (nameEnd < nameLimit && bytes[(int)nameEnd] != 0)
             {
                 nameEnd++;
             }
-            if (nameEnd >= bytes.Length)
+            if (nameEnd >= nameLimit)
             {
-                error = "a metadata stream name is not terminated";
+                error = "a metadata stream name is not terminated inside the metadata root";
                 return false;
             }
-            var name = Encoding.UTF8.GetString(bytes, nameStart, nameEnd - nameStart);
-            position = Align4(nameEnd + 1);
 
-            var absolute = metadataOffset + offset;
-            if (absolute < 0 || absolute > bytes.Length)
+            string name;
+            string nameError;
+            if (!TryDecodeUtf8(bytes, nameStart, (int)(nameEnd - nameStart), out name, out nameError))
             {
-                error = "metadata stream \"" + name + "\" is outside the file";
+                error = "a metadata stream name is not valid UTF-8";
                 return false;
             }
+
+            var aligned = Align4(nameEnd + 1);
+            if (aligned > rootEnd || aligned < nameStart)
+            {
+                error = "a metadata stream header is outside the metadata root";
+                return false;
+            }
+            position = aligned;
+
+            // The stream range is relative to the metadata root and must stay inside it.
+            if (streamOffset > rootSize || streamSize > rootSize - streamOffset)
+            {
+                error = "metadata stream \"" + name + "\" extends beyond the metadata root";
+                return false;
+            }
+            var absolute = root + streamOffset;
 
             if (name == "#~" || name == "#-")
             {
-                tablesOffset = absolute;
-                tablesSize = size;
+                if (tablesFound)
+                {
+                    error = "the metadata declares more than one table stream";
+                    return false;
+                }
+                tablesFound = true;
+                header.StreamEnd = absolute + streamSize;
+                if (!TryReadTableHeader(bytes, absolute, streamSize, heaps, header, out error))
+                {
+                    return false;
+                }
+                if (name == "#-")
+                {
+                    heaps.Uncompressed = true;
+                    heaps.StringIndexSize = 4;
+                    heaps.GuidIndexSize = 4;
+                    heaps.BlobIndexSize = 4;
+                }
             }
             else if (name == "#Strings")
             {
                 heaps.StringsOffset = absolute;
-                heaps.StringsSize = size;
+                heaps.StringsSize = streamSize;
             }
             else if (name == "#Blob")
             {
                 heaps.BlobOffset = absolute;
-                heaps.BlobSize = size;
+                heaps.BlobSize = streamSize;
             }
         }
 
-        if (tablesOffset < 0)
+        if (!tablesFound)
         {
             error = "the metadata has no #~ table stream";
             return false;
         }
-        if (tablesSize <= 0 || tablesOffset + tablesSize > bytes.Length)
+
+        return TryReadAssemblyRow(bytes, heaps, header, out identity, out error);
+    }
+
+    private static bool TryReadTableHeader(
+        byte[] bytes,
+        long tables,
+        long tablesSize,
+        Heaps heaps,
+        TableHeader header,
+        out string error)
+    {
+        error = "";
+        if (tablesSize < 24)
         {
-            error = "the #~ table stream is outside the file";
+            error = "the #~ table stream is smaller than its fixed header";
             return false;
         }
 
-        // Table stream header: Reserved(4) Major(1) Minor(1) HeapSizes(1) Reserved(1)
-        //                      Valid(8) Sorted(8) RowCounts(4 each)
-        if (tablesOffset + 24 > bytes.Length)
-        {
-            error = "the #~ header is truncated";
-            return false;
-        }
-        var heapSizes = bytes[tablesOffset + 6];
+        var heapSizes = bytes[(int)(tables + 6)];
         heaps.StringIndexSize = (heapSizes & 0x01) != 0 ? 4 : 2;
         heaps.GuidIndexSize = (heapSizes & 0x02) != 0 ? 4 : 2;
         heaps.BlobIndexSize = (heapSizes & 0x04) != 0 ? 4 : 2;
 
-        var position2 = tablesOffset + 24;
-        var valid = ReadUInt64(bytes, tablesOffset + 8);
+        var tablesEnd = tables + tablesSize;
+        var valid = ReadUInt64(bytes, tables + 8);
+        var position = tables + 24;
         for (var table = 0; table < 64; table++)
         {
             if ((valid & (1UL << table)) == 0)
             {
                 continue;
             }
-            if (position2 + 4 > bytes.Length)
+            if (position + 4 > tablesEnd)
             {
-                error = "the #~ row counts are truncated";
+                error = "the #~ row counts are outside the table stream";
                 return false;
             }
-            header.RowCount[table] = (int)ReadUInt32(bytes, position2);
-            position2 += 4;
+            // A row count is an unsigned 32-bit value; keep it as long so the product below
+            // cannot overflow.
+            header.RowCount[table] = (long)ReadUInt32(bytes, position);
+            position += 4;
         }
-        header.RowsStart = position2;
 
-        // Walking to table 0x20 must stay inside the stream.
-        var consumed = position2 - tablesOffset;
-        if (consumed > tablesSize)
-        {
-            error = "the #~ header is larger than its stream";
-            return false;
-        }
+        header.RowsStart = position;
         return true;
     }
 
-    private static bool TryReadAssemblyRow(byte[] bytes, Heaps heaps, TableHeader header, out AssemblyFileIdentity identity, out string error)
+    private static bool TryReadAssemblyRow(
+        byte[] bytes,
+        Heaps heaps,
+        TableHeader header,
+        out AssemblyFileIdentity identity,
+        out string error)
     {
         identity = new AssemblyFileIdentity();
         error = "";
 
+        var rows = header.RowCount[AssemblyTable];
+        if (rows == 0)
+        {
+            error = "the file has no Assembly row (it is a netmodule, not an assembly)";
+            return false;
+        }
+        if (rows != 1)
+        {
+            error = "the file declares " + rows + " Assembly rows; exactly one is required";
+            return false;
+        }
+
         var position = header.RowsStart;
         for (var table = 0; table < AssemblyTable; table++)
         {
-            var rows = header.RowCount[table];
-            if (rows == 0)
+            var count = header.RowCount[table];
+            if (count == 0)
             {
                 continue;
             }
@@ -393,27 +629,23 @@ internal static class ManagedAssemblyReader
                 error = "unsupported metadata table 0x" + table.ToString("x2");
                 return false;
             }
-            var advance = (long)rowSize * rows;
-            if (advance <= 0 || position + advance > bytes.Length)
+            var advance = (long)rowSize * count;
+            if (advance <= 0 || position + advance > header.StreamEnd)
             {
                 error = "the #~ table data is truncated (table 0x" + table.ToString("x2") + ")";
                 return false;
             }
-            position += (int)advance;
+            position += advance;
         }
 
-        var assemblyRow = 4 + 2 + 2 + 2 + 2 + 4 + heaps.BlobIndexSize + heaps.StringIndexSize + heaps.StringIndexSize;
-        if (position + assemblyRow > bytes.Length)
+        var assemblyRowSize = 16 + heaps.BlobIndexSize + heaps.StringIndexSize + heaps.StringIndexSize;
+        if (position + assemblyRowSize > header.StreamEnd)
         {
-            error = "the Assembly table row is truncated";
+            error = "the Assembly table row is outside the #~ table stream";
             return false;
         }
 
-        identity.Major = ReadUInt16(bytes, position + 4);
-        identity.Minor = ReadUInt16(bytes, position + 6);
-        identity.Build = ReadUInt16(bytes, position + 8);
-        identity.Revision = ReadUInt16(bytes, position + 10);
-
+        var flags = (int)ReadUInt32(bytes, position + 12);
         var publicKeyIndex = ReadIndex(bytes, position + 16, heaps.BlobIndexSize);
         var nameIndex = ReadIndex(bytes, position + 16 + heaps.BlobIndexSize, heaps.StringIndexSize);
         var cultureIndex = ReadIndex(bytes, position + 16 + heaps.BlobIndexSize + heaps.StringIndexSize, heaps.StringIndexSize);
@@ -428,21 +660,41 @@ internal static class ManagedAssemblyReader
             error = "the Assembly table has an empty name";
             return false;
         }
-        identity.Name = name;
 
         string culture;
         if (!TryReadString(bytes, heaps, cultureIndex, out culture, out error))
         {
             return false;
         }
-        identity.Culture = culture;
 
-        byte[] publicKey;
-        if (!TryReadBlob(bytes, heaps, publicKeyIndex, out publicKey, out error))
+        byte[] publicKeyBlob;
+        if (!TryReadBlob(bytes, heaps, publicKeyIndex, out publicKeyBlob, out error))
         {
             return false;
         }
-        identity.PublicKey = publicKey;
+
+        identity.Major = (int)ReadUInt16(bytes, position + 4);
+        identity.Minor = (int)ReadUInt16(bytes, position + 6);
+        identity.Build = (int)ReadUInt16(bytes, position + 8);
+        identity.Revision = (int)ReadUInt16(bytes, position + 10);
+        identity.Flags = flags;
+        identity.Name = name;
+        identity.Culture = culture == "neutral" ? "" : culture;
+        if (publicKeyBlob.Length > 0)
+        {
+            if ((flags & AssemblyFlagBits.PublicKey) != 0)
+            {
+                // A full public key: keep the raw bytes *and* derive the token, so this side is
+                // comparable with a loaded host assembly that only exposes its token.
+                identity.PublicKey = publicKeyBlob;
+                identity.PublicKeyToken = PublicKeyToken.Derive(publicKeyBlob);
+            }
+            else
+            {
+                // The blob is already a token; deriving anything from it would be fabrication.
+                identity.PublicKeyToken = publicKeyBlob;
+            }
+        }
         return true;
     }
 
@@ -454,28 +706,38 @@ internal static class ManagedAssemblyReader
         {
             return true;
         }
+        if (heaps.StringsOffset < 0 || heaps.StringsSize <= 0)
+        {
+            error = "a #Strings index was requested but the metadata has no #Strings heap";
+            return false;
+        }
+        if (index < 0 || index >= heaps.StringsSize)
+        {
+            error = "a #Strings index is outside the #Strings heap";
+            return false;
+        }
+
         var start = heaps.StringsOffset + index;
-        if (heaps.StringsSize > 0 && index >= heaps.StringsSize)
-        {
-            error = "a #Strings index is outside the heap";
-            return false;
-        }
-        if (start < 0 || start >= bytes.Length)
-        {
-            error = "a #Strings index is outside the file";
-            return false;
-        }
+        var limit = heaps.StringsOffset + heaps.StringsSize;
         var end = start;
-        while (end < bytes.Length && bytes[end] != 0)
+        while (end < limit && bytes[(int)end] != 0)
         {
             end++;
         }
-        if (end >= bytes.Length)
+        if (end >= limit)
         {
-            error = "a #Strings entry is not terminated";
+            error = "a #Strings entry is not terminated inside the #Strings heap";
             return false;
         }
-        value = Encoding.UTF8.GetString(bytes, start, end - start);
+
+        string decoded;
+        string decodeError;
+        if (!TryDecodeUtf8(bytes, start, (int)(end - start), out decoded, out decodeError))
+        {
+            error = "a #Strings entry is not valid UTF-8";
+            return false;
+        }
+        value = decoded;
         return true;
     }
 
@@ -487,47 +749,49 @@ internal static class ManagedAssemblyReader
         {
             return true;
         }
-        if (heaps.BlobSize > 0 && index >= heaps.BlobSize)
+        if (heaps.BlobOffset < 0 || heaps.BlobSize <= 0)
         {
-            error = "a #Blob index is outside the heap";
+            error = "a #Blob index was requested but the metadata has no #Blob heap";
             return false;
         }
-        var position = heaps.BlobOffset + index;
-        if (position < 0 || position >= bytes.Length)
+        if (index < 0 || index >= heaps.BlobSize)
         {
-            error = "a #Blob index is outside the file";
+            error = "a #Blob index is outside the #Blob heap";
             return false;
         }
 
+        var heapEnd = heaps.BlobOffset + heaps.BlobSize;
+        var position = heaps.BlobOffset + index;
         int length;
-        if (!TryReadCompressedUInt(bytes, ref position, out length))
+        if (!TryReadCompressedUInt(bytes, ref position, heapEnd, out length))
         {
             error = "a #Blob length prefix is invalid";
             return false;
         }
-        if (length < 0 || position + length > bytes.Length)
+        if (length < 0 || position + length > heapEnd)
         {
-            error = "a #Blob entry runs past the end of the file";
+            error = "a #Blob entry runs past the end of the #Blob heap";
             return false;
         }
         if (length == 0)
         {
             return true;
         }
+
         var result = new byte[length];
-        Array.Copy(bytes, position, result, 0, length);
+        Array.Copy(bytes, (int)position, result, 0, length);
         value = result;
         return true;
     }
 
-    private static bool TryReadCompressedUInt(byte[] bytes, ref int position, out int value)
+    private static bool TryReadCompressedUInt(byte[] bytes, ref long position, long limit, out int value)
     {
         value = 0;
-        if (position >= bytes.Length)
+        if (position >= limit)
         {
             return false;
         }
-        var first = bytes[position];
+        var first = bytes[(int)position];
         if ((first & 0x80) == 0)
         {
             value = first;
@@ -536,22 +800,22 @@ internal static class ManagedAssemblyReader
         }
         if ((first & 0xC0) == 0x80)
         {
-            if (position + 2 > bytes.Length)
+            if (position + 2 > limit)
             {
                 return false;
             }
-            value = ((first & 0x3F) << 8) | bytes[position + 1];
+            value = ((first & 0x3F) << 8) | bytes[(int)position + 1];
             position += 2;
             return true;
         }
         if ((first & 0xE0) == 0xC0)
         {
-            if (position + 4 > bytes.Length)
+            if (position + 4 > limit)
             {
                 return false;
             }
-            value = ((first & 0x1F) << 24) | (bytes[position + 1] << 16) |
-                    (bytes[position + 2] << 8) | bytes[position + 3];
+            value = ((first & 0x1F) << 24) | (bytes[(int)position + 1] << 16) |
+                    (bytes[(int)position + 2] << 8) | bytes[(int)position + 3];
             position += 4;
             return true;
         }
@@ -646,7 +910,7 @@ internal static class ManagedAssemblyReader
     private static int Coded(int kind, Heaps heaps, TableHeader header)
     {
         var tables = CodedTables[kind];
-        var max = 0;
+        var max = 0L;
         for (var i = 0; i < tables.Length; i++)
         {
             var rows = header.RowCount[tables[i]];
@@ -655,46 +919,144 @@ internal static class ManagedAssemblyReader
                 max = rows;
             }
         }
-        var limit = 1 << (16 - CodedTagBits[kind]);
+        var limit = 1L << (16 - CodedTagBits[kind]);
         return max < limit ? 2 : 4;
     }
 
     // ------------------------------------------------------------- primitives
 
-    private static int Align4(int value)
+    internal static bool TryDecodeUtf8(byte[] bytes, long start, int count, out string value, out string error)
     {
-        return (value + 3) & ~3;
+        value = "";
+        error = "";
+        if (count < 0 || start < 0 || start + count > bytes.Length)
+        {
+            error = "the range is outside the file";
+            return false;
+        }
+        if (!IsValidUtf8(bytes, (int)start, count))
+        {
+            error = "invalid UTF-8";
+            return false;
+        }
+        value = Encoding.UTF8.GetString(bytes, (int)start, count);
+        return true;
     }
 
-    private static int ReadIndex(byte[] bytes, int offset, int size)
+    /// <summary>
+    /// Strict UTF-8 validator. <see cref="Encoding.UTF8"/> silently substitutes U+FFFD for
+    /// invalid input, which would turn a corrupt assembly name into a plausible one.
+    /// </summary>
+    internal static bool IsValidUtf8(byte[] bytes, int start, int count)
     {
-        return size == 4 ? (int)ReadUInt32(bytes, offset) : ReadUInt16(bytes, offset);
+        var i = 0;
+        while (i < count)
+        {
+            var first = bytes[start + i];
+            if (first < 0x80)
+            {
+                i++;
+                continue;
+            }
+
+            int extra;
+            var codePoint = 0;
+            if ((first & 0xE0) == 0xC0)
+            {
+                extra = 1;
+                codePoint = first & 0x1F;
+                if (codePoint < 2)
+                {
+                    return false; // overlong
+                }
+            }
+            else if ((first & 0xF0) == 0xE0)
+            {
+                extra = 2;
+                codePoint = first & 0x0F;
+            }
+            else if ((first & 0xF8) == 0xF0)
+            {
+                extra = 3;
+                codePoint = first & 0x07;
+            }
+            else
+            {
+                return false;
+            }
+
+            if (i + extra > count - 1)
+            {
+                return false; // truncated sequence
+            }
+
+            for (var k = 1; k <= extra; k++)
+            {
+                var next = bytes[start + i + k];
+                if ((next & 0xC0) != 0x80)
+                {
+                    return false;
+                }
+                codePoint = (codePoint << 6) | (next & 0x3F);
+            }
+
+            if (extra == 2 && codePoint < 0x800)
+            {
+                return false;
+            }
+            if (extra == 3 && codePoint < 0x10000)
+            {
+                return false;
+            }
+            if (codePoint >= 0xD800 && codePoint <= 0xDFFF)
+            {
+                return false;
+            }
+            if (codePoint > 0x10FFFF)
+            {
+                return false;
+            }
+
+            i += extra + 1;
+        }
+        return true;
     }
 
-    private static int ReadInt32(byte[] bytes, int offset)
+    private static long Align4(long value)
     {
-        return (int)ReadUInt32(bytes, offset);
+        return (value + 3) & ~3L;
     }
 
-    private static int ReadUInt16(byte[] bytes, int offset)
+    private static int ReadIndex(byte[] bytes, long offset, int size)
+    {
+        var raw = size == 4 ? (long)ReadUInt32(bytes, offset) : (long)ReadUInt16(bytes, offset);
+        return raw > int.MaxValue ? int.MaxValue : (int)raw;
+    }
+
+    /// <summary>
+    /// Bounds-checked little-endian readers. An out-of-range request yields 0 and is caught by
+    /// the caller's own container check, so a read can never escape the array.
+    /// </summary>
+    private static ushort ReadUInt16(byte[] bytes, long offset)
     {
         if (offset < 0 || offset + 2 > bytes.Length)
         {
             return 0;
         }
-        return bytes[offset] | (bytes[offset + 1] << 8);
+        return (ushort)(bytes[offset] | (bytes[offset + 1] << 8));
     }
 
-    private static uint ReadUInt32(byte[] bytes, int offset)
+    private static uint ReadUInt32(byte[] bytes, long offset)
     {
         if (offset < 0 || offset + 4 > bytes.Length)
         {
             return 0;
         }
-        return (uint)(bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24));
+        return (uint)(bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) |
+                      (bytes[offset + 3] << 24));
     }
 
-    private static ulong ReadUInt64(byte[] bytes, int offset)
+    private static ulong ReadUInt64(byte[] bytes, long offset)
     {
         var low = ReadUInt32(bytes, offset);
         var high = ReadUInt32(bytes, offset + 4);

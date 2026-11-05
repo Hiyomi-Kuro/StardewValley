@@ -57,6 +57,13 @@ public static class Loader
     internal static string? FrameworkVersionOverride;
 
     /// <summary>
+    /// Test seam: makes framework-version detection behave as if reading the version failed, so
+    /// the "version could not be determined" branch is reachable on a desktop where
+    /// <c>ModFramework.Runtime</c> always has a readable version. <c>false</c> in production.
+    /// </summary>
+    internal static bool FrameworkVersionUnavailableForTests;
+
+    /// <summary>
     /// Canonical path -&gt; loaded assembly, for the whole process. Guarantees that one file is
     /// handed to <c>Assembly.LoadFrom</c> exactly once even when several mods share it, and
     /// prevents <c>FileLoadException</c> when the loader is invoked again for a second root.
@@ -114,7 +121,7 @@ public static class Loader
             var text = BuildFatalReport(root, ex);
             var reportWritten = TryWrite(Path.Combine(root, ReportFileName), text);
             var logWritten = TryWrite(Path.Combine(root, LogFileName), text);
-            var diagnostic = "loader-report: loader-crashed: " + ex.GetType().Name + ": " + ex.Message;
+            var diagnostic = "loader-report: loader-crashed: " + DescribeException(ex);
             if (!reportWritten && !logWritten)
             {
                 diagnostic += " (and neither loader-report.txt nor loader.log could be written)";
@@ -131,8 +138,8 @@ public static class Loader
     {
         var sb = new StringBuilder();
         sb.AppendLine("loader-report " + DateTimeOffset.Now.ToString("O"));
-        sb.AppendLine("locate=" + DefaultModsRoot());
-        sb.AppendLine("mods-root=" + root);
+        sb.AppendLine("locate=" + PathScrubber.Leaf(DefaultModsRoot()));
+        sb.AppendLine("mods-root=" + PathScrubber.Leaf(root));
         sb.AppendLine("result=already-initialized");
         var text = sb.ToString();
         TryWrite(Path.Combine(root, ReportFileName), text);
@@ -144,8 +151,10 @@ public static class Loader
         GameVersionState versionState;
         string versionSource;
         var gameVersion = DetectGameVersion(out versionState, out versionSource);
+        var framework = DetectFrameworkVersion();
         var report = new LoadReport(modsRoot, DefaultModsRoot(), gameVersion, versionState, versionSource);
-        report.AddLine("framework-version=" + FrameworkVersion());
+        report.AddLine("framework-version=" + framework.Text);
+        report.AddLine("framework-version-state=" + FrameworkStateText(framework.State));
 
         var discovery = ModDiscovery.Discover(modsRoot);
         report.Attach(discovery.Records);
@@ -185,12 +194,19 @@ public static class Loader
         var logsReady = TryCreateDirectory(logDirectory);
         if (!logsReady)
         {
-            report.AddWarning("could not create the log directory: " + logDirectory);
+            report.AddWarning("could not create the log directory \"" + LogsDirectoryName +
+                              "\"; per-mod logs fall back to the mod package directory");
         }
 
         // ---- gate 1: version compatibility, still without touching any mod assembly --------
-        var compatibilityFailures = new Dictionary<string, GateProblem>(StringComparer.OrdinalIgnoreCase);
-        var preflightInput = new List<ModManifest>();
+        //
+        // Phase 1.1.1: every reason a mod cannot run is collected into one classification map
+        // BEFORE the assembly preflight. Phase 1.1 fed the compatibility-gate failures straight
+        // into the preflight while leaving "my required dependency failed" for the sequential
+        // loop, so a mod that was already doomed could still contribute a conflicting assembly
+        // claim and take an unrelated healthy mod down with it.
+        var intrinsicFailures = new Dictionary<string, ModOutcome>(StringComparer.OrdinalIgnoreCase);
+
         for (var i = 0; i < plan.Order.Count; i++)
         {
             var manifest = plan.Order[i];
@@ -201,26 +217,189 @@ public static class Loader
             DependencyProblem? dependencyProblem;
             if (plan.Problems.TryGetValue(manifest.Id, out dependencyProblem) && dependencyProblem != null)
             {
-                // Reported by the dependency pass below; do not let it participate in the
-                // assembly conflict map either.
+                // The resolver already proved this mod cannot run: missing dependency, version
+                // mismatch or cycle.
+                intrinsicFailures[manifest.Id] = new ModOutcome(dependencyProblem.Code, dependencyProblem.Message);
+            }
+        }
+
+        for (var i = 0; i < plan.Order.Count; i++)
+        {
+            var manifest = plan.Order[i];
+            if (!byId.ContainsKey(manifest.Id) || intrinsicFailures.ContainsKey(manifest.Id))
+            {
                 continue;
             }
-            var compatibility = CheckCompatibility(manifest, report);
+            var compatibility = CheckCompatibility(manifest, framework, report);
             if (compatibility != null)
             {
-                compatibilityFailures[manifest.Id] = compatibility;
-                continue;
+                intrinsicFailures[manifest.Id] = new ModOutcome(compatibility.Code, compatibility.Message);
             }
-            preflightInput.Add(manifest);
         }
 
         // ---- gate 2: global assembly identity preflight (metadata only, no LoadFrom) ------
-        var preflight = AssemblyPreflight.Analyze(preflightInput);
-        for (var i = 0; i < preflight.Lines.Count; i++)
+        //
+        // Fixed point over TWO mutually dependent sets:
+        //   * `dependencySet`  - mods blocked because a required dependency cannot run;
+        //   * `conflictSet`    - mods rejected by the current preflight pass.
+        //
+        // They interact: a mod rejected as a conflict co-owner may also be a dependent of a
+        // failed mod, and excluding it for that reason can leave its former conflict partner
+        // healthy again. Phase 1.1 locked the first pass in permanently and therefore reported
+        // such a partner as failed although nothing conflicted with it any more.
+        //
+        // Each round: recompute the dependency closure over (intrinsic + conflictSet), then run
+        // the preflight over everything that is not intrinsically failed and not dependency
+        // blocked. Conflict-caused rejections are NOT accumulated - they are replaced by the new
+        // set, which is what allows a wrongly rejected partner to come back. The loop stops when
+        // the conflict set stops changing; a round bound keeps it deterministic even for a
+        // pathological dependency graph (the last computed state is used and recorded).
+        var conflictSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var dependencySet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var blockedByDependency = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var events = new Dictionary<string, PreflightEvent>(StringComparer.Ordinal);
+        var declaredFiles = 0;
+        var contentPolicy = "";
+        var rounds = 0;
+        var roundLimit = plan.Order.Count * 2 + 4;
+        AssemblyPreflightResult preflight;
+
+        while (true)
         {
-            report.AddLine(preflight.Lines[i]);
+            rounds++;
+
+            // 1. Dependency closure over the causes that are already settled. A mod that is
+            //    currently conflict-rejected is allowed to move to "dependency blocked": the
+            //    dependency reason is the more fundamental one, and (crucially) removing it from
+            //    the conflict set lets its former partner be re-evaluated.
+            dependencySet.Clear();
+            blockedByDependency.Clear();
+            var changed = true;
+            while (changed)
+            {
+                changed = false;
+                for (var i = 0; i < plan.Order.Count; i++)
+                {
+                    var manifest = plan.Order[i];
+                    if (!byId.ContainsKey(manifest.Id) ||
+                        intrinsicFailures.ContainsKey(manifest.Id) ||
+                        dependencySet.Contains(manifest.Id))
+                    {
+                        continue;
+                    }
+                    var blockedBy = FirstExcludedRequiredDependency(manifest, intrinsicFailures, conflictSet, dependencySet);
+                    if (blockedBy == null)
+                    {
+                        continue;
+                    }
+                    dependencySet.Add(manifest.Id);
+                    blockedByDependency[manifest.Id] = blockedBy;
+                    conflictSet.Remove(manifest.Id);
+                    changed = true;
+                }
+            }
+
+            // 2. Preflight every mod that could still run.
+            var pool = new List<ModManifest>();
+            for (var i = 0; i < plan.Order.Count; i++)
+            {
+                var manifest = plan.Order[i];
+                if (!byId.ContainsKey(manifest.Id) ||
+                    intrinsicFailures.ContainsKey(manifest.Id) ||
+                    dependencySet.Contains(manifest.Id))
+                {
+                    continue;
+                }
+                pool.Add(manifest);
+            }
+            preflight = AssemblyPreflight.Analyze(pool);
+            CollectPreflightEvents(preflight, events);
+            if (preflight.DeclaredFiles > declaredFiles)
+            {
+                declaredFiles = preflight.DeclaredFiles;
+            }
+            if (contentPolicy.Length == 0)
+            {
+                contentPolicy = preflight.ContentPolicy;
+            }
+
+            // 3. A mod whose own declared file is missing/damaged, or that collides with a host
+            //    assembly, cannot be repaired by removing another mod: that is intrinsic.
+            var addedIntrinsic = 0;
+            foreach (var rejection in preflight.Rejections)
+            {
+                if (!IsIntrinsicPreflightCode(rejection.Value.Code) ||
+                    intrinsicFailures.ContainsKey(rejection.Key))
+                {
+                    continue;
+                }
+                intrinsicFailures[rejection.Key] = new ModOutcome(rejection.Value.Code, rejection.Value.Message);
+                // An intrinsic failure is settled, so it must not keep a stale conflict membership.
+                conflictSet.Remove(rejection.Key);
+                addedIntrinsic++;
+            }
+            if (addedIntrinsic > 0)
+            {
+                if (rounds > roundLimit)
+                {
+                    break;
+                }
+                continue;
+            }
+
+            // 4. What is left can only be symmetric conflicts. Recompute them from scratch.
+            var newConflictSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rejection in preflight.Rejections)
+            {
+                newConflictSet.Add(rejection.Key);
+            }
+            if (newConflictSet.SetEquals(conflictSet))
+            {
+                break;
+            }
+            conflictSet = newConflictSet;
+            if (rounds > roundLimit)
+            {
+                break;
+            }
         }
+
+        // 5. Final classification, rebuilt from the three settled sets. Dependency failure
+        //    outranks a conflict for the same mod: the mod could not run because its dependency
+        //    did not, whatever else is true of it.
+        var outcomes = new Dictionary<string, ModOutcome>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pair in intrinsicFailures)
+        {
+            outcomes[pair.Key] = pair.Value;
+        }
+        foreach (var id in dependencySet)
+        {
+            string? blockedBy;
+            if (!blockedByDependency.TryGetValue(id, out blockedBy) || blockedBy == null)
+            {
+                blockedBy = "unknown";
+            }
+            outcomes[id] = new ModOutcome(ErrorCodes.DependencyFailed,
+                "required dependency \"" + blockedBy + "\" did not initialize");
+            report.AddLine("dependency-blocked=" + id + " blocked-by=" + blockedBy +
+                           " code=" + ErrorCodes.DependencyFailed);
+        }
+        foreach (var id in conflictSet)
+        {
+            if (outcomes.ContainsKey(id))
+            {
+                continue;
+            }
+            GateProblem? problem;
+            if (preflight.Rejections.TryGetValue(id, out problem) && problem != null)
+            {
+                outcomes[id] = new ModOutcome(problem.Code, problem.Message);
+            }
+        }
+
+        RenderPreflight(report, events, outcomes, declaredFiles, contentPolicy);
         report.AddLine("preflight-stage=complete");
+        report.AddLine("preflight-rounds=" + rounds);
 
         var initialized = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
 
@@ -233,10 +412,11 @@ public static class Loader
                 continue;
             }
 
-            DependencyProblem? problem;
-            if (plan.Problems.TryGetValue(manifest.Id, out problem) && problem != null)
+            ModOutcome? outcome;
+            if (outcomes.TryGetValue(manifest.Id, out outcome) && outcome != null)
             {
-                record.Fail(problem.Code, problem.Message);
+                record.Fail(outcome.Code, outcome.Message);
+                initialized[manifest.Id] = false;
                 continue;
             }
 
@@ -251,21 +431,9 @@ public static class Loader
                 }
             }
 
-            GateProblem? gateFailure;
-            if (compatibilityFailures.TryGetValue(manifest.Id, out gateFailure) && gateFailure != null)
-            {
-                record.Fail(gateFailure.Code, gateFailure.Message);
-                initialized[manifest.Id] = false;
-                continue;
-            }
-
-            if (preflight.Rejections.TryGetValue(manifest.Id, out gateFailure) && gateFailure != null)
-            {
-                record.Fail(gateFailure.Code, gateFailure.Message);
-                initialized[manifest.Id] = false;
-                continue;
-            }
-
+            // Defence in depth only: the fixed point above already blocked every mod whose
+            // required dependency failed before the preflight. This still catches a dependency
+            // that failed while mods were initializing.
             var blockedBy = FirstFailedDependency(manifest, initialized);
             if (blockedBy != null)
             {
@@ -300,25 +468,31 @@ public static class Loader
     /// rejected with its own stable code. Phase 1 used to warn and load; that turned a missing
     /// detection into a silent bypass of the mod's own compatibility claim.
     /// </summary>
-    private static GateProblem? CheckCompatibility(ModManifest manifest, LoadReport report)
+    private static GateProblem? CheckCompatibility(ModManifest manifest, FrameworkVersionInfo framework, LoadReport report)
     {
         if (manifest.FrameworkVersion.Text != "*")
         {
-            var frameworkText = FrameworkVersion();
-            SemVersion framework;
-            string frameworkError;
-            if (!SemVersion.TryParse(frameworkText, out framework, out frameworkError))
+            if (framework.State == FrameworkVersionState.Unknown)
+            {
+                // Fail closed: "cannot be determined" is not "0.0.0", and a declared range must
+                // never be checked against a placeholder.
+                return new GateProblem(ErrorCodes.FrameworkVersionUnknown,
+                    "requires framework \"" + manifest.FrameworkVersion.Describe() +
+                    "\" but the running framework version could not be determined, so the range cannot be enforced " +
+                    "(declare \"frameworkVersion\": \"*\" if the mod does not depend on the framework version)");
+            }
+            if (framework.State == FrameworkVersionState.Invalid || framework.Value == null)
             {
                 return new GateProblem(ErrorCodes.FrameworkVersionInvalid,
                     "requires framework \"" + manifest.FrameworkVersion.Describe() +
-                    "\" but the running framework version " + Describe(frameworkText) +
+                    "\" but the running framework version " + Describe(framework.Text) +
                     " is not a valid semantic version, so the range cannot be enforced");
             }
-            if (!manifest.FrameworkVersion.IsSatisfiedBy(framework))
+            if (!manifest.FrameworkVersion.IsSatisfiedBy(framework.Value!))
             {
                 return new GateProblem(ErrorCodes.FrameworkVersionUnsupported,
                     "requires framework \"" + manifest.FrameworkVersion.Describe() +
-                    "\" but this framework is " + frameworkText);
+                    "\" but this framework is " + framework.Text);
             }
         }
 
@@ -364,6 +538,234 @@ public static class Loader
     private static string Describe(string version)
     {
         return version.Length == 0 ? "\"\"" : "\"" + version + "\"";
+    }
+
+    /// <summary>One mod's terminal classification, decided before any assembly is loaded.</summary>
+    private sealed class ModOutcome
+    {
+        internal ModOutcome(string code, string message)
+        {
+            Code = code;
+            Message = message;
+        }
+
+        internal string Code { get; }
+
+        internal string Message { get; }
+    }
+
+    /// <summary>
+    /// First required dependency of <paramref name="manifest"/> that is already excluded by any
+    /// of the three sets, or <c>null</c>.
+    ///
+    /// Optional dependencies never block: that is the manifest contract, and it is the one case
+    /// where a failure must not spread. Everything is driven by the deterministic plan order and
+    /// by each manifest's own dependency order, so the outcome cannot depend on directory
+    /// enumeration or file-system ordering.
+    /// </summary>
+    private static string? FirstExcludedRequiredDependency(
+        ModManifest manifest,
+        Dictionary<string, ModOutcome> intrinsicFailures,
+        HashSet<string> conflictSet,
+        HashSet<string> dependencySet)
+    {
+        for (var i = 0; i < manifest.Dependencies.Count; i++)
+        {
+            var dep = manifest.Dependencies[i];
+            if (dep.Optional)
+            {
+                continue;
+            }
+            if (intrinsicFailures.ContainsKey(dep.Id) || conflictSet.Contains(dep.Id) ||
+                dependencySet.Contains(dep.Id))
+            {
+                return dep.Id;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Rejections that describe this mod's own declarations and cannot be cured by removing
+    /// another mod: a missing file, a damaged file, or a collision with the host.
+    /// </summary>
+    private static bool IsIntrinsicPreflightCode(string code)
+    {
+        return code == ErrorCodes.EntryAssemblyMissing ||
+               code == ErrorCodes.AssemblyIdentityUnreadable ||
+               code == ErrorCodes.HostAssemblyConflict;
+    }
+
+    /// <summary>Keeps one copy of every finding across all preflight rounds.</summary>
+    private static void CollectPreflightEvents(
+        AssemblyPreflightResult preflight,
+        Dictionary<string, PreflightEvent> events)
+    {
+        for (var i = 0; i < preflight.Events.Count; i++)
+        {
+            var e = preflight.Events[i];
+            if (!events.ContainsKey(e.Key))
+            {
+                events[e.Key] = e;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Renders the preflight section against the <b>final</b> classification.
+    ///
+    /// A finding only survives if it still explains a rejection, or if it still describes the
+    /// mods that are going to load. That is what stops a transient early-round conflict - formed
+    /// together with a mod that was later excluded for an unrelated reason - from appearing as
+    /// the reason a healthy mod failed.
+    /// </summary>
+    private static void RenderPreflight(
+        LoadReport report,
+        Dictionary<string, PreflightEvent> events,
+        Dictionary<string, ModOutcome> outcomes,
+        int declaredFiles,
+        string contentPolicy)
+    {
+        var ordered = new List<PreflightEvent>(events.Values);
+        ordered.Sort((a, b) => string.Compare(a.Key, b.Key, StringComparison.Ordinal));
+
+        var conflicts = 0;
+        var shared = 0;
+        var hostShared = 0;
+        var hostUnverified = 0;
+
+        for (var i = 0; i < ordered.Count; i++)
+        {
+            var e = ordered[i];
+            switch (e.Kind)
+            {
+                case PreflightEventKind.ModConflict:
+                {
+                    var kept = new List<string>();
+                    for (var o = 0; o < e.Owners.Count; o++)
+                    {
+                        if (RejectedWith(e.Owners[o], outcomes, ErrorCodes.AssemblyIdentityConflict))
+                        {
+                            kept.Add(e.OwnerLabels[o]);
+                        }
+                    }
+                    if (kept.Count < 2)
+                    {
+                        break;
+                    }
+                    conflicts++;
+                    report.AddLine("preflight-conflict=" + e.SimpleName + " kind=mod owners=" +
+                                   JoinValues(kept) + " identities=" + e.Identities);
+                    break;
+                }
+
+                case PreflightEventKind.HostConflict:
+                    if (!RejectedWith(e.Owners[0], outcomes, ErrorCodes.HostAssemblyConflict))
+                    {
+                        break;
+                    }
+                    report.AddLine("preflight-conflict=" + e.SimpleName + " kind=host owner=" +
+                                   e.OwnerLabels[0] + " identity=" + e.Identities);
+                    break;
+
+                case PreflightEventKind.HostUnverifiable:
+                    if (!RejectedWith(e.Owners[0], outcomes, ErrorCodes.HostAssemblyConflict))
+                    {
+                        break;
+                    }
+                    hostUnverified++;
+                    report.AddLine("preflight-host-unverifiable-rejected=" + e.SimpleName + " owner=" +
+                                   e.OwnerLabels[0] + " " + e.Detail);
+                    break;
+
+                case PreflightEventKind.HostAmbiguous:
+                    if (!RejectedWith(e.Owners[0], outcomes, ErrorCodes.HostAssemblyConflict))
+                    {
+                        break;
+                    }
+                    report.AddLine("preflight-host-ambiguous=" + e.SimpleName + " owner=" +
+                                   e.OwnerLabels[0] + " " + e.Detail);
+                    break;
+
+                case PreflightEventKind.Shared:
+                {
+                    var anyRejected = false;
+                    for (var o = 0; o < e.Owners.Count; o++)
+                    {
+                        if (outcomes.ContainsKey(e.Owners[o]))
+                        {
+                            anyRejected = true;
+                            break;
+                        }
+                    }
+                    if (anyRejected)
+                    {
+                        break;
+                    }
+                    shared += e.Owners.Count - 1;
+                    var parts = e.Detail.Split('|');
+                    report.AddLine("preflight-shared=" + e.SimpleName + " canonical=" + parts[0] +
+                                   " representative=" + parts[1] + " owners=" + parts[2]);
+                    break;
+                }
+
+                case PreflightEventKind.HostShare:
+                    if (outcomes.ContainsKey(e.Owners[0]))
+                    {
+                        break;
+                    }
+                    hostShared++;
+                    report.AddLine("preflight-host-share=" + e.SimpleName + " owner=" + e.Owners[0] +
+                                   " " + e.Detail);
+                    break;
+            }
+        }
+
+        var rejectedByPreflight = 0;
+        foreach (var pair in outcomes)
+        {
+            if (IsPreflightCode(pair.Value.Code))
+            {
+                rejectedByPreflight++;
+            }
+        }
+
+        report.AddLine("preflight=assemblies=" + declaredFiles +
+                       " conflicts=" + conflicts +
+                       " shared=" + shared +
+                       " host-shared=" + hostShared +
+                       " host-unverified=" + hostUnverified +
+                       " rejected=" + rejectedByPreflight);
+        report.AddLine("preflight-content-identity=" + contentPolicy);
+    }
+
+    private static bool IsPreflightCode(string code)
+    {
+        return code == ErrorCodes.EntryAssemblyMissing ||
+               code == ErrorCodes.AssemblyIdentityUnreadable ||
+               code == ErrorCodes.AssemblyIdentityConflict ||
+               code == ErrorCodes.HostAssemblyConflict;
+    }
+
+    private static bool RejectedWith(string modId, Dictionary<string, ModOutcome> outcomes, string code)
+    {
+        ModOutcome? outcome;
+        return outcomes.TryGetValue(modId, out outcome) && outcome != null &&
+               string.Equals(outcome.Code, code, StringComparison.Ordinal);
+    }
+
+    private static string JoinValues(List<string> values)
+    {
+        var text = "";
+        for (var i = 0; i < values.Count; i++)
+        {
+            if (i > 0)
+            {
+                text += ",";
+            }
+            text += values[i];
+        }
+        return text;
     }
 
     private static string? FirstFailedDependency(ModManifest manifest, Dictionary<string, bool> initialized)
@@ -447,7 +849,11 @@ public static class Loader
                 return;
             }
             NoteShared(record, entryClaim);
-            record.SetAssemblyPath(entryClaim.CanonicalPath);
+            // Path-free display value: the report names the declared file, or the host when the
+            // mod reuses an already loaded instance. An absolute path is never persisted.
+            record.SetAssemblyPath(entryClaim.Resolution == AssemblyResolution.ShareFromHost
+                ? "host:" + entryClaim.Identity.Name
+                : manifest.EntryAssembly);
 
             var expectedName = Path.GetFileNameWithoutExtension(manifest.EntryAssembly);
             var actualName = assembly.GetName().Name;
@@ -683,7 +1089,9 @@ public static class Loader
 
     private static string DescribeException(Exception ex)
     {
-        return ex.GetType().Name + ": " + ex.Message;
+        // Exception type plus a path-free reason. The raw message of an IO exception quotes the
+        // absolute file name, and the report is persisted, so it must not be copied verbatim.
+        return PathScrubber.Describe(ex);
     }
 
     /// <summary>How confident the loader is about the running game version.</summary>
@@ -785,27 +1193,101 @@ public static class Loader
         return version.Major + "." + version.Minor + "." + version.Build;
     }
 
-    internal static string FrameworkVersion()
+    /// <summary>How confident the loader is about the running ModFramework.Runtime version.</summary>
+    internal enum FrameworkVersionState
     {
-        var text = FrameworkVersionOverride;
-        if (text != null)
+        /// <summary>A version was read and parses as SemVer.</summary>
+        Known = 0,
+
+        /// <summary>The version could not be read at all: it is <b>not</b> "0.0.0".</summary>
+        Unknown = 1,
+
+        /// <summary>A version was read but it is not SemVer.</summary>
+        Invalid = 2,
+    }
+
+    internal sealed class FrameworkVersionInfo
+    {
+        internal string Text = "unknown";
+
+        internal FrameworkVersionState State = FrameworkVersionState.Unknown;
+
+        internal SemVersion? Value;
+    }
+
+    /// <summary>
+    /// Version of the running <c>ModFramework.Runtime</c>, mapped to the three-part SemVer form
+    /// the manifest ranges use.
+    ///
+    /// Phase 1.1 returned the placeholder <c>"0.0.0"</c> when the version could not be read.
+    /// That is a <i>valid</i> semantic version, so an explicit manifest range was then evaluated
+    /// against a version the loader had invented. Phase 1.1.1 keeps the three states apart and
+    /// lets the compatibility gate fail closed on the two non-<see cref="FrameworkVersionState.Known"/>
+    /// ones.
+    /// </summary>
+    internal static FrameworkVersionInfo DetectFrameworkVersion()
+    {
+        var info = new FrameworkVersionInfo();
+
+        var overrideText = FrameworkVersionOverride;
+        if (overrideText != null)
         {
-            return text;
+            info.Text = overrideText;
+            ClassifyFrameworkVersion(info);
+            return info;
         }
-        try
+
+        if (!FrameworkVersionUnavailableForTests)
         {
-            var name = typeof(Loader).Assembly.GetName();
-            var version = name.Version;
-            if (version != null)
+            try
             {
-                return version.Major + "." + version.Minor + "." + version.Build;
+                var name = typeof(Loader).Assembly.GetName();
+                var version = name.Version;
+                if (version != null && version.Major >= 0 && version.Minor >= 0 && version.Build >= 0)
+                {
+                    info.Text = version.Major + "." + version.Minor + "." + version.Build;
+                    ClassifyFrameworkVersion(info);
+                    return info;
+                }
+            }
+            catch (Exception)
+            {
+                // Unknown is a valid answer; it is never replaced by a placeholder version.
             }
         }
-        catch (Exception)
+
+        info.State = FrameworkVersionState.Unknown;
+        info.Text = "unknown";
+        return info;
+    }
+
+    private static void ClassifyFrameworkVersion(FrameworkVersionInfo info)
+    {
+        SemVersion parsed;
+        string error;
+        if (SemVersion.TryParse(info.Text, out parsed, out error))
         {
-            // fall through
+            info.State = FrameworkVersionState.Known;
+            info.Value = parsed;
+            return;
         }
-        return "0.0.0";
+        info.State = FrameworkVersionState.Invalid;
+        info.Value = null;
+    }
+
+    internal static string FrameworkVersion()
+    {
+        return DetectFrameworkVersion().Text;
+    }
+
+    private static string FrameworkStateText(FrameworkVersionState state)
+    {
+        switch (state)
+        {
+            case FrameworkVersionState.Known: return "known";
+            case FrameworkVersionState.Invalid: return "invalid";
+            default: return "unknown";
+        }
     }
 
     internal static string DefaultModsRoot()
@@ -874,7 +1356,7 @@ public static class Loader
         var stack = ex.StackTrace;
         if (!string.IsNullOrEmpty(stack))
         {
-            report.AddLine("stack=" + stack!.Replace("\n", " | "));
+            report.AddLine("stack=" + PathScrubber.Scrub(stack!).Replace("\n", " | "));
         }
         return report.Render();
     }
@@ -929,8 +1411,12 @@ public static class Loader
         {
             var sb = new StringBuilder();
             sb.AppendLine("loader-report " + DateTimeOffset.Now.ToString("O"));
-            sb.AppendLine("locate=" + RuntimeDirectory);
-            sb.AppendLine("mods-root=" + ModsRoot);
+            // Path policy (Phase 1.1.1): the report is persisted next to the mods and may be
+            // shared when someone asks for help, so it carries no host location. The runtime
+            // directory and the mods root are reduced to their last segment, and each mod is
+            // named by its own package directory relative to the root.
+            sb.AppendLine("locate=" + PathScrubber.Leaf(RuntimeDirectory));
+            sb.AppendLine("mods-root=" + DescribeRoot(ModsRoot));
             sb.AppendLine("game-version=" + GameVersion);
             sb.AppendLine("game-version-state=" + StateText(GameVersionState));
             sb.AppendLine("game-version-source=" + GameVersionSource);
@@ -978,10 +1464,18 @@ public static class Loader
                     sb.Append("  - id=" + record.Id + " state=" + record.State);
                     if (record.ErrorCode.Length > 0)
                     {
-                        sb.Append(" code=" + record.ErrorCode + " message=" + record.ErrorMessage);
+                        sb.Append(" code=" + record.ErrorCode);
+                    }
+                    if (record.FailureKind.Length > 0)
+                    {
+                        sb.Append(" kind=" + record.FailureKind);
+                    }
+                    if (record.ErrorCode.Length > 0)
+                    {
+                        sb.Append(" message=" + record.ErrorMessage);
                     }
                     sb.AppendLine();
-                    sb.AppendLine("    dir=" + record.Directory);
+                    sb.AppendLine("    dir=" + relativeDirectory(record));
                     if (record.AssemblyPath.Length > 0)
                     {
                         sb.AppendLine("    assembly=" + record.AssemblyPath);
@@ -997,6 +1491,24 @@ public static class Loader
             }
 
             return sb.ToString();
+        }
+
+        /// <summary>The mod's package directory, relative to the mods root: never a host path.</summary>
+        private string relativeDirectory(ModRecord record)
+        {
+            var component = record.DirectoryName;
+            if (string.IsNullOrEmpty(component))
+            {
+                component = PathScrubber.Leaf(record.Directory);
+            }
+            return component.Length == 0 ? "." : component;
+        }
+
+        /// <summary>The mods root reduced to its last segment (or "." when it has none).</summary>
+        private static string DescribeRoot(string root)
+        {
+            var leaf = PathScrubber.Leaf(root);
+            return leaf.Length == 0 ? "." : leaf;
         }
 
         private static string DescribeList(List<string> values)

@@ -99,6 +99,33 @@ VARIANTS = [
     ("host_collision", PLAIN_LIB,
      {"PlainAssemblyName": "ModFramework.Runtime", "PlainAssemblyVersion": "9.9.9.0"},
      "ModFramework.Runtime", "HostConflict.ModFramework.Runtime.dll"),
+
+    # Phase 1.1.1: dependency pre-propagation. Each scenario needs assemblies that no other
+    # test loads, so "already present in the AppDomain" can never mask the propagation rule.
+    ("phase_a1_v1", CONFLICT_LIB,
+     {"ConflictAssemblyName": "PhaseA1Lib", "ConflictAssemblyVersion": "1.0.0.0"},
+     "PhaseA1Lib", "PhaseA1Lib.v1.dll"),
+    ("phase_a1_v2", CONFLICT_LIB,
+     {"ConflictAssemblyName": "PhaseA1Lib", "ConflictAssemblyVersion": "2.0.0.0", "Variant": "VARIANT_B"},
+     "PhaseA1Lib", "PhaseA1Lib.v2.dll"),
+    ("phase_a2_v1", CONFLICT_LIB,
+     {"ConflictAssemblyName": "PhaseA2Lib", "ConflictAssemblyVersion": "1.0.0.0"},
+     "PhaseA2Lib", "PhaseA2Lib.v1.dll"),
+    ("phase_a2_v2", CONFLICT_LIB,
+     {"ConflictAssemblyName": "PhaseA2Lib", "ConflictAssemblyVersion": "2.0.0.0", "Variant": "VARIANT_B"},
+     "PhaseA2Lib", "PhaseA2Lib.v2.dll"),
+    ("phase_a2b_v1", CONFLICT_LIB,
+     {"ConflictAssemblyName": "PhaseA2Lib2", "ConflictAssemblyVersion": "1.0.0.0"},
+     "PhaseA2Lib2", "PhaseA2Lib2.v1.dll"),
+    ("phase_a2b_v2", CONFLICT_LIB,
+     {"ConflictAssemblyName": "PhaseA2Lib2", "ConflictAssemblyVersion": "2.0.0.0", "Variant": "VARIANT_B"},
+     "PhaseA2Lib2", "PhaseA2Lib2.v2.dll"),
+    ("phase_a3_v1", CONFLICT_LIB,
+     {"ConflictAssemblyName": "PhaseA3Lib", "ConflictAssemblyVersion": "1.0.0.0"},
+     "PhaseA3Lib", "PhaseA3Lib.v1.dll"),
+    ("phase_a3_v2", CONFLICT_LIB,
+     {"ConflictAssemblyName": "PhaseA3Lib", "ConflictAssemblyVersion": "2.0.0.0", "Variant": "VARIANT_B"},
+     "PhaseA3Lib", "PhaseA3Lib.v2.dll"),
 ]
 
 
@@ -135,6 +162,10 @@ def build_variants(dotnet, variants_root, fixtures_dir):
 
 
 def main():
+    # The host prints assembly identities, and a malformed-input test can legitimately surface
+    # a replacement character. Never let the console codec turn that into a crash.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser()
     ap.add_argument("--dotnet", default=os.path.join(ROOT, ".tmp", "phase0.5", "dotnet", "dotnet.exe"),
                     help="dotnet executable (default: the private SDK, or pass 'dotnet' for a system SDK)")
@@ -233,6 +264,19 @@ def main():
     if hello_world_dir:
         check("hello_world_host_run", "hello_world_discovered" in out and "FAIL hello_world" not in out,
               "example mod initialized through the real manifest")
+
+    # ------------------------------------------- Phase 1.1.1 parser differential
+    # Read-only: the game's own reference assemblies are parsed and compared against the desktop
+    # BCL parser. Only counts and file names are printed; nothing is copied into the repository
+    # and no absolute path is echoed.
+    if refs:
+        rc, diff_out, secs = run([dotnet, test_dll, "--diff-refs", refs])
+        detail = ""
+        for line in diff_out.splitlines():
+            if "compared" in line:
+                detail = line.strip().replace("\ufeff", "")
+        check("p111_parser_differential_65_refs", rc == 0 and "RESULT: OK" in diff_out,
+              "rc=%d %.1fs %s" % (rc, secs, detail or tail(diff_out, 3)))
 
     print("\nartifacts: " + artifacts)
     return finish()

@@ -53,6 +53,8 @@ python Tools/AssemblyStore/store.py extract app/src/main/apkroot/assemblies/asse
 | 文本 | `StringBuilder`（含 `AppendLine`）、`Encoding.UTF8`、`string.Split(char[], StringSplitOptions)`、`string.Join`、`CompareOrdinal`、`Trim`、`PadLeft`、`ToLowerInvariant` | |
 | 环境 | `Environment.NewLine`、`Environment.GetEnvironmentVariable` | **没有** `Environment.CurrentDirectory` |
 | 进程内程序集清单 | `Assembly.GetEntryAssembly()`、`AppDomain.CurrentDomain.GetAssemblies()` | 用来找 `StardewValley` 判断游戏版本 |
+| 程序集身份 | `Assembly.GetName()`、`AssemblyName.GetPublicKeyToken()`、`Assembly.Location`、`Assembly.IsDynamic` | **没有** `AssemblyName.GetPublicKey()`（见 3.2）；Token 是宿主能给出的全部强名称身份 |
+| 密码学摘要 | `SHA256.HashData(byte[])` | 只用于内容摘要的快速否定；相等判定仍走逐字节比较 |
 | 控制台 | `Console.WriteLine` / `Console.Error.WriteLine` | 输出进 logcat |
 
 ### 3.2 不可用（编译期证据）
@@ -75,6 +77,7 @@ python Tools/AssemblyStore/store.py extract app/src/main/apkroot/assemblies/asse
 | `Assembly.Load(byte[])` | `CS1503`（Phase 0 记录 + 编译期） | 唯一入口是 `Assembly.LoadFrom(string)` |
 | `Reflection.Emit` / `DynamicMethod` / `AssemblyBuilder` | `CS0234` / `CS7036` | Harmony 类方案在本运行时不可行（Phase 0 结论，ADR §6） |
 | `AppContext` / `RuntimeInformation` / `RuntimeFeature` | `CS0117` / `CS0234` | 不做运行时特性探测 |
+| `AssemblyName.GetPublicKey()` | `CS1061`（Phase 1.1.1 实测，AndroidRefsDir 编译） | 拿不到**完整公钥**，只有 `GetPublicKeyToken()`；因此预检从文件读到的完整公钥要用 ECMA-335 规则（SHA-1 末 8 字节倒序）派生成 Token 才能与宿主比较，见 `PublicKeyToken.cs` |
 
 > 注意：`System.Linq.dll` 这个**文件**在 65 个程序集里，但 `Enumerable` 的扩展方法被裁掉了。
 > 引用存在 ≠ 成员存在，必须按成员判断。
