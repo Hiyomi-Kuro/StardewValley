@@ -680,23 +680,98 @@ internal static class ManagedAssemblyReader
         identity.Flags = flags;
         identity.Name = name;
         identity.Culture = culture == "neutral" ? "" : culture;
-        if (publicKeyBlob.Length > 0)
+
+        byte[] publicKey;
+        byte[] publicKeyToken;
+        if (!TryClassifyKeyBlob(flags, publicKeyBlob, out publicKey, out publicKeyToken, out error))
         {
-            if ((flags & AssemblyFlagBits.PublicKey) != 0)
-            {
-                // A full public key: keep the raw bytes *and* derive the token, so this side is
-                // comparable with a loaded host assembly that only exposes its token.
-                identity.PublicKey = publicKeyBlob;
-                identity.PublicKeyToken = PublicKeyToken.Derive(publicKeyBlob);
-            }
-            else
-            {
-                // The blob is already a token; deriving anything from it would be fabrication.
-                identity.PublicKeyToken = publicKeyBlob;
-            }
+            return false;
         }
+        identity.PublicKey = publicKey;
+        identity.PublicKeyToken = publicKeyToken;
         return true;
     }
+
+    /// <summary>
+    /// ECMA-335 II.23.1.2 <c>Assembly.Flags.PublicKey</c> (0x0001) and II.6.2.1.3 decide what the
+    /// <c>Assembly.PublicKey</c> blob <i>is</i>: with the flag set it is the full public key, with
+    /// the flag clear it is the 8-byte public key token. Both halves are fixed-size structures, so
+    /// a combination that cannot be either is a malformed row, and it is refused instead of being
+    /// guessed.
+    ///
+    /// <para>Exactly four shapes are well formed:</para>
+    /// <list type="bullet">
+    ///   <item>no flag, empty blob - unsigned assembly;</item>
+    ///   <item>no flag, 8-byte blob - the token (<c>PublicKeyToken</c>);</item>
+    ///   <item>flag set, blob of 12 or more bytes - a <c>PublicKeyBlob</c>
+    ///     (SigAlgID, HashAlgID, cbPublicKey, then the key), kept verbatim and also reduced to its
+    ///     token with <see cref="PublicKeyToken.Derive"/> so the two sides are comparable.</item>
+    /// </list>
+    /// Everything else is rejected: the flag without a blob, the flag with a blob that can only be
+    /// a token (8 bytes) or is too short to hold the 12-byte header, and a token blob whose length
+    /// is not 8.
+    ///
+    /// <para><b>Not validated on purpose:</b> the reserved bits of <c>Flags</c>, the
+    /// <c>ContentTypeMask</c> bits and the key material itself. The reader only needs the
+    /// representation to be consistent; calling a syntactically complete blob "a valid RSA key"
+    /// would be a claim it cannot make, and rejecting reserved bits would refuse assemblies the
+    /// specification allows.</para>
+    /// </summary>
+    private static bool TryClassifyKeyBlob(
+        int flags,
+        byte[] blob,
+        out byte[] publicKey,
+        out byte[] publicKeyToken,
+        out string error)
+    {
+        publicKey = Array.Empty<byte>();
+        publicKeyToken = Array.Empty<byte>();
+        error = "";
+
+        var hasKeyFlag = (flags & AssemblyFlagBits.PublicKey) != 0;
+        if (blob.Length == 0)
+        {
+            if (hasKeyFlag)
+            {
+                error = "the Assembly.PublicKey flag is set but the public key blob is empty";
+                return false;
+            }
+            return true;
+        }
+
+        if (hasKeyFlag)
+        {
+            if (blob.Length == PublicKeyToken.TokenLength)
+            {
+                error = "the Assembly.PublicKey flag is set but the blob is " + blob.Length +
+                        " bytes, which is a public key token, not a full public key";
+                return false;
+            }
+            if (blob.Length < FullPublicKeyHeaderLength)
+            {
+                error = "the Assembly.PublicKey flag is set but the blob is " + blob.Length +
+                        " bytes, too short to be a full public key (" + FullPublicKeyHeaderLength +
+                        "-byte header + key)";
+                return false;
+            }
+            publicKey = blob;
+            publicKeyToken = PublicKeyToken.Derive(blob);
+            return true;
+        }
+
+        if (blob.Length != PublicKeyToken.TokenLength)
+        {
+            error = "the Assembly.PublicKey flag is clear, so the blob must be an " +
+                    PublicKeyToken.TokenLength + "-byte public key token, but it is " + blob.Length + " bytes";
+            return false;
+        }
+        publicKeyToken = blob;
+        return true;
+    }
+
+    /// <summary><c>PublicKeyBlob</c>: SigAlgID (4), HashAlgID (4), cbPublicKey (4).</summary>
+    private const int FullPublicKeyHeaderLength = 12;
+
 
     private static bool TryReadString(byte[] bytes, Heaps heaps, int index, out string value, out string error)
     {

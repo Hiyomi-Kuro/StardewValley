@@ -71,6 +71,9 @@ internal static class Program
                 // Phase 1.1.1: dependency pre-propagation, secure content identity, host
                 // fail-closed matching, PE/CLI bounds, framework-version state and redaction.
                 Phase111Tests.Run(runner, fixtureDir);
+                // Phase 1.1.2: snapshot binding (TOCTOU), ContentIdentity fault branches, the
+                // positive host-share path, ECMA-335 assembly flags and fixed-point convergence.
+                Phase112Tests.Run(runner, fixtureDir);
                 if (helloWorldDir.Length > 0)
                 {
                     HostTests.HelloWorld(runner, helloWorldDir);

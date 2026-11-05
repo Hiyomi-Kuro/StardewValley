@@ -138,6 +138,68 @@ internal static class ContentIdentity
     }
 
     /// <summary>
+    /// Proves that a file holds exactly <paramref name="expected"/>, byte for byte (Phase 1.1.2).
+    ///
+    /// Used right after the snapshot is written: the buffer that was parsed and hashed by the
+    /// preflight is still in memory, so "the staged copy is the preflighted content" is decided by
+    /// a full comparison rather than by a digest.
+    /// </summary>
+    internal static bool VerifyExactBytes(string path, byte[] expected, out string error)
+    {
+        error = "";
+        Stream? stream = null;
+        try
+        {
+            // Deliberately not Open(): this compares a file the loader itself just created, so the
+            // test seam (which models a third party changing a declared file) must not apply.
+            stream = File.OpenRead(path);
+            if (stream.Length != expected.Length)
+            {
+                error = "the file is " + stream.Length + " bytes, expected " + expected.Length;
+                return false;
+            }
+
+            var buffer = new byte[BufferSize];
+            var offset = 0;
+            while (offset < expected.Length)
+            {
+                var want = expected.Length - offset < BufferSize ? expected.Length - offset : BufferSize;
+                var read = ReadFully(stream, buffer, want);
+                if (read != want)
+                {
+                    error = "the file ended before its recorded length";
+                    return false;
+                }
+                for (var i = 0; i < want; i++)
+                {
+                    if (buffer[i] != expected[offset + i])
+                    {
+                        error = "the contents differ at offset " + (offset + i);
+                        return false;
+                    }
+                }
+                offset += want;
+            }
+
+            if (stream.ReadByte() != -1)
+            {
+                error = "the file has more bytes than expected";
+                return false;
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = PathScrubber.Describe(ex);
+            return false;
+        }
+        finally
+        {
+            Close(stream);
+        }
+    }
+
+    /// <summary>
     /// Length of an existing file, or a path-free reason why it could not be read. Needed for
     /// the host image, whose length was not recorded by the preflight.
     /// </summary>

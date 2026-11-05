@@ -145,6 +145,46 @@ Bootstrap 把非 null 当失败抛异常，而它自己的 catch 会吞掉——
 
 ---
 
+### 3.2 字节快照与加载绑定（Phase 1.1.2）
+
+Phase 1.1.1 的预检已经"读一次、算一次"，但真正加载时仍按**路径**重新打开文件：
+
+```
+TryRead(path) ─► 身份 + 长度 + 摘要（同一 buffer）          [预检]
+       ⋮   ← 这里可以替换文件 / 同长度原位改写
+Assembly.LoadFrom(path) ─► 可能是另一份字节                 [加载]
+```
+
+Phase 1.1.2 让"预检批准的字节"成为**唯一的加载源**：
+
+1. `AssemblyClaimReader.TryRead` 仍然只读一次文件；解析身份、算摘要、**写快照**都用同一个 buffer。
+2. `AssemblyStagingArea.TryStage` 把该 buffer 写入应用私有目录
+   `<Mods>/.staging/<run-id>/<mod id>/<声明文件名>`，随后**把文件读回来逐字节比较**；
+   只有比较通过，claim 才会拿到 `StagedPath` / `SnapshotFingerprint`。
+3. `Assembly.LoadFrom` 的实参永远是 `claim.StagedPath`。mod 声明的路径之后只用于
+   `ContentIdentity` 的字节比较，以及预检阶段"文件在读取期间变了"的判定。
+4. 加载前一刻再校验一次快照（长度 + 指纹：有 SHA-256 用 `sha256:`，运行时没有则用内置
+   `sha1:` 形式）。指纹不匹配 → 该 mod 以 `MF0209` 语义的错误失败，**不加载**。
+5. 同一内容只落一份快照（按指纹去重）；同一 canonical artifact 只 `LoadFrom` 一次
+   （`s_loadedByPath` 的键仍是"实际加载的文件"，现在是快照路径）。
+
+报告因此能区分三个对象：声明文件（`file=`）、快照（`snapshot=`）、最终加载对象
+（`assembly-load=` 与 `canonical=`），且不含任何绝对路径。
+
+不做的两件事，此处写清楚：
+
+- **不能**用 `Assembly.Load(byte[])`：目标运行时把它裁掉了（本阶段重新编译得到 `CS1503`），
+  所以"直接在内存里加载"不是选项。
+- **不宣称**"TOCTOU 不可能"：快照与 mod 同处应用私有存储，同 uid 的代码仍可能在
+  "校验通过"与"`LoadFrom`"之间替换快照。该窗口被压到最小，且一旦发生会被**发现并拒绝**；
+  要做到完全原子化只能依赖 `Assembly.Load(byte[])`，目标运行时没有 → 真机语义标记 BLOCKED。
+
+代价与边界：快照只存在于应用私有目录，单文件上限沿用 `MaxAssemblyBytes`（64 MiB），
+总量上限 256 MiB / 4096 个文件，超出即 fail-closed；每次启动清理上一轮目录（尽力而为）。
+`Assembly.Location` 现在指向快照，因此 mod 取自身数据文件必须用 `IModContext.ModDirectory`。
+
+---
+
 ## 4. 状态机
 
 ```
@@ -232,3 +272,4 @@ Bootstrap（注入进 `StardewValley.dll` 的 IL）只做四件事：
 | 2026-11-05 | 初版：Phase 1 最小 Loader 的设计、时序、状态机、隔离矩阵 |
 | 2026-11-05 | Phase 1.1：裸 DLL 不执行、三态版本门禁、加载前程序集预检、日志降级进报告 |
 | 2026-11-05 | Phase 1.1.1：预检不动点（依赖优先、冲突重算、事件按最终归类过滤）、内容相等改为逐字节判定、宿主匹配 Fail-Closed、PE/CLI 逐层边界、框架版本 Unknown/Invalid 分离、报告与日志脱敏 |
+| 2026-11-06 | Phase 1.1.2：预检字节写入私有快照并只从快照 `LoadFrom`（加载前二次校验指纹）、不动点显式 Converged/Exhausted 且未收敛时 Fail-Closed（`MF0208`）、ECMA-335 PublicKey 标志与 Blob 形状校验（`MF0205`） |

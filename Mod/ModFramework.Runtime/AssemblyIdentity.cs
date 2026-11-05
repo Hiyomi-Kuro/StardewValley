@@ -63,6 +63,21 @@ internal sealed class AssemblyClaim
 
     internal string CanonicalModId = "";
 
+    /// <summary>
+    /// Phase 1.1.2: the immutable staged copy of the exact bytes that were preflighted, or empty
+    /// when the claim is satisfied some other way (host reuse). When it is set, this - and never
+    /// <see cref="Path"/> - is what <c>Assembly.LoadFrom</c> is given, so a replacement of the
+    /// declared file after the preflight cannot change what gets loaded.
+    /// </summary>
+    internal string StagedPath = "";
+
+    /// <summary>
+    /// Content fingerprint of the staged snapshot (<c>sha256:…</c> or, when the runtime has no
+    /// SHA-256, the built-in <c>sha1:…</c> form). Recomputed immediately before the load so a
+    /// snapshot edited after staging is refused instead of being loaded.
+    /// </summary>
+    internal string SnapshotFingerprint = "";
+
     internal Assembly? HostAssembly;
 
     internal string RoleText => Role == AssemblyClaimRole.Entry ? "entry" : "private";
@@ -80,11 +95,18 @@ internal sealed class AssemblyClaim
 /// </summary>
 internal static class AssemblyClaimReader
 {
+    /// <summary>
+    /// Test seam: replaces the file opener so a short read, an early EOF or a file that grows
+    /// while it is being read is reachable deterministically. <c>null</c> in production.
+    /// </summary>
+    internal static Func<string, Stream>? OpenForTests;
+
     internal static bool TryRead(
         string modId,
         AssemblyClaimRole role,
         string declaredName,
         string absolutePath,
+        AssemblyStagingArea? staging,
         out AssemblyClaim claim,
         out string code,
         out string message)
@@ -130,6 +152,21 @@ internal static class AssemblyClaimReader
         claim.Resolution = AssemblyResolution.Load;
         claim.CanonicalPath = absolutePath;
         claim.CanonicalModId = modId;
+
+        // Phase 1.1.2: snapshot the exact buffer that was just parsed and hashed, and prove the
+        // staged copy matches it. From here on this claim is loaded from the snapshot, never from
+        // `absolutePath`, so a replacement after this point cannot change what runs.
+        if (staging != null)
+        {
+            string stageError;
+            if (!staging.TryStage(claim, bytes, out stageError))
+            {
+                code = ErrorCodes.AssemblyStagingFailed;
+                message = "\"" + declaredName + "\": " + stageError;
+                return false;
+            }
+            claim.CanonicalPath = claim.StagedPath;
+        }
         return true;
     }
 
@@ -140,7 +177,7 @@ internal static class AssemblyClaimReader
         error = "";
         try
         {
-            using (var stream = File.OpenRead(path))
+            using (var stream = OpenRead(path))
             {
                 var length = stream.Length;
                 if (length < 0 || length > ManagedAssemblyReader.MaxAssemblyBytes)
@@ -175,6 +212,12 @@ internal static class AssemblyClaimReader
             error = PathScrubber.Describe(ex);
             return false;
         }
+    }
+
+    private static Stream OpenRead(string path)
+    {
+        var open = OpenForTests;
+        return open != null ? open(path) : File.OpenRead(path);
     }
 
     /// <summary>

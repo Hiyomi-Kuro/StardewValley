@@ -64,6 +64,21 @@ public static class Loader
     internal static bool FrameworkVersionUnavailableForTests;
 
     /// <summary>
+    /// Test seam: invoked immediately before <c>Assembly.LoadFrom</c> is issued for one claim.
+    ///
+    /// Phase 1.1.2 uses it to place a replacement inside the "the preflight has finished reading,
+    /// the load has not been issued yet" window, which is the only way to exercise the TOCTOU
+    /// binding deterministically. <c>null</c> in production.
+    /// </summary>
+    internal static Action<AssemblyClaim>? BeforeLoadForTests;
+
+    /// <summary>
+    /// Test seam: replaces the fixed-point round bound so the "did not converge" branch is
+    /// reachable with a two-mod graph. <c>0</c> (the production value) selects the computed bound.
+    /// </summary>
+    internal static int RoundLimitOverrideForTests;
+
+    /// <summary>
     /// Canonical path -&gt; loaded assembly, for the whole process. Guarantees that one file is
     /// handed to <c>Assembly.LoadFrom</c> exactly once even when several mods share it, and
     /// prevents <c>FileLoadException</c> when the loader is invoked again for a second root.
@@ -254,6 +269,29 @@ public static class Loader
         // set, which is what allows a wrongly rejected partner to come back. The loop stops when
         // the conflict set stops changing; a round bound keeps it deterministic even for a
         // pathological dependency graph (the last computed state is used and recorded).
+        //
+        // Phase 1.1.2: "stopped changing" is now an explicit state. A repeated (or unbounded)
+        // iteration means the loader could not classify the candidates, and an unclassified
+        // candidate must not be loaded - see `MF0208` below. The previous code simply broke out of
+        // the loop and classified whatever state happened to be current.
+        var staging = AssemblyStagingArea.TryCreate(modsRoot, out var stagingError);
+        if (staging == null)
+        {
+            // Without a snapshot area the approved bytes cannot be the loaded bytes, so nothing is
+            // loaded at all rather than falling back to path loading.
+            var stagingMessage = ErrorCodes.AssemblyStagingFailed + ": " +
+                                 ErrorCodes.Describe(ErrorCodes.AssemblyStagingFailed) +
+                                 " (" + stagingError + ")";
+            report.Result = "failed";
+            report.AddLine("result=failed");
+            report.AddLine("assembly-snapshot=unavailable");
+            report.AddLine("error=" + stagingMessage);
+            WriteReport(report);
+            return stagingMessage;
+        }
+        report.AddLine("assembly-snapshot=private");
+        report.AddLine("assembly-snapshot-policy=staged-then-verified");
+
         var conflictSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var dependencySet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var blockedByDependency = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -261,7 +299,10 @@ public static class Loader
         var declaredFiles = 0;
         var contentPolicy = "";
         var rounds = 0;
-        var roundLimit = plan.Order.Count * 2 + 4;
+        var roundLimit = RoundLimitOverrideForTests > 0 ? RoundLimitOverrideForTests : plan.Order.Count * 2 + 4;
+        var converged = false;
+        var exhaustedReason = "";
+        var seenStates = new HashSet<string>(StringComparer.Ordinal);
         AssemblyPreflightResult preflight;
 
         while (true)
@@ -312,7 +353,7 @@ public static class Loader
                 }
                 pool.Add(manifest);
             }
-            preflight = AssemblyPreflight.Analyze(pool);
+            preflight = AssemblyPreflight.Analyze(pool, staging);
             CollectPreflightEvents(preflight, events);
             if (preflight.DeclaredFiles > declaredFiles)
             {
@@ -321,6 +362,15 @@ public static class Loader
             if (contentPolicy.Length == 0)
             {
                 contentPolicy = preflight.ContentPolicy;
+            }
+
+            // Cycle detection: the three sets below are the complete input of the next round (they
+            // decide the dependency closure and the candidate pool), so a repetition proves the
+            // iteration can never settle, whatever the round bound is.
+            if (!seenStates.Add(StateSignature(intrinsicFailures, dependencySet, conflictSet)))
+            {
+                exhaustedReason = "the conflict and dependency sets repeated, so the iteration cycles instead of converging";
+                break;
             }
 
             // 3. A mod whose own declared file is missing/damaged, or that collides with a host
@@ -342,6 +392,7 @@ public static class Loader
             {
                 if (rounds > roundLimit)
                 {
+                    exhaustedReason = "the round bound (" + roundLimit + ") was reached while intrinsic rejections were still being added";
                     break;
                 }
                 continue;
@@ -355,11 +406,15 @@ public static class Loader
             }
             if (newConflictSet.SetEquals(conflictSet))
             {
+                // A stable fixed point: the pool, the dependency closure and the conflict set all
+                // reproduce themselves. This is the only state in which mods may be loaded.
+                converged = true;
                 break;
             }
             conflictSet = newConflictSet;
             if (rounds > roundLimit)
             {
+                exhaustedReason = "the round bound (" + roundLimit + ") was reached before the conflict set stabilized";
                 break;
             }
         }
@@ -372,34 +427,70 @@ public static class Loader
         {
             outcomes[pair.Key] = pair.Value;
         }
-        foreach (var id in dependencySet)
+
+        if (!converged)
         {
-            string? blockedBy;
-            if (!blockedByDependency.TryGetValue(id, out blockedBy) || blockedBy == null)
+            // Fail closed. The sets above are the state of an iteration that did not settle, so
+            // they cannot classify anything: a mod that is absent from the last pool was never
+            // evaluated, and a mod that is in it was evaluated against a pool that may still
+            // change. Every candidate that is not already intrinsically doomed is rejected with
+            // its own code, so "the loader could not decide" is never reported as "this mod is
+            // fine" (Phase 1.1.2, MF0208).
+            for (var i = 0; i < plan.Order.Count; i++)
             {
-                blockedBy = "unknown";
+                var manifest = plan.Order[i];
+                if (!byId.ContainsKey(manifest.Id) || outcomes.ContainsKey(manifest.Id))
+                {
+                    continue;
+                }
+                outcomes[manifest.Id] = new ModOutcome(ErrorCodes.PreflightNotConverged,
+                    "the assembly preflight did not converge (rounds=" + rounds +
+                    ", limit=" + roundLimit + ": " + exhaustedReason +
+                    "), so this mod was not classified and was not loaded");
+                report.AddLine("preflight-not-converged=" + manifest.Id + " code=" + ErrorCodes.PreflightNotConverged);
             }
-            outcomes[id] = new ModOutcome(ErrorCodes.DependencyFailed,
-                "required dependency \"" + blockedBy + "\" did not initialize");
-            report.AddLine("dependency-blocked=" + id + " blocked-by=" + blockedBy +
-                           " code=" + ErrorCodes.DependencyFailed);
+            report.AddWarning("the assembly preflight did not converge (" + exhaustedReason +
+                              "); no mod assembly was loaded - see " + ErrorCodes.PreflightNotConverged);
         }
-        foreach (var id in conflictSet)
+        else
         {
-            if (outcomes.ContainsKey(id))
+            foreach (var id in dependencySet)
             {
-                continue;
+                string? blockedBy;
+                if (!blockedByDependency.TryGetValue(id, out blockedBy) || blockedBy == null)
+                {
+                    blockedBy = "unknown";
+                }
+                outcomes[id] = new ModOutcome(ErrorCodes.DependencyFailed,
+                    "required dependency \"" + blockedBy + "\" did not initialize");
+                report.AddLine("dependency-blocked=" + id + " blocked-by=" + blockedBy +
+                               " code=" + ErrorCodes.DependencyFailed);
             }
-            GateProblem? problem;
-            if (preflight.Rejections.TryGetValue(id, out problem) && problem != null)
+            foreach (var id in conflictSet)
             {
-                outcomes[id] = new ModOutcome(problem.Code, problem.Message);
+                if (outcomes.ContainsKey(id))
+                {
+                    continue;
+                }
+                GateProblem? problem;
+                if (preflight.Rejections.TryGetValue(id, out problem) && problem != null)
+                {
+                    outcomes[id] = new ModOutcome(problem.Code, problem.Message);
+                }
             }
         }
 
         RenderPreflight(report, events, outcomes, declaredFiles, contentPolicy);
         report.AddLine("preflight-stage=complete");
         report.AddLine("preflight-rounds=" + rounds);
+        report.AddLine("preflight-round-limit=" + roundLimit);
+        report.AddLine("preflight-convergence=" + (converged ? "converged" : "exhausted"));
+        if (!converged)
+        {
+            report.AddLine("preflight-exhausted-reason=" + exhaustedReason);
+        }
+        report.AddLine("assembly-snapshot-files=" + staging.FileCount +
+                       " bytes=" + staging.TotalBytes);
 
         var initialized = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
 
@@ -593,7 +684,8 @@ public static class Loader
     {
         return code == ErrorCodes.EntryAssemblyMissing ||
                code == ErrorCodes.AssemblyIdentityUnreadable ||
-               code == ErrorCodes.HostAssemblyConflict;
+               code == ErrorCodes.HostAssemblyConflict ||
+               code == ErrorCodes.AssemblyStagingFailed;
     }
 
     /// <summary>Keeps one copy of every finding across all preflight rounds.</summary>
@@ -744,7 +836,8 @@ public static class Loader
         return code == ErrorCodes.EntryAssemblyMissing ||
                code == ErrorCodes.AssemblyIdentityUnreadable ||
                code == ErrorCodes.AssemblyIdentityConflict ||
-               code == ErrorCodes.HostAssemblyConflict;
+               code == ErrorCodes.HostAssemblyConflict ||
+               code == ErrorCodes.AssemblyStagingFailed;
     }
 
     private static bool RejectedWith(string modId, Dictionary<string, ModOutcome> outcomes, string code)
@@ -955,6 +1048,47 @@ public static class Loader
         }
     }
 
+    /// <summary>
+    /// Identity of one fixed-point state: the three sets below are the complete input of the next
+    /// round, so two equal signatures prove the iteration is repeating.
+    /// </summary>
+    private static string StateSignature(
+        Dictionary<string, ModOutcome> intrinsicFailures,
+        HashSet<string> dependencySet,
+        HashSet<string> conflictSet)
+    {
+        var sb = new StringBuilder();
+        var intrinsic = new List<string>();
+        foreach (var pair in intrinsicFailures)
+        {
+            intrinsic.Add(pair.Key + ":" + pair.Value.Code);
+        }
+        AppendSorted(sb, intrinsic);
+        sb.Append('|');
+        AppendSorted(sb, dependencySet);
+        sb.Append('|');
+        AppendSorted(sb, conflictSet);
+        return sb.ToString();
+    }
+
+    private static void AppendSorted(StringBuilder sb, IEnumerable<string> values)
+    {
+        var list = new List<string>();
+        foreach (var value in values)
+        {
+            list.Add(value);
+        }
+        list.Sort(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < list.Count; i++)
+        {
+            if (i > 0)
+            {
+                sb.Append(',');
+            }
+            sb.Append(list[i]);
+        }
+    }
+
     private static void NoteShared(ModRecord record, AssemblyClaim claim)
     {
         if (claim.Resolution == AssemblyResolution.ShareFromClaim)
@@ -987,12 +1121,40 @@ public static class Loader
             return true;
         }
 
-        var path = claim.CanonicalPath;
+        // Phase 1.1.2: the load source is the snapshot that was written from the bytes the
+        // preflight parsed. The mod-declared file is never opened here, so replacing it after the
+        // preflight cannot change what is loaded.
+        if (claim.StagedPath.Length == 0 || claim.SnapshotFingerprint.Length == 0)
+        {
+            error = claim.DeclaredName + ": " + ErrorCodes.Describe(ErrorCodes.AssemblyStagingFailed) +
+                    " (the claim has no snapshot)";
+            return false;
+        }
+
+        var path = claim.StagedPath;
         Assembly? cached;
         if (s_loadedByPath.TryGetValue(path, out cached) && cached != null)
         {
             assembly = cached;
             return true;
+        }
+
+        // The seam runs as late as possible: whatever a test (or an attacker) changes after this
+        // point still has to survive the snapshot verification below.
+        var beforeLoad = BeforeLoadForTests;
+        if (beforeLoad != null)
+        {
+            beforeLoad(claim);
+        }
+
+        // Consistency check of the snapshot itself, immediately before it is used. This narrows -
+        // it does not close - the window between "checked" and "loaded"; see AssemblyStagingArea.
+        string snapshotError;
+        if (!AssemblyStagingArea.VerifyStagedFile(path, claim.SnapshotFingerprint, claim.Length, out snapshotError))
+        {
+            error = claim.DeclaredName + ": " + ErrorCodes.Describe(ErrorCodes.AssemblyStagingFailed) +
+                    " (" + snapshotError + ")";
+            return false;
         }
 
         try
@@ -1007,7 +1169,8 @@ public static class Loader
 
         s_loadedByPath[path] = assembly;
         report.AddLine("assembly-load=" + claim.ModId + " file=" + claim.DeclaredName +
-                       " canonical=" + claim.CanonicalModId);
+                       " canonical=" + claim.CanonicalModId +
+                       " snapshot=" + (claim.SnapshotFingerprint.Length > 0 ? claim.SnapshotFingerprint : "none"));
         return true;
     }
 

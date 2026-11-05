@@ -107,6 +107,9 @@ internal sealed class AssemblyPreflightResult
 
     internal int DeclaredFiles { get; set; }
 
+    /// <summary>The snapshot area this pass staged into, so the report can state its cost.</summary>
+    internal AssemblyStagingArea? Staging { get; set; }
+
     /// <summary><c>sha256+full-bytes</c> or <c>full-bytes-only</c>: what a content match rests on.</summary>
     internal string ContentPolicy { get; set; } = "sha256+full-bytes";
 
@@ -186,9 +189,10 @@ internal static class AssemblyPreflight
     /// </summary>
     internal static List<HostAssemblyIdentity>? HostSnapshotForTests;
 
-    internal static AssemblyPreflightResult Analyze(List<ModManifest> eligible)
+    internal static AssemblyPreflightResult Analyze(List<ModManifest> eligible, AssemblyStagingArea? staging = null)
     {
         var result = new AssemblyPreflightResult();
+        result.Staging = staging;
 
         // Deterministic mod order; the loader's own plan is already sorted, but the preflight
         // must not depend on its caller.
@@ -200,7 +204,7 @@ internal static class AssemblyPreflight
         {
             var manifest = ordered[i];
             var claims = new List<AssemblyClaim>();
-            if (ReadClaims(manifest, claims, result))
+            if (ReadClaims(manifest, claims, result, staging))
             {
                 result.SetClaims(manifest.Id, claims);
                 for (var c = 0; c < claims.Count; c++)
@@ -288,7 +292,11 @@ internal static class AssemblyPreflight
 
     // --------------------------------------------------------------- reading
 
-    private static bool ReadClaims(ModManifest manifest, List<AssemblyClaim> claims, AssemblyPreflightResult result)
+    private static bool ReadClaims(
+        ModManifest manifest,
+        List<AssemblyClaim> claims,
+        AssemblyPreflightResult result,
+        AssemblyStagingArea? staging)
     {
         var entryPath = Path.Combine(manifest.Directory, manifest.EntryAssembly);
         if (!PathRules.IsInside(manifest.Directory, entryPath))
@@ -302,7 +310,7 @@ internal static class AssemblyPreflight
         string code;
         string message;
         if (!AssemblyClaimReader.TryRead(manifest.Id, AssemblyClaimRole.Entry, manifest.EntryAssembly,
-                entryPath, out claim, out code, out message))
+                entryPath, staging, out claim, out code, out message))
         {
             Reject(result, manifest.Id, code, message);
             return false;
@@ -320,7 +328,7 @@ internal static class AssemblyPreflight
                 return false;
             }
             if (!AssemblyClaimReader.TryRead(manifest.Id, AssemblyClaimRole.Private, declared, path,
-                    out claim, out code, out message))
+                    staging, out claim, out code, out message))
             {
                 Reject(result, manifest.Id, code, message);
                 return false;
@@ -541,8 +549,12 @@ internal static class AssemblyPreflight
         for (var i = 0; i < ordered.Count; i++)
         {
             var claim = ordered[i];
-            claim.CanonicalPath = canonical.Path;
+            // Every claim in the group is loaded from the representative's snapshot: identical
+            // bytes were proven above, and `Assembly.LoadFrom` must be issued once per artifact.
+            claim.CanonicalPath = canonical.StagedPath.Length > 0 ? canonical.StagedPath : canonical.Path;
             claim.CanonicalModId = canonical.ModId;
+            claim.StagedPath = canonical.StagedPath;
+            claim.SnapshotFingerprint = canonical.SnapshotFingerprint;
             claim.Resolution = ReferenceEquals(claim, canonical)
                 ? AssemblyResolution.Load
                 : AssemblyResolution.ShareFromClaim;

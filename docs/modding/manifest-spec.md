@@ -86,6 +86,18 @@
 不声明会怎样：`Initialize` 里第一次用到该依赖时抛 `FileNotFoundException`，
 该 mod 以 `MF0309` 失败——不会影响其他 mod，但也不会"自动修好"。
 
+### 3.3.1 加载的是快照，不是你的文件（Phase 1.1.2）
+
+预检读到的字节会被写成应用私有目录里的**快照**
+（`<Mods>/.staging/<run>/<mod id>/<文件名>`，逐字节校验过），`Assembly.LoadFrom` 只拿这个快照。
+所以：
+
+- 运行期修改/替换自己包里的 dll **不会**影响已加载的程序集（这是故意的）；
+- `Assembly.Location` 指向快照，**不是**你的包目录；取随包数据文件请用
+  `IModContext.ModDirectory`（从 Phase 1 起就是契约）；
+- 每个随包程序集都必须写进 `privateAssemblies`，否则不会被加载；
+- 快照总量上限 256 MiB / 4096 个文件、单文件 64 MiB，超限则该 mod 以 `MF0209` 失败。
+
 ### 3.4 程序集身份与冲突策略（Phase 1.1 / 1.1.1）
 
 Loader 在**加载任何 mod 程序集之前**做一次全局预检：只读 `entryAssembly` 与

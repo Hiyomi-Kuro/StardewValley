@@ -124,6 +124,31 @@ Loader 在加载入口程序集之前**按声明逐个 `LoadFrom`**（两轮 fix
 - 因此契约程序集（`ModFramework.Runtime`）**绝不能**随 mod 打包：第二份副本会让
   `IModEntry` 变成另一个类型，Loader 会以 `MF0204` 拒绝（并给出"来自哪个程序集"的诊断）。
 
+### 4.4 快照加载：Phase 1.1.2 的结论
+
+`Assembly.LoadFrom(string)` 是唯一入口（§4.1），而"路径"本身是可变的：预检读完到加载之间，
+文件可以被替换或同长度原位改写。Phase 1.1.2 因此**不按 mod 声明的路径加载**，而是：
+
+| 步骤 | 行为 | 依据 |
+| --- | --- | --- |
+| 读 | 一次读全文件进 buffer；身份/长度/摘要都来自这一个 buffer | A 级（源码 + 测试） |
+| 写 | 把同一个 buffer 写入 `<Mods>/.staging/<run>/<mod id>/<声明文件名>` | A 级 |
+| 验 | 立刻读回快照**逐字节比较**（`ContentIdentity.VerifyExactBytes`） | A 级 |
+| 载 | `Assembly.LoadFrom(claim.StagedPath)`；加载前再校验长度 + 指纹 | A 级 |
+| 兜底 | 指纹不符 → 该 mod 失败（`MF0209` 语义），不加载 | A 级 |
+
+事实与边界：
+
+- **不能用内存字节**：`Assembly.Load(byte[])` 在目标引用程序集里不存在。本阶段重新编译验证，
+  得到 `CS1503: 无法从“byte[]”转换为“string”`（只有 `Load(string)` 重载）→ 只能落盘再从路径加载。
+- **`Assembly.Location` 变成快照路径**：mod 若用 `Assembly.Location` 找自己的数据文件会失效，
+  必须用 `IModContext.ModDirectory`（Phase 1 起就是这个契约）。
+- **剩余窗口**：快照与 mod 同处应用私有存储，同 uid 的代码理论上可在"校验"与"加载"之间替换它。
+  该替换会被下一次校验发现并拒绝，但不是原子操作。彻底关闭需要 `Assembly.Load(byte[])`，
+  目标运行时没有 → **真机（ARM64 Mono）语义验证标记 BLOCKED**，不得把桌面结论当设备结论。
+- **不确定就不加载**：快照目录建不出来、超预算（64 MiB/文件、256 MiB 总量、4096 文件）、
+  文件写不进去，全部 fail-closed（整轮或该 mod 失败），绝不回退到"按路径加载"。
+
 ---
 
 ## 5. 启动时序与调用点

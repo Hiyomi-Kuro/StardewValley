@@ -126,6 +126,31 @@ VARIANTS = [
     ("phase_a3_v2", CONFLICT_LIB,
      {"ConflictAssemblyName": "PhaseA3Lib", "ConflictAssemblyVersion": "2.0.0.0", "Variant": "VARIANT_B"},
      "PhaseA3Lib", "PhaseA3Lib.v2.dll"),
+
+    # Phase 1.1.2: snapshot binding (TOCTOU), host positive share and fixed-point fixtures.
+    # `P112Entry` and `P112Entry.v2` are the same assembly identity with different content, which
+    # is what proves that the bytes loaded are the bytes the preflight approved.
+    ("p112_entry", CONFLICT_LIB,
+     {"ConflictAssemblyName": "P112Entry", "ConflictAssemblyVersion": "1.0.0.0"},
+     "P112Entry", "P112Entry.dll"),
+    ("p112_entry_v2", CONFLICT_LIB,
+     {"ConflictAssemblyName": "P112Entry", "ConflictAssemblyVersion": "1.0.0.0", "Variant": "VARIANT_B"},
+     "P112Entry", "P112Entry.v2.dll"),
+    ("p112_priv", PLAIN_LIB,
+     {"PlainAssemblyName": "P112Priv", "PlainAssemblyVersion": "1.0.0.0"},
+     "P112Priv", "P112Priv.dll"),
+    ("p112_host_lib", PLAIN_LIB,
+     {"PlainAssemblyName": "P112HostLib", "PlainAssemblyVersion": "1.0.0.0"},
+     "P112HostLib", "P112HostLib.dll"),
+    ("p112_conflict_v1", CONFLICT_LIB,
+     {"ConflictAssemblyName": "P112ConflictLib", "ConflictAssemblyVersion": "1.0.0.0"},
+     "P112ConflictLib", "P112ConflictLib.v1.dll"),
+    ("p112_conflict_v2", CONFLICT_LIB,
+     {"ConflictAssemblyName": "P112ConflictLib", "ConflictAssemblyVersion": "2.0.0.0", "Variant": "VARIANT_B"},
+     "P112ConflictLib", "P112ConflictLib.v2.dll"),
+    ("p112_shared", CONFLICT_LIB,
+     {"ConflictAssemblyName": "P112SharedLib", "ConflictAssemblyVersion": "1.0.0.0"},
+     "P112SharedLib", "P112SharedLib.dll"),
 ]
 
 

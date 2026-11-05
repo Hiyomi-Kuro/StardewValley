@@ -40,6 +40,21 @@ internal static class ErrorCodes
     internal const string AssemblyIdentityConflict = "MF0206";
     internal const string HostAssemblyConflict = "MF0207";
 
+    /// <summary>
+    /// Phase 1.1.2: the assembly-identity preflight did not reach a stable fixed point within the
+    /// round bound, so no candidate mod could be classified. Nothing is loaded (fail closed).
+    /// Deliberately distinct from <see cref="AssemblyIdentityConflict"/>: this is "the loader
+    /// could not decide", not "two mods were proven to conflict".
+    /// </summary>
+    internal const string PreflightNotConverged = "MF0208";
+
+    /// <summary>
+    /// Phase 1.1.2: the exact bytes that were preflighted could not be staged (or the staged copy
+    /// no longer matched them), so the approved bytes cannot be the loaded bytes. Nothing for that
+    /// claim is loaded (fail closed).
+    /// </summary>
+    internal const string AssemblyStagingFailed = "MF0209";
+
     // ---- entry validation -----------------------------------------------------
     internal const string EntryTypeMissing = "MF0301";
     internal const string EntryTypeNotPublic = "MF0302";
@@ -116,6 +131,8 @@ internal static class ErrorCodes
             case AssemblyIdentityUnreadable: return "a declared assembly file is missing, damaged or not a managed assembly";
             case AssemblyIdentityConflict: return "two mods declare the same assembly with a different identity or content";
             case HostAssemblyConflict: return "a mod assembly collides with an assembly already loaded by the host";
+            case PreflightNotConverged: return "the assembly preflight did not reach a stable state, so no mod was loaded";
+            case AssemblyStagingFailed: return "the preflighted bytes could not be snapshotted, so the approved bytes cannot be loaded";
             case EntryTypeMissing: return "entryType does not exist in the entry assembly";
             case EntryTypeNotPublic: return "entryType is not public";
             case EntryTypeAbstract: return "entryType is abstract";
