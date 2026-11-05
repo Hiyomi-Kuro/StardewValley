@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "ExampleMod.Full",
+  "name": "Full Mod",
+  "version": "2.1.0-beta.1+build.7",
+  "author": "Example Author",
+  "description": "Exercises every optional field.",
+  "website": "https://example.invalid/full-mod",
+  "entryAssembly": "ExampleMod.Full.dll",
+  "entryType": "ExampleMod.Full.Entry",
+  "gameVersion": ">=1.6.0 <2.0.0",
+  "frameworkVersion": "^1.0.0",
+  "dependencies": [
+    {
+      "id": "ExampleMod.Minimal",
+      "version": ">=1.0.0 <2.0.0"
+    },
+    {
+      "id": "ExampleMod.Optional",
+      "version": "*",
+      "optional": true
+    }
+  ]
+}

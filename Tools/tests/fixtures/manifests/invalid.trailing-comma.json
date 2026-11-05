@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "id": "ExampleMod.Comma",
+  "name": "Comma",
+  "version": "1.0.0",
+  "entryAssembly": "Comma.dll",
+  "entryType": "Comma.Entry",
+}

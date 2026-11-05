@@ -2,20 +2,36 @@
 
 - 报告日期：2026-11-05
 - 阶段：**Phase 0.5**
-- 总状态：**PARTIALLY COMPLETE / BLOCKED**
-  （离线审计、文档修复、代码修复与离线回归全部完成；E1/E2 真机验证 **BLOCKED: no ARM64 physical device**）
-- 是否启动 Phase 1：**未启动**
+- 后续修订：**Phase 0.5.1 复核并修正了本报告的证据等级表述**，见 `phase0.5.1-report.md`。
+  本文件中的"模拟器 PASS"一律指 **RECORDED PASS（D 级历史记录）**，不是本阶段的直接运行证据。
+
+### 总状态（三个维度分开看，不得合并成"完成"）
+
+| 维度 | 状态 | 依据 |
+| --- | --- | --- |
+| **Offline Audit**（文档一致性、代码修复、离线回归、注入/容器复核） | **COMPLETE** | §4–§6、§8、§11；本轮测试有日志可复核 |
+| **Device Validation**（ARM64 物理设备 E1/E2） | **BLOCKED: no ARM64 physical device** | 只有 x86_64 MuMu 模拟器（§7.1，C 级） |
+| **Overall Phase 0.5** | **PARTIALLY COMPLETE**（不是 fully complete） | 真机验证缺失；模拟器结果只是 D 级历史记录 |
+
+- 是否启动 Phase 1：**Phase 0.5 期间未启动**（Phase 1 于 Phase 0.5.1 门禁通过后开始，见 `phase1-report.md`）
 - 关联：`phase0.5-evidence-index.md`（证据索引）、`phase0.5-device-checklist.md`（真机准入）、
   `phase0-report.md`、`phase0-status.md`、`runtime-feasibility.md`、`adr-0001-mod-injection.md`
+
+> **证据等级口径**（与 `phase0.5-evidence-index.md` §0 一致）：
+> A = 直接读源码/二进制；B = 本阶段实际执行的离线测试；C = 本阶段只读设备输出；
+> D = Phase 0 历史记录、原始日志已丢失、不可独立复现；E = 外部参考。
+> **D 级只能写"记录"，不能写"已验证/当前通过"。**
 
 ---
 
 ## 1. 一句话结论
 
-Phase 0 的**技术结论成立**（`Assembly.LoadFrom` 可加载并执行外部 C# DLL；`Load(byte[])`/`Reflection.Emit` 不可用），
-但 Phase 0 的**文档与实现之间存在 4 处实质矛盾**、**工具链有 3 个真实缺陷**（其中一个会让默认构建静默不加载模组），
+Phase 0 的**技术结论在源码/编译期层面成立**（`Assembly.LoadFrom` 是唯一可用的外部程序集加载 API；
+`Load(byte[])`/`Reflection.Emit` 在裁剪后的运行时里不可用），但"它能加载并执行外部 DLL"这条**运行时结论**
+只有 **D 级历史记录**（模拟器、原始日志已丢失、本阶段未重跑），不得当作当前已验证事实。
+此外 Phase 0 的**文档与实现之间存在 4 处实质矛盾**、**工具链有 3 个真实缺陷**（其中一个会让默认构建静默不加载模组），
 且**全部 Phase 0 原始证据文件已随 `.tmp/` 清空而丢失**。本阶段已修文档、修代码、补回归测试（27 项离线检查全通过），
-并把"模拟器通过"与"真机通过"严格分开：E1/E2 目前只有**模拟器**证据，真机为 **BLOCKED**。
+并把"模拟器记录"与"真机通过"严格分开：E1/E2 只有 **D 级模拟器记录**，真机为 **BLOCKED**。
 
 ---
 
@@ -252,11 +268,16 @@ Bootstrap 以"非 null = 失败"处理，于是**成功也被当失败**；而�
 
 ### 7.2 E1 / E2
 
+**本阶段没有重跑 E1/E2。** 下表 Emulator 列全部是 **D 级历史记录**（Phase 0 文档，原始日志已随 `.tmp/phase0/` 丢失），
+只能读作"曾经记录为通过"，**不是**本阶段的 Current Run PASS，也不可独立复现。
+
 | 项 | 模拟器（MuMu 12） | ARM64 真机 | 结论 |
 | --- | --- | --- | --- |
-| E1 加载外部 DLL 并执行 IL | **PASS**（Phase 0 记录：`Assembly.LoadFrom` → `Loader.Start()` → `loader.log` 130 字节；探针 8/8） | **BLOCKED**：无设备 | 只能记 Emulator PASS |
-| E2 反射访问 `Game1` | **PASS**（记录：`Game1 576 方法 / 532 字段`） | **BLOCKED** | 同上 |
-| 游戏正常进标题界面 | PASS（记录：`am start -W Status: ok`、进程存活；截图受 display 2 限制不可用） | NOT RUN | |
+| E1 加载外部 DLL 并执行 IL | **RECORDED PASS (Evidence D; original logs unavailable; not independently reproducible)** | **BLOCKED**：无设备 | 只有 D 级记录；真机未验证 |
+| E2 反射访问 `Game1` | **RECORDED PASS (Evidence D; same caveat)**（记录：`Game1 576 方法 / 532 字段`） | **BLOCKED** | 同上；576/532 属 Historical Record / Not independently verified |
+| 游戏正常进标题界面 | **RECORDED PASS (Evidence D; same caveat)** | NOT RUN | 同上 |
+
+> Emulator 列不得填进 Device 列；D 级记录不得升级为"当前通过"。
 
 **本阶段没有重跑 E1/E2**，原因：① 设备不是 ARM64；② 重跑需要卸载+安装（丢存档、覆盖用户游戏），
 未获授权；③ 当前设备上装的是基线 APK，没有任何探针/模组残留。
@@ -323,16 +344,20 @@ python Tools/tests/test_mod_pipeline.py
 
 ## 9. 状态矩阵（每格有证据；N/A = 不适用；Unknown = 无证据）
 
-| 项目 | 源码存在 | 离线测试 | 模拟器 | ARM64 真机 | 最终状态 |
+> **模拟器列全部是 D 级历史记录**：Phase 0 的原始日志已随 `.tmp/phase0/` 丢失，本阶段没有重跑，
+> 因此读作 `RECORDED PASS (Evidence D; original logs unavailable; not independently reproducible)`，
+> **不是** Current Run PASS。真机列一律 BLOCKED / NOT RUN。
+
+| 项目 | 源码存在 | 离线测试 | 模拟器（D 级记录） | ARM64 真机 | 最终状态 |
 | --- | --- | --- | --- | --- | --- |
-| Bootstrap 触发 | 是（注入 IL） | PASS（IL 结构 + hook 首指令，§8.2） | PASS（Phase 0 记录 `bootstrap-ran` in logcat） | **BLOCKED** | PARTIAL |
-| Loader 初始化 | 是（`Loader.cs`） | PASS（契约宿主：null + 报告落盘） | PASS（记录 `loader.log` 130 B） | **BLOCKED** | PARTIAL |
-| Assembly.LoadFrom | 是（`Loader.cs` / 注入 IL） | PASS（IL 里就是 `LoadFrom`；Android refs 编译通过） | PASS（记录：加载并执行 `Loader.Start()`） | **BLOCKED** | PARTIAL |
-| C# Mod 入口执行 | **否**（只有探针入口，无 Mod 入口分发） | PASS（探针加载路径可验证；Mod 入口无实现） | PASS（探针 8/8） | **BLOCKED** | **NOT IMPLEMENTED**（Mod 入口）/ PARTIAL（探针） |
-| Game1 反射只读访问 | 是（`Probe.GameTypes`） | Unknown（需运行时） | PASS（记录 576/532） | **BLOCKED** | PARTIAL |
+| Bootstrap 触发 | 是（注入 IL） | PASS（IL 结构 + hook 首指令，§8.2） | RECORDED PASS (D) | **BLOCKED** | PARTIAL |
+| Loader 初始化 | 是（`Loader.cs`） | PASS（契约宿主：null + 报告落盘） | RECORDED PASS (D) | **BLOCKED** | PARTIAL |
+| Assembly.LoadFrom | 是（`Loader.cs` / 注入 IL） | PASS（IL 里就是 `LoadFrom`；Android refs 编译通过） | RECORDED PASS (D) | **BLOCKED** | PARTIAL |
+| C# Mod 入口执行 | **否**（只有探针入口，无 Mod 入口分发） | PASS（探针加载路径可验证；Mod 入口无实现） | RECORDED PASS (D)（探针 8/8） | **BLOCKED** | **NOT IMPLEMENTED**（Mod 入口）/ PARTIAL（探针） |
+| Game1 反射只读访问 | 是（`Probe.GameTypes`） | Unknown（需运行时） | RECORDED PASS (D)（记录 576/532） | **BLOCKED** | PARTIAL |
 | ModInjector | 是 | PASS（注入相关项全过） | N/A（构建期工具） | N/A | **DONE（离线）** |
 | AssemblyStore 重建/校验 | 是 | PASS（结构/条目/描述符/往返/负向） | N/A | N/A | **DONE（离线）** |
-| Harmony / native detour | 是（`DetourProbe.cs`） | N/A（需运行时） | **FAIL**（T12 写跳转桩 → 原生崩溃） | **BLOCKED** | **FAIL（当前工具链）** |
+| Harmony / native detour | 是（`DetourProbe.cs`） | N/A（需运行时） | **RECORDED FAIL (D)**（T12 写跳转桩 → 原生崩溃） | **BLOCKED** | **FAIL（当前工具链）** |
 
 ---
 
@@ -376,8 +401,8 @@ python Tools/tests/test_mod_pipeline.py
 | 4 | `... build Mod/ModFramework.Runtime -p:AndroidRefsDir=<abs>` | 0 / 0 | 0 | 测试项 `runtime_compiles_against_android_refs` |
 | 5 | `... build Mod/MonoRuntimeProbe -p:AndroidRefsDir=<abs>` | 0 error，1 warning（`CS0169 _staticCounter`，反射用） | 0 | 见 §11.1 |
 | 6 | `... build Mod/ExampleMod.HelloWorld -p:AndroidRefsDir=<abs>` | 0 / 0；产物 4096 字节 | 0 | 见 §11.1 |
-| 7 | `python Tools/tests/test_mod_pipeline.py` | **27/27 PASS** | 0 | `.tmp/phase0.5/logs/test-mod-pipeline.final.txt` |
-| 8 | `powershell -File Tools/device-precheck.ps1` | E0 PASS；E1/E2 BLOCKED | 0 | `.tmp/phase0.5/logs/e0/device-precheck-127.0.0.1_16384.txt` |
+| 7 | `python Tools/tests/test_mod_pipeline.py` | **27/27 PASS**（等级 **B**：本阶段实际执行，日志仍在 `.tmp/phase0.5/logs/`；删除 `.tmp` 后需重跑才能复核） | 0 | `.tmp/phase0.5/logs/test-mod-pipeline.final.txt` |
+| 8 | `powershell -File Tools/device-precheck.ps1` | E0 PASS（**C**）；E1/E2 BLOCKED | 0 | `.tmp/phase0.5/logs/e0/device-precheck-127.0.0.1_16384.txt` |
 | 9 | `dotnet <LoaderContract.dll>`（新 Loader） | `return-null=true`、`loader-report=True` | 0 | `.tmp/phase0.5/logs/loader-contract-host.txt` |
 | 10 | `dotnet <LoaderContract.dll>`（HEAD 版 Loader） | `return-null=false`（缺陷复现） | 0 | `.tmp/phase0.5/logs/loader-contract-before.txt` |
 | 11 | `git diff --check` | 无空白错误 | 0 | §12 |

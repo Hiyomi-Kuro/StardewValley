@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "ExampleMod.Minimal",
+  "name": "Minimal Mod",
+  "version": "1.0.0",
+  "entryAssembly": "ExampleMod.Minimal.dll",
+  "entryType": "ExampleMod.Minimal.Entry",
+  "dependencies": [
+    {
+      "id": "ExampleMod.Minimal"
+    }
+  ]
+}

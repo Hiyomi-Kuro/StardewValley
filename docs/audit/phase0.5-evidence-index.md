@@ -4,6 +4,8 @@
 - 对应报告：`phase0.5-report.md`
 - 工作目录：`D:\Download\DSH\StardewValley`，branch `main`，HEAD `fa4f5c3baa64a0d1c5c10c1ff3f5d314df3a022a`
 - 本阶段证据根：`.tmp/phase0.5/`（gitignored；**删除后按本文命令可重建的项标 ✅，不可重建的标 ⚠️**）
+- **Phase 0.5.1 复核**：本索引在 `phase0.5.1-evidence-index.md` 中重新核对。
+  结论未变，但 D 级条目一律改写为 `RECORDED PASS (Evidence D)`，不再使用裸 "PASS"。
 
 ---
 
@@ -17,7 +19,9 @@
 | **D** | Phase 0 记录、原始日志已丢失（`.tmp/phase0/` 被删） | ❌ 只剩文档记录 |
 | **E** | 外部参考（网页/第三方项目），未独立验证 | ❌ 仅引用 |
 
-> 任何"通过"结论都必须落到 A–C；D 只能写成"记录"，不能写成"已验证"。
+> 任何"通过"结论都必须落到 A–C；D 只能写成
+> `RECORDED PASS (Evidence D; original logs unavailable; not independently reproducible)`，
+> 不能写成"已验证"或"当前通过"。
 
 ---
 
@@ -165,7 +169,7 @@ store_verify_detects_wrong_hash        rc=1
 | 容器原位替换不破坏其它条目（§8.2） | B | `rebuild_leaves_other_entries` 等 5 项 |
 | 原始输入未被覆盖（§8.1） | B | `inputs_not_modified`（重算 blob/manifest 哈希） |
 | 设备是 x86_64 模拟器（§7.1） | C | §2.6 |
-| E1/E2 模拟器 PASS（§7.2） | D | Phase 0 文档记录，原始日志缺失 |
+| E1/E2 模拟器结论（§7.2） | D | **RECORDED PASS (Evidence D; original logs unavailable; not independently reproducible)** —— Phase 0 文档记录，原始日志缺失，本阶段未重跑 |
 | E1/E2 真机 BLOCKED（§7.2） | C | §2.6 设备分类 |
 | Harmony 当前工具链 FAIL（§9 末行） | D（T12 记录）+ A（源码） | `DetourProbe.cs` 存在；崩溃现象仅记录 |
 

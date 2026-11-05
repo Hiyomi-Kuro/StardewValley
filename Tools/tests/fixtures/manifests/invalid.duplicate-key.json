@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "id": "ExampleMod.Dup",
+  "id": "ExampleMod.Dup2",
+  "name": "Dup",
+  "version": "1.0.0",
+  "entryAssembly": "Dup.dll",
+  "entryType": "Dup.Entry"
+}

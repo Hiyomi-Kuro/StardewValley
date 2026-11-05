@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Hiyomi-Kuro/StardewValley/docs/modding/manifest.schema.json",
+  "title": "Stardew Valley Android mod manifest (schemaVersion 1)",
+  "description": "The authoritative validation rules are implemented in Mod/ModFramework.Runtime/ModManifest.cs and pinned by Tools/tests/fixtures/manifests. This schema documents the same rules for editors and for the CI cross-check; where the two disagree, the implementation wins and the schema must be fixed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "name", "version", "entryAssembly", "entryType"],
+  "properties": {
+    "schemaVersion": {
+      "const": 1,
+      "description": "Manifest format version. Adding a field requires bumping this value; schemaVersion 1 rejects unknown fields."
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^(?![^.]*\\.\\.[^.]*$)[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "description": "Stable unique mod id. Uniqueness is case-insensitive; two packages with the same id are both rejected."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Display name."
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\\+([0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*))?$",
+      "description": "SemVer 2.0.0. Build metadata is parsed but ignored for precedence."
+    },
+    "author": {
+      "type": "string",
+      "maxLength": 256,
+      "description": "Optional author metadata. Never executed."
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 2048,
+      "description": "Optional description. Never executed."
+    },
+    "website": {
+      "type": "string",
+      "maxLength": 512,
+      "description": "Optional URL for humans. The loader never opens it."
+    },
+    "entryAssembly": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[^\\\\/:*?\"<>|]+\\.dll$",
+      "description": "File name of the entry assembly, directly inside the mod package. Directory separators, '..' and absolute paths are rejected, so a manifest can never point outside its package."
+    },
+    "entryType": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._+`]+$",
+      "description": "Full name of the IModEntry implementation. The loader never guesses the entry type."
+    },
+    "gameVersion": {
+      "type": "string",
+      "description": "SemVer range the running game must satisfy, e.g. \">=1.6.0 <2.0.0\". Grammar: '*', or space/comma separated comparators of the forms '=X', '>X', '>=X', '<X', '<=X', '^X', '~X' with a full major.minor.patch version. Disjunction (||) is not supported in schemaVersion 1."
+    },
+    "frameworkVersion": {
+      "type": "string",
+      "description": "SemVer range the hosting ModFramework.Runtime must satisfy. Same grammar as gameVersion."
+    },
+    "dependencies": {
+      "type": "array",
+      "maxItems": 64,
+      "description": "Other mods that must be present (and, unless optional, initialized) before this one.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Mod id of the dependency. Must not be this mod's own id."
+          },
+          "version": {
+            "type": "string",
+            "default": "*",
+            "description": "SemVer range the dependency's version must satisfy."
+          },
+          "optional": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, a missing dependency is allowed and only reported; when false the mod is skipped."
+          }
+        }
+      }
+    },
+    "privateAssemblies": {
+      "type": "array",
+      "maxItems": 32,
+      "description": "Assemblies shipped next to the entry assembly and loaded before it. They must be listed explicitly: Assembly.LoadFrom does not probe the load directory on .NET Core and Directory.GetFiles does not exist in the shipped runtime.",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[^\\\\/:*?\"<>|]+\\.dll$"
+      }
+    }
+  }
+}

@@ -1,11 +1,18 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    最小编译期验证：模组能否**静态引用**游戏程序集里的类型。
+    The reference mod: the smallest package the Phase 1 loader can discover, validate,
+    load and initialize.
 
-    这不是可运行的模组，而是"SDK 地基是否成立"的证据：
-    如果这个工程能用 Android 参考程序集编译通过，说明模组作者可以在
-    Visual Studio / Rider 里直接 `using StardewValley;` 并调用 `Game1`。
+    Build (needs the game's own assemblies as references, see Mod/Directory.Build.props):
+      dotnet build Mod/ExampleMod.HelloWorld -p:AndroidRefsDir=<dir with the 65 assemblies>
+
+    The build output directory is a complete mod package: manifest.json is copied next to
+    the assembly, so the directory can be copied to <Mods>/ExampleMod.HelloWorld/ as-is.
+
+    GameBindings.cs deliberately references StardewValley.Game1: that is the compile-time
+    proof that a mod can be written against game types. It is NOT called by the loader, so
+    the host tests can load and initialize this mod on a desktop without the game.
   -->
 
   <PropertyGroup>
@@ -14,7 +21,18 @@
     <Nullable>enable</Nullable>
     <AssemblyName>ExampleMod.HelloWorld</AssemblyName>
     <RootNamespace>ExampleMod.HelloWorld</RootNamespace>
+    <Version>1.0.0</Version>
     <Deterministic>true</Deterministic>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Compile against the shared contract, but never ship a copy of it: a second copy would
+         give the mod a different IModEntry identity and the loader would reject it (MF0204). -->
+    <ProjectReference Include="..\ModFramework.Runtime\ModFramework.Runtime.csproj" Private="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="manifest.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 
 </Project>

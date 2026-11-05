@@ -17,8 +17,11 @@
 param(
     [ValidateSet("full", "append")][string]$Mode = "full",
     [string]$HookMethod = "OnCreate",
-    [string]$Serial = "127.0.0.1:16384",
+    # Empty = auto-select the single attached device. Never default to a specific
+    # endpoint: this script uninstalls and reinstalls the game.
+    [string]$Serial = "",
     [string]$Dotnet = "",
+    [string]$JavaHome = "",
     # Do not register the catch handler in Bootstrap.Start(): failures surface as a crash.
     [switch]$NoCatch,
     # Push ModFramework.Runtime.dll + probe into the app's Mods dir before launching.
@@ -31,17 +34,53 @@ param(
 $ErrorActionPreference = "Stop"
 
 $root      = Split-Path -Parent $PSScriptRoot
-$adb       = Join-Path $env:LOCALAPPDATA "Android\Sdk\platform-tools\adb.exe"
 $phase     = Join-Path $root ".tmp\phase0.5"
 $dotnet    = if ($Dotnet) { $Dotnet } else { Join-Path $phase "dotnet\dotnet.exe" }
 $python    = "python"
 $blob      = Join-Path $root "app\src\main\apkroot\assemblies\assemblies.blob"
 $manifest  = Join-Path $root "app\src\main\apkroot\assemblies\assemblies.manifest"
 $original  = Join-Path $phase "out\assemblies.original.blob"
-$refs      = Join-Path $phase "refs"
-$apk       = Join-Path $root "app\build\outputs\apk\debug\app-debug.apk"
-$env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-11.0.32.101-hotspot"
+
+# Same portable adb resolution as Tools/device-precheck.ps1: no hardcoded user path.
+function Resolve-Adb {
+    $exe = if ($env:OS -eq "Windows_NT") { "adb.exe" } else { "adb" }
+    $onPath = Get-Command adb -ErrorAction SilentlyContinue
+    if ($onPath -and $onPath.Source) { return $onPath.Source }
+    foreach ($var in @("ANDROID_HOME", "ANDROID_SDK_ROOT")) {
+        $sdk = [Environment]::GetEnvironmentVariable($var)
+        if ($sdk) {
+            $candidate = Join-Path (Join-Path $sdk "platform-tools") $exe
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+        }
+    }
+    if ($env:ADB_PATH -and (Test-Path -LiteralPath $env:ADB_PATH -PathType Leaf)) { return $env:ADB_PATH }
+    if ($env:LOCALAPPDATA) {
+        $candidate = Join-Path $env:LOCALAPPDATA "Android\Sdk\platform-tools\adb.exe"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    return $null
+}
+
+$adb = Resolve-Adb
+if (-not $adb) {
+    throw "no adb client found: put platform-tools on PATH or set ANDROID_HOME / ANDROID_SDK_ROOT"
+}
+
+if (-not $JavaHome) {
+    if ($env:JAVA_HOME -and (Test-Path $env:JAVA_HOME)) {
+        $JavaHome = $env:JAVA_HOME
+    } else {
+        $JavaHome = "C:\Program Files\Eclipse Adoptium\jdk-11.0.32.101-hotspot"
+    }
+}
+if (-not (Test-Path $JavaHome)) {
+    throw "JAVA_HOME not found: $JavaHome (pass -JavaHome or set JAVA_HOME)"
+}
+$env:JAVA_HOME = $JavaHome
 $env:DOTNET_NOLOGO = "1"
+
+$refs = Join-Path $phase "refs"
+$apk  = Join-Path $root "app\build\outputs\apk\debug\app-debug.apk"
 
 function Sha256([string]$path) {
     (Get-FileHash -Path $path -Algorithm SHA256).Hash.ToLower()
@@ -93,6 +132,22 @@ $localApkHash = Sha256 $apk
 Write-Host "local apk  : $localApkHash ($((Get-Item $apk).Length) bytes)"
 
 if ($SkipInstall) { exit 0 }
+
+# 3.5 pick a device explicitly. Auto-select only when exactly one is attached: this
+# script uninstalls the game, so silently targeting a guessed endpoint is unacceptable.
+if (-not $Serial) {
+    $online = @()
+    foreach ($line in (& $adb devices)) {
+        if ($line -match '^(\S+)\s+device\b') { $online += $Matches[1] }
+    }
+    if ($online.Count -ne 1) {
+        throw ("expected exactly one attached device, found {0}: {1}. Pass -Serial <serial>." -f $online.Count, ($online -join ", "))
+    }
+    $Serial = $online[0]
+    Write-Host "device     : $Serial (auto-selected, single attached device)"
+} else {
+    Write-Host "device     : $Serial"
+}
 
 # 4. install without incremental streaming, then PROVE which APK is installed
 # uninstall -> install has a race in this workspace (one Phase 0 run failed here); retry once.

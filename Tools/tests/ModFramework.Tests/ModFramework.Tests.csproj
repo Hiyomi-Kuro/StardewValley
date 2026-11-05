@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Console test host for ModFramework.Runtime.
+
+    Two layers, both offline (no Android device, no game installation):
+      * unit tests   - SemVer, version ranges, JSON, manifest validation, dependency graph,
+                       discovery, state machine, error codes;
+      * host tests   - a real Manifest -> Loader -> Assembly.LoadFrom -> IModEntry.Initialize
+                       chain against the fixture mods in Tools/tests/FixtureMods.
+
+    Deliberately not xunit/NUnit: the repository has no NuGet test dependency and these
+    checks must run on a machine with only a .NET SDK.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>ModFramework.Tests</AssemblyName>
+    <RootNamespace>ModFramework.Tests</RootNamespace>
+    <Deterministic>true</Deterministic>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\Mod\ModFramework.Runtime\ModFramework.Runtime.csproj" />
+  </ItemGroup>
+
+</Project>

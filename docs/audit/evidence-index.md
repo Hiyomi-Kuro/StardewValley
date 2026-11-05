@@ -113,8 +113,8 @@ Phase 0.5 复核：
 | 证据 | 位置 | 说明 |
 | --- | --- | --- |
 | 桌面基线报告 | `.tmp/phase0/evidence/probe-desktop-baseline.{log,json}` | 11 pass / 1 fail（T07 无游戏程序集，预期） |
-| **设备实测报告（最终）** | `.tmp/phase0/evidence/probe-device-androidrefs.txt` | **8/8 PASS**，含 `T00 dyn-code supported=True`、`T07 Game1 576 方法/532 字段` |
-| 设备 loader 日志 | `.tmp/phase0/evidence/loader-device-androidrefs.log` | `Assembly.LoadFrom` 加载运行时并执行 `Loader.Start()` |
+| **设备实测报告（最终）** | `.tmp/phase0/evidence/probe-device-androidrefs.txt`（**已丢失**） | **RECORDED 8/8 PASS (Evidence D)**，含 `T00 dyn-code supported=True`、`T07 Game1 576 方法/532 字段`；模拟器，非真机 |
+| 设备 loader 日志 | `.tmp/phase0/evidence/loader-device-androidrefs.log`（**已丢失**） | 记录为 `Assembly.LoadFrom` 加载运行时并执行 `Loader.Start()`（D 级） |
 | 早期设备报告（桌面参考程序集编译） | `.tmp/phase0/evidence/probe-device.txt` | 8 项中 3 项失败，**已被上一行取代**；保留用于对照"编译方式"的影响 |
 | 探针源码 | `Mod/MonoRuntimeProbe/ProbeEntry.cs` | T00–T07（T08–T10 因 API 不可用已移除） |
 | 编译期证据 | `docs/audit/bcl-surface.md` §3 | `CS0117`/`CS0234`/`CS1503` 四条错误 |

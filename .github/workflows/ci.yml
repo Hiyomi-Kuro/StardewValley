@@ -1,0 +1,75 @@
+# Offline CI for the Stardew Valley Android mod framework.
+#
+# Scope (deliberate): everything here runs without the game, the APK, a device or the
+# private .NET SDK. Nothing copyrighted is uploaded, and no artifact is produced.
+#
+# Suites that DO need the game's own assemblies (injection against StardewValley.dll,
+# container rebuild, the example mod compiled with AndroidRefsDir) are local-only:
+#   python Tools/tests/test_mod_pipeline.py --dotnet <sdk> --refs <65 assemblies>
+#   python Tools/tests/test_loader.py --dotnet <sdk> --refs <65 assemblies>
+# They are reported as SKIPPED here, never as passed.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-checks:
+    name: offline checks (python, powershell, manifests, privacy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: setup python
+        uses: actions/setup-python@v5.3.0
+        with:
+          python-version: "3.12"
+
+      - name: offline suite
+        run: python Tools/tests/test_ci_offline.py
+
+      - name: privacy scan
+        run: python Tools/privacy-scan.py
+
+  dotnet-tools:
+    name: dotnet build + loader host tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: setup dotnet
+        uses: actions/setup-dotnet@v4.1.0
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: build ModInjector
+        run: dotnet build Tools/ModInjector/ModInjector.csproj -c Release --artifacts-path "$RUNNER_TEMP/artifacts" -v q
+
+      - name: build runtime and fixture mods
+        run: |
+          dotnet build Mod/ModFramework.Runtime/ModFramework.Runtime.csproj -c Release --artifacts-path "$RUNNER_TEMP/artifacts" -v q
+          dotnet build Tools/tests/FixtureMods/FixtureMod/FixtureMod.csproj -c Release --artifacts-path "$RUNNER_TEMP/artifacts" -v q
+
+      - name: loader host tests (no game assemblies)
+        run: python Tools/tests/test_loader.py --dotnet dotnet --artifacts "$RUNNER_TEMP/artifacts"
+
+      - name: local-only suites (not configured on this runner)
+        run: |
+          echo "SKIPPED: test_mod_pipeline.py needs the game's StardewValley.dll and the assemblies container."
+          echo "SKIPPED: the example-mod build (Mod/ExampleMod.HelloWorld) needs AndroidRefsDir."
+          echo "SKIPPED: any device/E1/E2 evidence needs an ARM64 physical device (BLOCKED, see docs/audit/phase0.5-device-checklist.md)."
+          echo "Nothing above was reported as passed."

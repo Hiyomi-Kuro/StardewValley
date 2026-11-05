@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "ExampleMod.HelloWorld",
+  "name": "Hello World",
+  "version": "1.0.0",
+  "author": "Stardew Valley Mod Framework",
+  "description": "Minimal mod that proves the manifest -> loader -> IModEntry.Initialize chain.",
+  "entryAssembly": "ExampleMod.HelloWorld.dll",
+  "entryType": "ExampleMod.HelloWorld.HelloWorldEntry",
+  "gameVersion": ">=1.6.0 <2.0.0",
+  "frameworkVersion": "^1.0.0"
+}

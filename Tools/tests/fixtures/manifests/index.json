@@ -1,0 +1,130 @@
+{
+  "comment": "expect: 'ok' or the ErrorCodes value the loader must report",
+  "cases": [
+    {
+      "file": "valid.minimal.json",
+      "expect": "ok",
+      "note": "Smallest accepted manifest."
+    },
+    {
+      "file": "valid.full.json",
+      "expect": "ok",
+      "note": "Every optional field, a prerelease+build version, a dependency and an optional dependency."
+    },
+    {
+      "file": "invalid.missing-schema.json",
+      "expect": "MF0108",
+      "note": "schemaVersion is required."
+    },
+    {
+      "file": "invalid.unknown-schema.json",
+      "expect": "MF0107",
+      "note": "Only schemaVersion 1 is supported."
+    },
+    {
+      "file": "invalid.schema-not-number.json",
+      "expect": "MF0110",
+      "note": "schemaVersion must be a number."
+    },
+    {
+      "file": "invalid.missing-id.json",
+      "expect": "MF0108",
+      "note": "id is required."
+    },
+    {
+      "file": "invalid.empty-name.json",
+      "expect": "MF0109",
+      "note": "A required string that is only whitespace is rejected."
+    },
+    {
+      "file": "invalid.bad-id.json",
+      "expect": "MF0113",
+      "note": "Mod ids cannot contain path separators."
+    },
+    {
+      "file": "invalid.bad-version.json",
+      "expect": "MF0116",
+      "note": "Version must be full SemVer major.minor.patch."
+    },
+    {
+      "file": "invalid.version-leading-zero.json",
+      "expect": "MF0116",
+      "note": "SemVer forbids leading zeros."
+    },
+    {
+      "file": "invalid.entry-assembly-absolute.json",
+      "expect": "MF0118",
+      "note": "Absolute paths are rejected."
+    },
+    {
+      "file": "invalid.entry-assembly-traversal.json",
+      "expect": "MF0118",
+      "note": "Path traversal is rejected."
+    },
+    {
+      "file": "invalid.entry-assembly-subdir.json",
+      "expect": "MF0118",
+      "note": "Separators are rejected, so a manifest can never point outside the package."
+    },
+    {
+      "file": "invalid.entry-assembly-noext.json",
+      "expect": "MF0118",
+      "note": "The entry assembly must be a .dll."
+    },
+    {
+      "file": "invalid.unknown-field.json",
+      "expect": "MF0111",
+      "note": "schemaVersion 1 rejects unknown fields so typos cannot be silently ignored."
+    },
+    {
+      "file": "invalid.wrong-type-version.json",
+      "expect": "MF0110",
+      "note": "version must be a string."
+    },
+    {
+      "file": "invalid.bad-range.json",
+      "expect": "MF0117",
+      "note": "Version ranges require full SemVer comparators."
+    },
+    {
+      "file": "invalid.duplicate-dependency.json",
+      "expect": "MF0114",
+      "note": "The same dependency twice is rejected."
+    },
+    {
+      "file": "invalid.self-dependency.json",
+      "expect": "MF0115",
+      "note": "A mod cannot depend on itself."
+    },
+    {
+      "file": "invalid.too-many-dependencies.json",
+      "expect": "MF0112",
+      "note": "More than 64 dependencies is rejected."
+    },
+    {
+      "file": "invalid.not-object.json",
+      "expect": "MF0110",
+      "note": "The manifest root must be a JSON object."
+    },
+    {
+      "file": "invalid.duplicate-key.json",
+      "expect": "MF0106",
+      "note": "Duplicate object keys are rejected instead of silently keeping the last one."
+    },
+    {
+      "file": "invalid.trailing-comma.json",
+      "expect": "MF0104",
+      "note": "Trailing commas are not valid JSON."
+    },
+    {
+      "file": "invalid.not-utf8.json",
+      "expect": "MF0105",
+      "note": "Latin-1 bytes are not UTF-8."
+    },
+    {
+      "file": "invalid.too-large.json",
+      "expect": "MF0103",
+      "note": "Manifests larger than 256 KiB are rejected before parsing."
+    }
+  ]
+}

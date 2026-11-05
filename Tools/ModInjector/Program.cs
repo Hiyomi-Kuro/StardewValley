@@ -52,7 +52,7 @@ public static class Program
                 case "--help":
                     return Usage();
                 default:
-                    Console.Error.WriteLine("[error] 鏈煡鍛戒护: " + command);
+                    Console.Error.WriteLine("[error] unknown command: " + command);
                     return 2;
             }
         }

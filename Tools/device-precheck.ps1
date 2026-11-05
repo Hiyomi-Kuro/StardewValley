@@ -5,16 +5,28 @@
 # Read-only by construction: getprop / pm path / dumpsys / ls / sha256sum only.
 # It never installs, uninstalls, force-stops, clears data, or writes to the device.
 #
+# adb discovery (no hardcoded user directory, ever):
+#   1. -Adb <path>            explicit override (validated, wins over everything)
+#   2. PATH                   Get-Command adb
+#   3. ANDROID_HOME           $ANDROID_HOME/platform-tools/adb[.exe]
+#   4. ANDROID_SDK_ROOT       $ANDROID_SDK_ROOT/platform-tools/adb[.exe]
+#   5. LOCALAPPDATA           %LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe (Windows)
+#   6. ADB_PATH               explicit environment override for unusual layouts
+# When several candidates exist the highest-priority one is used and the conflict
+# is printed, so "which adb did I measure with" is never ambiguous.
+#
 # Usage:
 #   pwsh -NoProfile -File Tools/device-precheck.ps1
 #   pwsh -NoProfile -File Tools/device-precheck.ps1 -Serial 127.0.0.1:16384
 #   pwsh -NoProfile -File Tools/device-precheck.ps1 -OutFile .tmp/phase0.5/logs/e0.txt
+#   pwsh -NoProfile -File Tools/device-precheck.ps1 -ResolveAdbOnly   # no device needed
 param(
     [string]$Serial = "",
     [string]$Adb = "",
     [string]$Package = "com.chucklefish.stardewvalley",
     [string]$OutFile = "",
-    [string[]]$HashFiles = @()
+    [string[]]$HashFiles = @(),
+    [switch]$ResolveAdbOnly
 )
 
 $ErrorActionPreference = "Continue"
@@ -25,35 +37,167 @@ function Say([string]$text) {
     Write-Host $text
 }
 
-function Adb-Prop([string]$serial, [string]$prop) {
-    $v = & $script:AdbBin -s $serial shell "getprop $prop" 2>$null
-    if ($null -eq $v) { return "" }
-    return (($v -join " ") -replace "`r", "").Trim()
+# Replace the operator's home directory with a stable placeholder so that pasted
+# output never leaks a user name. Only the home prefix is rewritten; nothing else
+# about the path is changed.
+function Redact-Path([string]$text) {
+    if (-not $text) { return $text }
+    $roots = @()
+    if ($env:USERPROFILE) { $roots += $env:USERPROFILE }
+    if ($env:HOME) { $roots += $env:HOME }
+    if ($env:LOCALAPPDATA) { $roots += (Split-Path -Parent (Split-Path -Parent $env:LOCALAPPDATA)) }
+    foreach ($root in $roots) {
+        if ($root -and $root.Trim().Length -gt 3) {
+            $text = $text -replace [regex]::Escape($root.TrimEnd('\', '/')), '<home>'
+        }
+    }
+    # Any remaining Windows profile path (e.g. a stale log line) is redacted too.
+    $text = $text -replace '(?i)[A-Z]:\\Users\\[^\\\s"]+', '<home>'
+    return $text
 }
 
-if (-not $Adb) {
-    $cmd = Get-Command adb -ErrorAction SilentlyContinue
-    if ($cmd) { $Adb = $cmd.Source }
+function Test-WindowsHost {
+    # Windows PowerShell 5.1 has no $IsWindows; $env:OS is set on Windows in both hosts.
+    return [bool]($env:OS -eq "Windows_NT")
 }
-if (-not $Adb) {
-    $candidates = @()
-    if ($env:LOCALAPPDATA) { $candidates += (Join-Path $env:LOCALAPPDATA "Android\Sdk\platform-tools\adb.exe") }
-    if ($env:ANDROID_HOME) { $candidates += (Join-Path $env:ANDROID_HOME "platform-tools\adb.exe") }
-    if ($env:ANDROID_SDK_ROOT) { $candidates += (Join-Path $env:ANDROID_SDK_ROOT "platform-tools\adb.exe") }
-    $candidates += "C:\Users\Kaori Izuki\AppData\Local\Android\Sdk\platform-tools\adb.exe"
-    foreach ($c in $candidates) {
-        if ($c -and (Test-Path $c)) { $Adb = $c; break }
+
+function Get-AdbFileName {
+    if (Test-WindowsHost) { return "adb.exe" }
+    return "adb"
+}
+
+# Ordered candidate list: @{ Path = <full path>; Source = <where it came from> }.
+# Nothing here guesses a user name; every candidate comes from an env var, PATH or
+# an explicit argument.
+function Get-AdbCandidates([string]$Explicit) {
+    $exe = Get-AdbFileName
+    $list = New-Object System.Collections.Generic.List[object]
+
+    if ($Explicit) {
+        $list.Add([pscustomobject]@{ Path = $Explicit; Source = "argument" })
+        return $list
+    }
+
+    $onPath = Get-Command adb -ErrorAction SilentlyContinue
+    if ($onPath -and $onPath.Source) {
+        $list.Add([pscustomobject]@{ Path = $onPath.Source; Source = "PATH" })
+    }
+
+    foreach ($pair in @(@{ Var = "ANDROID_HOME"; Name = "ANDROID_HOME" },
+                        @{ Var = "ANDROID_SDK_ROOT"; Name = "ANDROID_SDK_ROOT" })) {
+        $root = [Environment]::GetEnvironmentVariable($pair.Var)
+        if ($root) {
+            $list.Add([pscustomobject]@{
+                Path   = (Join-Path (Join-Path $root "platform-tools") $exe)
+                Source = $pair.Name
+            })
+        }
+    }
+
+    if ($env:LOCALAPPDATA) {
+        $list.Add([pscustomobject]@{
+            Path   = (Join-Path (Join-Path (Join-Path $env:LOCALAPPDATA "Android") "Sdk") (Join-Path "platform-tools" $exe))
+            Source = "LOCALAPPDATA"
+        })
+    }
+
+    if ($env:ADB_PATH) {
+        $list.Add([pscustomobject]@{ Path = $env:ADB_PATH; Source = "ADB_PATH" })
+    }
+
+    return $list
+}
+
+# Picks the first candidate that exists. Returns @{ Ok; Path; Source; All; Conflict }.
+function Resolve-Adb([string]$Explicit) {
+    $all = Get-AdbCandidates $Explicit
+    $existing = @($all | Where-Object { $_.Path -and (Test-Path -LiteralPath $_.Path -PathType Leaf) })
+    $chosen = $existing | Select-Object -First 1
+    $conflict = $existing.Count -gt 1
+    $chosenPath = ""
+    $chosenSource = "none"
+    if ($chosen) {
+        $chosenPath = $chosen.Path
+        $chosenSource = $chosen.Source
+    }
+    return [pscustomobject]@{
+        Ok       = [bool]$chosen
+        Path     = $chosenPath
+        Source   = $chosenSource
+        All      = $all
+        Existing = $existing
+        Conflict = $conflict
     }
 }
-if (-not $Adb -or -not (Test-Path $Adb)) {
+
+function Report-AdbResolution($res) {
+    Say "adb-resolution:"
+    if ($res.All.Count -eq 0) {
+        Say "  candidates        : (none: adb not on PATH and no Android SDK env var is set)"
+    }
+    foreach ($c in $res.All) {
+        $mark = if ($c.Path -and (Test-Path -LiteralPath $c.Path -PathType Leaf)) { "found" } else { "missing" }
+        Say ("  {0,-14} {1,-7} {2}" -f $c.Source, $mark, (Redact-Path $c.Path))
+    }
+    if (-not $res.Ok) {
+        Say "  verdict           : BLOCKED reason=no-adb"
+        Say "  fix               : put platform-tools on PATH, or set ANDROID_HOME /"
+        Say "                      ANDROID_SDK_ROOT to an Android SDK root, or pass -Adb <path>."
+        return
+    }
+    Say ("  selected          : {0} ({1})" -f (Redact-Path $res.Path), $res.Source)
+    if ($res.Conflict) {
+        Say ("  adb-conflict      : {0} candidates exist; the highest-priority one was used." -f $res.Existing.Count)
+        foreach ($c in $res.Existing) {
+            Say ("                      {0,-14} {1}" -f $c.Source, (Redact-Path $c.Path))
+        }
+    }
+}
+
+function Adb-Prop([string]$serial, [string]$prop) {
+    # A cold adb server (or a busy emulator) can return nothing for the first few
+    # calls. Retry a couple of times so an empty value means "property is empty",
+    # not "adb was still starting".
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        $v = & $script:AdbBin -s $serial shell "getprop $prop" 2>$null
+        if ($null -ne $v) {
+            $text = (($v -join " ") -replace "`r", "").Trim()
+            if ($text -ne "" -or $attempt -eq 2) { return $text }
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    return ""
+}
+
+$resolved = Resolve-Adb $Adb
+
+if ($ResolveAdbOnly) {
+    Say "device-precheck: adb resolution self-test (no device is contacted)"
+    Report-AdbResolution $resolved
+    $text = ($lines -join "`r`n")
+    if ($OutFile) {
+        $dir = Split-Path -Parent $OutFile
+        if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        Set-Content -Path $OutFile -Value $text -Encoding utf8
+    }
+    if (-not $resolved.Ok) { exit 2 }
+    exit 0
+}
+
+if (-not $resolved.Ok) {
+    Report-AdbResolution $resolved
     Say "verdict=BLOCKED reason=no-adb no adb client found"
     exit 2
 }
-$script:AdbBin = $Adb
-Say "adb=$Adb"
+$script:AdbBin = $resolved.Path
+Say ("adb=" + (Redact-Path $resolved.Path))
+Say ("adb-source=" + $resolved.Source)
+if ($resolved.Conflict) {
+    Say ("adb-conflict=" + (($resolved.Existing | ForEach-Object { $_.Source }) -join ","))
+}
 
 Say "`n== 1. attached devices =="
-$devices = & $Adb devices -l 2>&1
+$devices = & $resolved.Path devices -l 2>&1
 $devices | ForEach-Object { Say ("  " + $_) }
 
 $serialList = @()
@@ -103,20 +247,20 @@ if ($isArm64Device -and -not $isTranslated -and -not $looksEmulator) {
 Say "  abi-primary=$abiPrimary abilist=$abiList native-bridge=$bridge"
 
 Say "`n== 3. root (do not assume) =="
-$whoami = & $Adb -s $Serial shell "id" 2>&1
+$whoami = & $resolved.Path -s $Serial shell "id" 2>&1
 Say ("  adb shell id      : " + (($whoami -join " ") -replace "`r", "").Trim())
-$suId = & $Adb -s $Serial shell "su -c id" 2>&1
+$suId = & $resolved.Path -s $Serial shell "su -c id" 2>&1
 $suText = (($suId -join " ") -replace "`r", "").Trim()
 Say ("  su -c id          : " + $(if ($suText -match "uid=0") { "uid=0 (available)" } else { "unavailable -> $suText" }))
 $hasSu = ($suText -match "uid=0")
 
 Say "`n== 4. target package (read-only) =="
-$pkgPath = & $Adb -s $Serial shell "pm path $Package" 2>&1
+$pkgPath = & $resolved.Path -s $Serial shell "pm path $Package" 2>&1
 $pkgPathText = (($pkgPath -join " ") -replace "`r", "").Trim()
 Say ("  pm path           : " + $pkgPathText)
 $installed = $pkgPathText -match "package:"
 if ($installed) {
-    $dumpsys = & $Adb -s $Serial shell "dumpsys package $Package" 2>&1
+    $dumpsys = & $resolved.Path -s $Serial shell "dumpsys package $Package" 2>&1
     foreach ($pat in @("versionCode", "versionName", "firstInstallTime", "lastUpdateTime", "primaryCpuAbi")) {
         $hit = $dumpsys | Where-Object { $_ -match "$pat=" } | Select-Object -First 1
         if ($hit) { Say ("  " + ($hit -replace "`r", "").Trim()) }
@@ -124,7 +268,7 @@ if ($installed) {
 
     $apkPath = ($pkgPathText -split "\s+" | Select-Object -First 1) -replace "package:", ""
     if ($hasSu -and $apkPath) {
-        $devHash = & $Adb -s $Serial shell "su -c 'sha256sum $apkPath'" 2>&1
+        $devHash = & $resolved.Path -s $Serial shell "su -c 'sha256sum $apkPath'" 2>&1
         Say ("  installed apk sha : " + ((($devHash -join " ") -replace "`r", "").Trim()))
     } else {
         Say "  installed apk sha : UNKNOWN (needs root; do not assume root)"
@@ -132,11 +276,11 @@ if ($installed) {
 
     Say "`n== 5. mod/framework leftovers in the app's private dir (read-only) =="
     if ($hasSu) {
-        $ls = & $Adb -s $Serial shell "su -c 'ls -la /data/data/$Package/files' " 2>&1
+        $ls = & $resolved.Path -s $Serial shell "su -c 'ls -la /data/data/$Package/files' " 2>&1
         $ls | ForEach-Object { Say ("  " + ($_ -replace "`r", "")) }
-        $mods = & $Adb -s $Serial shell "su -c 'ls -la /sdcard/Android/data/$Package/files/Mods'" 2>&1
+        $mods = & $resolved.Path -s $Serial shell "su -c 'ls -la /sdcard/Android/data/$Package/files/Mods'" 2>&1
         $mods | ForEach-Object { Say ("  mods: " + ($_ -replace "`r", "")) }
-        $log = & $Adb -s $Serial shell "su -c 'cat /data/data/$Package/files/Mods/loader.log'" 2>&1
+        $log = & $resolved.Path -s $Serial shell "su -c 'cat /data/data/$Package/files/Mods/loader.log'" 2>&1
         Say ("  loader.log (Mods) : " + ((($log -join " ") -replace "`r", "").Trim()))
     } else {
         Say "  skipped: no root"
@@ -153,9 +297,9 @@ if ($HashFiles.Count -eq 0) {
         if (Test-Path $f) {
             $h = (Get-FileHash -Path $f -Algorithm SHA256).Hash.ToLower()
             $size = (Get-Item $f).Length
-            Say ("  {0}  {1}  {2}" -f $h, $size, $f)
+            Say ("  {0}  {1}  {2}" -f $h, $size, (Redact-Path $f))
         } else {
-            Say ("  MISSING " + $f)
+            Say ("  MISSING " + (Redact-Path $f))
         }
     }
 }
@@ -176,6 +320,6 @@ if ($OutFile) {
     $dir = Split-Path -Parent $OutFile
     if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     Set-Content -Path $OutFile -Value $text -Encoding utf8
-    Write-Host "`nwritten: $OutFile"
+    Write-Host "`nwritten: $(Redact-Path $OutFile)"
 }
 exit 0

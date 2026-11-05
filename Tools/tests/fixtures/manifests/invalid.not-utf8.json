@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "id": "ExampleMod.Bytes",
+  "name": "Café",
+  "version": "1.0.0",
+  "entryAssembly": "Bytes.dll",
+  "entryType": "Bytes.Entry"
+}

@@ -1,0 +1,37 @@
+{
+  "_comment": [
+    "Reviewed exceptions for Tools/privacy-scan.py.",
+    "Every entry needs a reason: an allow-list entry is an explicit statement that the",
+    "occurrence was looked at and is not a secret, not a way to silence the scanner.",
+    "Matching: all present keys must match. 'rule' and 'path' are exact; 'contains' is a",
+    "substring of the line; 'line' is 1-based.",
+    "An entry is only consulted when the corresponding rule actually fires, so entries for",
+    "patterns that no longer appear are harmless."
+  ],
+  "allow": [
+    {
+      "rule": "posix-home-path",
+      "path": "app/src/main/kotlin/com/kaori/svpatch/Main.kt",
+      "contains": "package com.kaori.svpatch",
+      "reason": "Kotlin package namespace of this project (author-chosen identifier), not a filesystem path or user name."
+    },
+    {
+      "rule": "email",
+      "path": "docs/audit/adr-0001-mod-injection.md",
+      "contains": "noreply@",
+      "reason": "Placeholder pattern in an example; no real mailbox."
+    },
+    {
+      "rule": "posix-home-path",
+      "path": "Tools/tests/test_device_precheck.ps1",
+      "contains": "<tmp>/home/AppData",
+      "reason": "Documentation of the synthetic temp tree the self-test builds; not a real home directory."
+    },
+    {
+      "rule": "windows-user-path",
+      "path": "Tools/tests/test_device_precheck.ps1",
+      "contains": "C:\\Users\\...",
+      "reason": "The literal assertion string that proves the script never prints a guessed user profile path."
+    }
+  ]
+}

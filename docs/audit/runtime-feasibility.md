@@ -3,7 +3,7 @@
 - 项目：Stardew Valley Android Mod Framework
 - 目标产物：`docs/audit/runtime-feasibility.md`
 - 版本绑定：`com.chucklefish.stardewvalley` 1.6.15.0 (versionCode 239)
-- 报告状态：**静态审计完成；运行时实验已在模拟器上完成 E1/E2，真机复现待做**
+- 报告状态：**静态审计完成；E1/E2 只有模拟器上的 D 级历史记录（原始日志已丢失），ARM64 真机复现待做（BLOCKED）**
   （见 `phase0-status.md` §3.22/§3.23；Phase 0.5 复核见 `phase0.5-report.md`）
 - 生成时间：2026-11-04（Phase 0.5 修订：2026-11-05）
 - 证据根目录：`.tmp/phase0/evidence/`（**已不在本机**，见下）
@@ -583,15 +583,15 @@ APK 构建期（一次性，由本工程完成）
 ## 10. 待完成的实验（Phase 0 阻塞项）
 
 > Phase 0.5 状态更新（2026-11-05）：下表"状态"列是 Phase 0 早期的"待设备"。
-> 实际结果：E1/E2 = **模拟器 PASS / 真机 BLOCKED**；E3 = 模拟器间接 PASS；
+> 实际结果：E1/E2 = **RECORDED PASS (Evidence D)（模拟器）/ 真机 BLOCKED**；E3 = RECORDED PASS (D)；
 > E4 = NOT RUN（被 E5 取代）；E5 = 当前工具链 FAIL；E6 = NOT RUN。
 > 逐项证据见 `phase0.5-report.md` §7 与 §9 状态矩阵。
 
 | ID | 目的 | 方法 | 通过标准 | 状态（Phase 0.5 复核） |
 | --- | --- | --- | --- | --- |
-| E1 | 动态程序集加载 + IL 执行 | 注入探针，`Assembly.LoadFrom(path)` + `Loader.Start()`，调用静态/实例/泛型方法 | 日志出现三段返回值 | 模拟器 PASS / 真机 BLOCKED |
-| E2 | 反射访问游戏类型 | `probe` 反射 `StardewValley.Game1`，枚举类型/成员（只读） | 返回预期值 | 模拟器 PASS / 真机 BLOCKED |
-| E3 | 事件钩子可行性 | 在 `OnCreatePartTwo` 前后打点，验证 tick/day 事件可被驱动 | 事件按序触发 | 模拟器间接 PASS（仅注入点 + 事件用例） |
+| E1 | 动态程序集加载 + IL 执行 | 注入探针，`Assembly.LoadFrom(path)` + `Loader.Start()`，调用静态/实例/泛型方法 | 日志出现三段返回值 | RECORDED PASS (D)（模拟器）/ 真机 BLOCKED |
+| E2 | 反射访问游戏类型 | `probe` 反射 `StardewValley.Game1`，枚举类型/成员（只读） | 返回预期值 | RECORDED PASS (D)（模拟器）/ 真机 BLOCKED |
+| E3 | 事件钩子可行性 | 在 `OnCreatePartTwo` 前后打点，验证 tick/day 事件可被驱动 | 事件按序触发 | RECORDED PASS (D)（仅注入点 + 事件用例） |
 | E4 | 去 AOT 回退 | 移除 `libaot-StardewValley.dll.so` 重打包 | 游戏启动到标题界面；记录启动耗时/内存 | NOT RUN（JIT 本来就在，无必要） |
 | E5 | Harmony Prefix/Postfix/Original | `HarmonyDemo` 对 JIT 方法与 AOT 方法各打一次 | JIT 通过；AOT 明确失败并给出诊断 | FAIL（缺 `Reflection.Emit`；原生 detour 崩溃 T12） |
 | E6 | 独立管理器存储通道 | SAF / 共享目录 / 游戏端导入三条路径 | 至少一条在 Android 12 + Android 14 真机可用 | NOT RUN（需真机） |
@@ -644,5 +644,5 @@ StardewValley.dll 587ff5ff9c258679004977bbeec359aba86649bd3e4860ddcaa428df8f07e0
 | 页首 | 增加"证据可得性"说明 | `.tmp/phase0/evidence/*` 已删除，不能继续声称可复核 |
 | §6.5 标题 | "真机" → "MuMu 模拟器" | 当时设备是 x86_64 模拟器 + `libnb.so`，不是 ARM64 真机 |
 | §9.2 | 架构图改为真实实现：Bootstrap 合并进 `StardewValley.dll`；`Assembly.LoadFrom`；标注 manifest/入口/事件未实现 | 原图写的是"新增程序集条目 + `Load(byte[])`"，与 ADR D3 和源码都不一致 |
-| §10 | 状态列填入 Phase 0.5 复核结果（模拟器/真机分开） | 原文一律"待设备"，与 §3.22/§3.23 已通过的结论矛盾 |
+| §10 | 状态列填入 Phase 0.5 复核结果（模拟器 D 级记录 / 真机 BLOCKED 分开） | 原文一律"待设备"，与 §3.22/§3.23 的记录矛盾；Phase 0.5.1 再把"模拟器 PASS"改写为 RECORDED PASS (Evidence D) |
 | §11 | 未改动，但表格里的 `.tmp/phase0/*` 路径已失效 | 保留为历史；重建脚本不存在，见 `phase0.5-evidence-index.md` |

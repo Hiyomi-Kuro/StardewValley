@@ -227,8 +227,13 @@ E AndroidRuntime: android.runtime.JavaProxyThrowable: [System.Exception]: bootst
 I am_crash: [23245,0,com.chucklefish.stardewvalley,…,bootstrap-ran,…]
 ```
 
-在 `logcat -b all` 里抓到 `bootstrap-ran`。**这是 Phase 0 第一次拿到"注入代码在真机运行时执行"
+在 `logcat -b all` 里抓到 `bootstrap-ran`。**这是 Phase 0 第一次拿到"注入代码在运行时执行"
 的正向证据**（此前只有"崩在我们代码里"这种间接证据）。
+
+> **Phase 0.5.1 更正（证据等级）**：这次运行的设备是 **MuMu 12 模拟器（x86_64 + `libnb.so` 翻译层）**，
+> **不是 ARM64 真机**。原文写的"真机运行时执行"是错的。该 logcat 已随 `.tmp/phase0/` 丢失，
+> 因此本结论只是 **RECORDED PASS (Evidence D; original logs unavailable; not independently reproducible)**，
+> 不能作为当前已验证事实，也不能填进真机栏。
 
 ### 仍未完成
 
@@ -497,23 +502,32 @@ FAIL T10 dyn-assembly   : FileNotFoundException: System.Reflection.Emit, Version
 
 ### 结论
 
-| 能力 | 结果 |
-| --- | --- |
-| 从磁盘加载外部程序集 | ✅ `Assembly.LoadFrom` 可用（Bootstrap 与 Probe 都靠它加载） |
-| 执行外部程序集的 IL | ✅ 静态/实例/泛型/事件/反射全部 PASS |
-| 跨程序集调用 | ✅ T06（探针 → 依赖 DLL） |
-| 反射访问游戏类型 | ✅ **T07 读到 `Game1` 576 方法 / 532 字段** |
-| 写文件 | ✅ `loader.log`、`probe.txt` 均落盘 |
-| `Assembly.Load(byte[])` | ❌ 被裁剪 |
-| **Reflection.Emit** | ❌ `DynamicMethod` 与 `AssemblyBuilder` 都不可用（缺 `System.Reflection.Emit` 程序集） |
-| `AppContext` / `RuntimeFeature` / `Architecture` | ❌ facade 缺失 |
+> **Phase 0.5.1 更正**：下表来自已丢失的探针输出，属 **D 级历史记录**（模拟器，非真机）。
+> ✅ 只能读作"当时记录为可用"，不是本阶段的直接证据；只有标 **编译期 A** 的条目可复核。
+
+| 能力 | 结果 | 证据等级 |
+| --- | --- | --- |
+| 从磁盘加载外部程序集 | `Assembly.LoadFrom` 记录为可用（Bootstrap 与 Probe 都靠它加载） | D（记录） |
+| 执行外部程序集的 IL | 记录为 静态/实例/泛型/事件/反射全部 PASS | D（记录） |
+| 跨程序集调用 | 记录 T06（探针 → 依赖 DLL） | D（记录） |
+| 反射访问游戏类型 | 记录 **T07 `Game1` 576 方法 / 532 字段** | D（记录，不可复核） |
+| 写文件 | 记录 `loader.log`、`probe.txt` 均落盘 | D（记录） |
+| `Assembly.Load(byte[])` | ❌ 被裁剪 | **A（编译期 CS1503）** |
+| **Reflection.Emit** | ❌ `DynamicMethod` 与 `AssemblyBuilder` 都不可用（缺 `System.Reflection.Emit` 程序集） | **A（编译期 CS7036/CS0234）** + D（运行时记录） |
+| `AppContext` / `RuntimeFeature` / `Architecture` | ❌ facade 缺失 | **A（编译期 CS0117/CS0234）** |
 
 ### 门控判定
 
-按 ADR-0001 §6，E1（动态加载 + IL 执行）与 E2（反射访问游戏类型）**在设备上通过**。
+按 ADR-0001 §6，E1（动态加载 + IL 执行）与 E2（反射访问游戏类型）**曾经在模拟器上记录为通过**。
 但该设备是 **MuMu 模拟器（x86_64 + ARM 翻译）**，按任务书 §2.3 不得替代真机结论。
 
-→ 记为 **E1/E2 = 通过（模拟器）/ Awaiting real-device confirmation**，**仍不进入 Phase 1**。
+→ 记为 **E1/E2 = RECORDED PASS (Evidence D; original logs unavailable; not independently reproducible) /
+真机 BLOCKED**。**D 级记录不能当作"当前通过"**，也不能填进真机栏。
+
+> **Phase 0.5.1 更正**：上表 §3.22 的能力矩阵来自已丢失的探针输出（D 级），
+> 其中"执行外部程序集的 IL ✅"和"反射访问游戏类型 ✅"只是历史记录；
+> 只有"`Load(byte[])` / `Reflection.Emit` 不可用"这两条有**编译期**（A/B 级）复核，
+> 见 §3.23 的 CS0117/CS1503/CS7036。
 
 ### 对 Harmony 的影响（重要）
 
@@ -685,21 +699,23 @@ Phase 5 的目标应从"Harmony 式方法补丁"改为**游戏自带扩展点**
 
 ## 3. 未完成（阻塞项）
 
-> Phase 0.5 更新：下表是 Phase 0 早期（§3.5 之前）的认识。实际进展见 §3.22/§3.23（E1/E2 模拟器通过）
-> 与 §3.26（E5 当前工具链不可行）。当前真实阻塞只剩**真机**一项。
+> Phase 0.5 更新：下表是 Phase 0 早期（§3.5 之前）的认识。实际进展见 §3.22/§3.23
+> （E1/E2 **模拟器 D 级记录**，原始日志已丢失）与 §3.26（E5 当前工具链不可行）。
+> 当前真实阻塞是**ARM64 真机**一项。
 
 | 项 | Phase 0 早期判断 | Phase 0.5 实际状态 |
 | --- | --- | --- |
-| E1 动态加载 + IL 执行 | 需要真机 + 注入工具 | 模拟器 **PASS**（§3.22/§3.23）；真机 `BLOCKED` |
-| E2 反射访问 `Game1` | 同上 | 模拟器 **PASS**（576 方法 / 532 字段）；真机 `BLOCKED` |
-| E3 事件钩子 | 同上 | 模拟器间接 PASS（注入点执行 + 事件用例）；未做 tick/day 驱动 |
+| E1 动态加载 + IL 执行 | 需要真机 + 注入工具 | **RECORDED PASS (D)**（§3.22/§3.23，模拟器、日志已丢失）；真机 `BLOCKED` |
+| E2 反射访问 `Game1` | 同上 | **RECORDED PASS (D)**（576 方法 / 532 字段，未独立复核）；真机 `BLOCKED` |
+| E3 事件钩子 | 同上 | **RECORDED PASS (D)**（注入点执行 + 事件用例）；未做 tick/day 驱动 |
 | E4 去 AOT 回退 | 同上 | `NOT RUN`（被 E5 结论取代：JIT 本来就在） |
 | E5 Harmony | 需要 `0Harmony.dll` + 注入 | 当前工具链 **FAIL**（§3.26：缺 `Reflection.Emit` + 缺 AArch64 刷缓存手段） |
 | E6 存储通道 | 需要第二台设备/Android 14 | `NOT RUN` |
 | 注入工具（Cecil patch + blob 重写） | 尚未实现 | **已实现并通过离线验证**（§3.6/§3.7 + `phase0.5-report.md` §8） |
 
 **当前唯一设备**：MuMu 12 模拟器（Android 12 / x86_64 + `libnb.so` 翻译）。
-按任务书 §2.3，**不得**用模拟器结果替代真机结论。因此 E1/E2 只能记"模拟器 PASS / 真机 BLOCKED"。
+按任务书 §2.3，**不得**用模拟器结果替代真机结论。因此 E1/E2 只能记
+"**RECORDED PASS (D)（模拟器）/ 真机 BLOCKED**"。
 
 ## 4. 基线可用性验证（模拟器）
 
@@ -713,10 +729,14 @@ Phase 5 的目标应从"Harmony 式方法补丁"改为**游戏自带扩展点**
 ## 5. 门控判定
 
 Phase 1 的准入条件（来自 ADR-0001 §6）：E1、E2 至少通过。
-**当前：E1/E2 已在模拟器上通过（§3.22/§3.23），真机未复现。**
-→ **不进入 Phase 1**（不实现完整 Mod Loader）。允许继续做的是：
+**当前：E1/E2 只有 RECORDED PASS (Evidence D)（模拟器，原始日志已丢失），真机未验证。**
+→ Phase 0 结束时 **不进入 Phase 1**。允许继续做的是：
 - 注入工具与 Bootstrap 的**离线**实现与单元测试（不宣称运行时通过）；
 - 文档、SDK 骨架、manifest 校验器等不依赖运行时验证的部分。
+
+> **Phase 0.5.1 补充**：Phase 0.5.1 明确把"ARM64 真机缺失"定义为**不阻止离线架构开发**的阻塞，
+> 因此 Phase 1 的**离线实现**（Manifest/依赖/Loader/宿主测试）在 Phase 0.5.1 门禁通过后开始，
+> 端到端设备验收仍记 BLOCKED。见 `phase1-report.md`。
 
 ## 6. 下一轮任务（建议顺序）
 

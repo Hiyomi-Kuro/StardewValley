@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "name": "Minimal Mod",
+  "version": "1.0.0",
+  "entryAssembly": "ExampleMod.Minimal.dll",
+  "entryType": "ExampleMod.Minimal.Entry"
+}

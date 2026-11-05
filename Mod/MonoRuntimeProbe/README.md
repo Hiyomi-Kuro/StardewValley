@@ -2,9 +2,10 @@
 
 Phase 0 的运行时探针：在**真实游戏进程**里验证 .NET for Android / MonoVM 的动态程序集加载、反射与代码生成能力。
 
-> 状态（2026-11-05 复核）：
+> 状态（2026-11-05 Phase 0.5.1 复核）：
 > - **代码完成**，桌面基线通过；
-> - **Android 侧只在 MuMu 12 模拟器（x86_64 + `libnb.so` 翻译）跑过**：T00–T07、T11 PASS，T12 原生崩溃；
+> - **Android 侧只在 MuMu 12 模拟器（x86_64 + `libnb.so` 翻译）跑过**：T00–T07、T11 记录为 PASS，T12 原生崩溃。
+>   这些结果全部是 **RECORDED (Evidence D)**：原始日志已随 `.tmp/phase0/` 丢失，本阶段未重跑，不可独立复现；
 > - **ARM64 真机未验证**（`BLOCKED: no physical device`，见 `docs/audit/phase0.5-device-checklist.md`）。
 
 ## 1. 结构
@@ -31,18 +32,18 @@ Mod/
 
 ## 2. 用例（与当前源码一一对应）
 
-| ID | 实现 | 验证项 | 期望 / 实测 |
+| ID | 实现 | 验证项 | 期望 / 实测（模拟器记录，Evidence D） |
 | --- | --- | --- | --- |
-| T00 | `Probe.DynCode` | `RuntimeFeature.IsDynamicCodeSupported/Compiled` | 模拟器 `supported=True compiled=True` |
-| T01 | `Probe.StaticGreeting` | 普通静态方法 | PASS |
-| T02 | `ProbeSubject.InstanceGreeting` | 实例方法 | PASS |
-| T03 | `Probe.GenericEcho` / `GenericPair` | 泛型方法（含嵌套实例化） | PASS |
-| T04 | `Probe.EventRoundtrip` | 事件订阅/触发/退订 | PASS（hits=1） |
-| T05 | `Probe.ReflectionRoundtrip` | 反射 字段 get/set + 方法 Invoke | PASS |
-| T06 | `DependencyMarker.Describe` | 编译期引用另一个程序集 + 运行时加载 | PASS |
-| T07 | `Probe.GameTypes` | 反射访问 `StardewValley.Game1`（只读枚举成员） | 模拟器 `Game1 576 methods/532 fields` |
-| T11 | `Probe.NativeDetourProbe` | 取方法地址 + `mprotect` RWX 再还原（**不写字节**） | PASS（rwx_rc=0 restore_rc=0） |
-| T12 | `DetourProbe.Run` | 真写 16 字节 ARM64 跳转桩 | **FAIL**：写后进程原生崩溃（缺指令缓存刷新） |
+| T00 | `Probe.DynCode` | `RuntimeFeature.IsDynamicCodeSupported/Compiled` | 记录 `supported=True compiled=True` |
+| T01 | `Probe.StaticGreeting` | 普通静态方法 | RECORDED PASS (D) |
+| T02 | `ProbeSubject.InstanceGreeting` | 实例方法 | RECORDED PASS (D) |
+| T03 | `Probe.GenericEcho` / `GenericPair` | 泛型方法（含嵌套实例化） | RECORDED PASS (D) |
+| T04 | `Probe.EventRoundtrip` | 事件订阅/触发/退订 | RECORDED PASS (D)（hits=1） |
+| T05 | `Probe.ReflectionRoundtrip` | 反射 字段 get/set + 方法 Invoke | RECORDED PASS (D) |
+| T06 | `DependencyMarker.Describe` | 编译期引用另一个程序集 + 运行时加载 | RECORDED PASS (D) |
+| T07 | `Probe.GameTypes` | 反射访问 `StardewValley.Game1`（只读枚举成员） | 记录 `Game1 576 methods/532 fields`（不可复核） |
+| T11 | `Probe.NativeDetourProbe` | 取方法地址 + `mprotect` RWX 再还原（**不写字节**） | RECORDED PASS (D)（rwx_rc=0 restore_rc=0） |
+| T12 | `DetourProbe.Run` | 真写 16 字节 ARM64 跳转桩 | **RECORDED FAIL (D)**：写后进程原生崩溃（缺指令缓存刷新） |
 
 ### 2.1 已移除的用例（历史记录，不在当前源码里）
 

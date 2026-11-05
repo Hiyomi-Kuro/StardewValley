@@ -207,16 +207,19 @@ adb -s <serial> shell "su -c 'cat /data/data/com.chucklefish.stardewvalley/files
 
 ## 6. 结果记录总表（复制到报告里填）
 
+> 取值规则：Device 列只能用 **PASS / FAIL / BLOCKED / NOT RUN**，且 PASS 必须有真实 ARM64 设备的直接证据。
+> Emulator 列的历史结论若没有原始日志，写成 **RECORDED PASS (Evidence D)**，不能写 PASS。
+
 | 项目 | 源码存在 | 离线测试 | Emulator（MuMu 12, x86_64） | Device（ARM64 物理） | 最终状态 |
 | --- | --- | --- | --- | --- | --- |
-| Bootstrap 触发 | 是 | PASS | PASS（Phase 0 记录） | **BLOCKED** | PARTIAL |
-| Loader 初始化 | 是 | PASS | PASS（记录） | **BLOCKED** | PARTIAL |
-| Assembly.LoadFrom | 是 | PASS | PASS（记录） | **BLOCKED** | PARTIAL |
-| C# Mod 入口执行 | 探针入口有 / Mod 入口无 | PASS（探针路径） | PASS（探针） | **BLOCKED** | NOT IMPLEMENTED |
-| Game1 反射只读访问 | 是 | Unknown | PASS（576/532） | **BLOCKED** | PARTIAL |
+| Bootstrap 触发 | 是 | PASS | RECORDED PASS (D) | **BLOCKED** | PARTIAL |
+| Loader 初始化 | 是 | PASS | RECORDED PASS (D) | **BLOCKED** | PARTIAL |
+| Assembly.LoadFrom | 是 | PASS | RECORDED PASS (D) | **BLOCKED** | PARTIAL |
+| C# Mod 入口执行 | 探针入口有 / Mod 入口无 | PASS（探针路径） | RECORDED PASS (D)（探针） | **BLOCKED** | NOT IMPLEMENTED |
+| Game1 反射只读访问 | 是 | Unknown | RECORDED PASS (D)（576/532） | **BLOCKED** | PARTIAL |
 | ModInjector | 是 | PASS | N/A | N/A | DONE（离线） |
 | AssemblyStore 重建/校验 | 是 | PASS | N/A | N/A | DONE（离线） |
-| Harmony / native detour | 是 | N/A | FAIL（T12） | **BLOCKED** | FAIL（当前工具链） |
+| Harmony / native detour | 是 | N/A | RECORDED FAIL (D)（T12） | **BLOCKED** | FAIL（当前工具链） |
 
 签名：
 
@@ -230,9 +233,10 @@ adb -s <serial> shell "su -c 'cat /data/data/com.chucklefish.stardewvalley/files
 
 | 项 | Emulator | Device | 备注 |
 | --- | --- | --- | --- |
-| E0 只读预检 | **PASS**（`.tmp/phase0.5/logs/e0/device-precheck-127.0.0.1_16384.txt`） | **NOT RUN** | 无物理设备 |
-| E1 加载并执行 C# DLL | **PASS**（Phase 0 记录，D 级证据） | **BLOCKED**：`no ARM64 physical device` | 未重跑（未获装机授权） |
-| E2 反射访问 `Game1` | **PASS**（同上） | **BLOCKED**：同上 | 576/532 不可外推到真机 |
+| E0 只读预检 | **PASS（C 级）**（`.tmp/phase0.5/logs/e0/device-precheck-127.0.0.1_16384.txt`；Phase 0.5.1 复跑见 `.tmp/phase0.5.1/logs/e0/`） | **NOT RUN** | 无物理设备 |
+| E1 加载并执行 C# DLL | **RECORDED PASS (Evidence D; original logs unavailable; not independently reproducible)** | **BLOCKED**：`no ARM64 physical device` | 未重跑（未获装机授权） |
+| E2 反射访问 `Game1` | **RECORDED PASS (Evidence D; same caveat)** | **BLOCKED**：同上 | 576/532 属 Historical Record，不可外推到真机 |
 
 > 依据：当前唯一可用设备 `127.0.0.1:16384` 的 `ro.product.cpu.abi = x86_64`、
 > `ro.dalvik.vm.native.bridge = libnb.so`（ARM 翻译层），`device-class = NOT-ARM64-PHYSICAL`。
+> 这些属性于 Phase 0.5.1 由 `Tools/device-precheck.ps1` 重新只读采集（C 级）。

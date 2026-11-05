@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "id": "ExampleMod.Minimal",
+  "name": "Minimal Mod",
+  "version": "1.0.0",
+  "entryAssembly": "C:\\Mods\\Evil.dll",
+  "entryType": "ExampleMod.Minimal.Entry"
+}

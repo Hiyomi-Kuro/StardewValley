@@ -204,32 +204,32 @@ S1 优先：它修正的正是被校验的那个字段，且若不生效可以�
 
 | 实验 | 状态 | 证据 |
 | --- | --- | --- |
-| E1 加载外部 DLL 并执行 IL | **通过（模拟器）** | `ModFramework.Runtime.dll` 经 `Assembly.LoadFrom` 加载，`Loader.Start()` 执行并落盘 `loader.log`；探针 T01–T06 全 PASS |
-| E2 反射访问游戏类型 | **通过（模拟器）** | 探针 T07：`Game1` 576 方法 / 532 字段 |
-| E5 Harmony | **不可行（当前工具链）** | ① `Reflection.Emit` 与 `System.Reflection.Emit` 均缺失 → Harmony/MonoMod 托管 detour 无法实现；② 原生 detour 的内存前提成立（`MethodHandle.Value` 取址、`mprotect` RWX 均成功），但 AArch64 需要用户态刷指令缓存，而三个运行时/系统库**都没有导出相关符号**，本机也**没有 NDK** 可自建；直接写跳转以原生崩溃告终 |
+| E1 加载外部 DLL 并执行 IL | **RECORDED PASS (Evidence D)**（模拟器） | 记录为：`ModFramework.Runtime.dll` 经 `Assembly.LoadFrom` 加载，`Loader.Start()` 执行并落盘 `loader.log`；探针 T01–T06 记录为 PASS。原始日志已丢失，本阶段未重跑 |
+| E2 反射访问游戏类型 | **RECORDED PASS (Evidence D)**（模拟器） | 探针 T07 记录：`Game1` 576 方法 / 532 字段（Historical Record，未独立复核） |
+| E5 Harmony | **不可行（当前工具链）** | ① `Reflection.Emit` 与 `System.Reflection.Emit` 均缺失 → Harmony/MonoMod 托管 detour 无法实现（编译期 A 级）；② 原生 detour 的内存前提记录为成立（`MethodHandle.Value` 取址、`mprotect` RWX 均成功，D 级），但 AArch64 需要用户态刷指令缓存，而三个运行时/系统库**都没有导出相关符号**，本机也**没有 NDK** 可自建；直接写跳转以原生崩溃告终（D 级记录） |
 
 补充约束（实测）：
 
-- 加载 API 只有 `Assembly.LoadFrom(string)` 可用；`Assembly.Load(byte[])` 被 ILLink 裁剪；
-- 模组 DLL 必须针对 `net8.0-android` 参考程序集编译，否则 facade 类型解析失败（`Architecture`/`AppContext`/`RuntimeFeature` 均缺）；
-- BCL 面被选择性裁剪（`Directory.GetFiles` 没了、`File.WriteAllText` 还在），SDK 需要 API 白名单；
-- 一个方法里只要有一个被裁剪的引用，**整个方法的 JIT 就会失败**，方法内 try/catch 拦不住。
+- 加载 API 只有 `Assembly.LoadFrom(string)` 可用；`Assembly.Load(byte[])` 被 ILLink 裁剪（**编译期 A 级**：CS1503）；
+- 模组 DLL 必须针对游戏自带的程序集编译，否则 facade 类型解析失败（`Architecture`/`AppContext`/`RuntimeFeature` 均缺，**编译期 A 级**：CS0117/CS0234）；
+- BCL 面被选择性裁剪（`Directory.GetFiles` 没了、`File.WriteAllText` 还在，**编译期 A 级**），SDK 需要 API 白名单；
+- 一个方法里只要有一个被裁剪的引用，**整个方法的 JIT 就会失败**，方法内 try/catch 拦不住（D 级推断）。
 
-→ E1/E2 尚未在 **ARM64 真机**复现，Phase 1 仍不启动。
+→ E1/E2 尚未在 **ARM64 真机**复现，Phase 0 结束时 Phase 1 未启动。
 
 ### 6.2 Phase 0.5 复核结论（2026-11-05）
 
 | 门槛 | 状态 | 说明 |
 | --- | --- | --- |
-| E1 动态加载 + IL 执行 | 模拟器 PASS / 真机 **BLOCKED** | 目前只有 MuMu 12（x86_64 + `libnb.so` 翻译）；无物理 ARM64 设备（见 `phase0.5-report.md` §7） |
-| E2 反射访问 `Game1` | 模拟器 PASS / 真机 **BLOCKED** | 同上；统计数字（576 方法 / 532 字段）是模拟器反射结果，不可外推 |
-| E3 事件钩子 | 间接 PASS（模拟器） | 仅有"注入点执行 + 事件用例"的证据，未做 tick/day 驱动 |
+| E1 动态加载 + IL 执行 | **RECORDED PASS (D)**（模拟器）/ 真机 **BLOCKED** | 目前只有 MuMu 12（x86_64 + `libnb.so` 翻译）；无物理 ARM64 设备（见 `phase0.5-report.md` §7） |
+| E2 反射访问 `Game1` | **RECORDED PASS (D)**（模拟器）/ 真机 **BLOCKED** | 同上；统计数字（576 方法 / 532 字段）是模拟器反射结果，不可外推 |
+| E3 事件钩子 | **RECORDED PASS (D)**（模拟器，间接） | 仅有"注入点执行 + 事件用例"的证据，未做 tick/day 驱动 |
 | E4 去 AOT 回退 | NOT RUN | 已被 E5 结论取代（JIT 本就在，缺的是 `Reflection.Emit`） |
 | E5 Harmony | FAIL（当前工具链） | 见 §6.1；缺 `Reflection.Emit` + 缺 AArch64 指令缓存刷新手段 |
 | E6 独立管理器存储通道 | NOT RUN | 需第二台设备或 Android 14 |
 
-**因此 ADR 维持 Proposed**：§6 第 1、2 条要求"真机"，当前证据只到模拟器。
-不得因为模拟器通过而改 Accepted。
+**因此 ADR 维持 Proposed**：§6 第 1、2 条要求"真机"，当前证据只到模拟器，且模拟器证据本身是 D 级。
+不得因为模拟器记录而改 Accepted。
 
 ---
 

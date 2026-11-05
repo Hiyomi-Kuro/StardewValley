@@ -1,0 +1,205 @@
+{
+  "schemaVersion": 1,
+  "id": "ExampleMod.Minimal",
+  "name": "Minimal Mod",
+  "version": "1.0.0",
+  "entryAssembly": "ExampleMod.Minimal.dll",
+  "entryType": "ExampleMod.Minimal.Entry",
+  "dependencies": [
+    {
+      "id": "Dep.000"
+    },
+    {
+      "id": "Dep.001"
+    },
+    {
+      "id": "Dep.002"
+    },
+    {
+      "id": "Dep.003"
+    },
+    {
+      "id": "Dep.004"
+    },
+    {
+      "id": "Dep.005"
+    },
+    {
+      "id": "Dep.006"
+    },
+    {
+      "id": "Dep.007"
+    },
+    {
+      "id": "Dep.008"
+    },
+    {
+      "id": "Dep.009"
+    },
+    {
+      "id": "Dep.010"
+    },
+    {
+      "id": "Dep.011"
+    },
+    {
+      "id": "Dep.012"
+    },
+    {
+      "id": "Dep.013"
+    },
+    {
+      "id": "Dep.014"
+    },
+    {
+      "id": "Dep.015"
+    },
+    {
+      "id": "Dep.016"
+    },
+    {
+      "id": "Dep.017"
+    },
+    {
+      "id": "Dep.018"
+    },
+    {
+      "id": "Dep.019"
+    },
+    {
+      "id": "Dep.020"
+    },
+    {
+      "id": "Dep.021"
+    },
+    {
+      "id": "Dep.022"
+    },
+    {
+      "id": "Dep.023"
+    },
+    {
+      "id": "Dep.024"
+    },
+    {
+      "id": "Dep.025"
+    },
+    {
+      "id": "Dep.026"
+    },
+    {
+      "id": "Dep.027"
+    },
+    {
+      "id": "Dep.028"
+    },
+    {
+      "id": "Dep.029"
+    },
+    {
+      "id": "Dep.030"
+    },
+    {
+      "id": "Dep.031"
+    },
+    {
+      "id": "Dep.032"
+    },
+    {
+      "id": "Dep.033"
+    },
+    {
+      "id": "Dep.034"
+    },
+    {
+      "id": "Dep.035"
+    },
+    {
+      "id": "Dep.036"
+    },
+    {
+      "id": "Dep.037"
+    },
+    {
+      "id": "Dep.038"
+    },
+    {
+      "id": "Dep.039"
+    },
+    {
+      "id": "Dep.040"
+    },
+    {
+      "id": "Dep.041"
+    },
+    {
+      "id": "Dep.042"
+    },
+    {
+      "id": "Dep.043"
+    },
+    {
+      "id": "Dep.044"
+    },
+    {
+      "id": "Dep.045"
+    },
+    {
+      "id": "Dep.046"
+    },
+    {
+      "id": "Dep.047"
+    },
+    {
+      "id": "Dep.048"
+    },
+    {
+      "id": "Dep.049"
+    },
+    {
+      "id": "Dep.050"
+    },
+    {
+      "id": "Dep.051"
+    },
+    {
+      "id": "Dep.052"
+    },
+    {
+      "id": "Dep.053"
+    },
+    {
+      "id": "Dep.054"
+    },
+    {
+      "id": "Dep.055"
+    },
+    {
+      "id": "Dep.056"
+    },
+    {
+      "id": "Dep.057"
+    },
+    {
+      "id": "Dep.058"
+    },
+    {
+      "id": "Dep.059"
+    },
+    {
+      "id": "Dep.060"
+    },
+    {
+      "id": "Dep.061"
+    },
+    {
+      "id": "Dep.062"
+    },
+    {
+      "id": "Dep.063"
+    },
+    {
+      "id": "Dep.064"
+    }
+  ]
+}

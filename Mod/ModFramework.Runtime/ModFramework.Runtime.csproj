@@ -1,13 +1,20 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    ModFramework.Runtime 的最小版本（Phase 0 用）。
-    它不是最终的 Loader —— 只做两件事：
-      1) 在 Mods/ 目录写一份 loader.log，证明 Bootstrap 真的把它加载起来并执行了；
-      2) 如果 Mods/ 里有 MonoRuntimeProbe.dll，就调用它的 Probe.Run()，产出运行时报告。
+    ModFramework.Runtime - the mod host that Bootstrap loads from the Mods directory.
 
-    真正的 Mod 加载（manifest 解析、依赖拓扑、事件总线）属于 Phase 1，
-    在 E1/E2 通过前不实现。
+    It contains three things and nothing else:
+      1) the public mod contract (IModEntry / IModContext / IModLogger),
+      2) the manifest + dependency + discovery engine,
+      3) the loader that turns mod packages into initialized mods.
+
+    IMPORTANT (runtime constraint, see docs/architecture/phase1-runtime-constraints.md):
+    this assembly is compiled against the game's own ILLink-trimmed assemblies
+    (dotnet build -p:AndroidRefsDir=<dir>) because the shipped BCL is a subset.
+    Do not use System.Linq, System.Text.Json, FileInfo/DirectoryInfo, Directory.GetFiles,
+    Environment.CurrentDirectory or Version.TryParse here: they do not exist at runtime.
+
+    The assembly version is the framework API version that manifests compare against.
   -->
 
   <PropertyGroup>
@@ -17,8 +24,16 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>ModFramework.Runtime</AssemblyName>
     <RootNamespace>ModFramework.Runtime</RootNamespace>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
     <Deterministic>true</Deterministic>
     <DebugType>portable</DebugType>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The test host exercises the internal engine directly (manifest/version/graph). -->
+    <InternalsVisibleTo Include="ModFramework.Tests" />
+  </ItemGroup>
 
 </Project>

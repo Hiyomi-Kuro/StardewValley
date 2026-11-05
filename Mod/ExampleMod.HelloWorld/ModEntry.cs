@@ -1,19 +1,43 @@
-using StardewValley;
+using ModFramework.Runtime;
 
 namespace ExampleMod.HelloWorld;
 
 /// <summary>
-/// 编译期验证：直接 `using StardewValley;` 并访问 <c>Game1</c> 的静态成员。
-/// 只要能编译通过，就说明模组作者可以像写桌面 SMAPI 模组那样对着游戏类型编程。
+/// The entry point the loader finds through <c>manifest.json</c>
+/// (<c>"entryType": "ExampleMod.HelloWorld.HelloWorldEntry"</c>).
+///
+/// It touches only <see cref="IModContext"/>, so it can be initialized by the desktop host
+/// test as well as on the device. Everything that needs the game lives in
+/// <see cref="GameBindings"/> and is never called from here.
 /// </summary>
-public static class ModEntry
+public sealed class HelloWorldEntry : IModEntry
 {
-    public static string Greet()
+    /// <summary>
+    /// Called once by the loader, after the manifest validated, dependencies resolved and the
+    /// assembly loaded.
+    /// </summary>
+    /// <param name="context">Identity, versions, mod directory and the mod's own logger.</param>
+    public void Initialize(IModContext context)
     {
-        // Game1.IsMultiplayer 是静态属性（探针 T07 已确认存在）。
-        return "hello from a mod; multiplayer=" + Game1.IsMultiplayer;
+        context.Log.Info("Hello World from \"" + context.ModName + "\" " + context.ModVersion);
+        context.Log.Info("game=" + context.GameVersion + " framework=" + context.FrameworkVersion);
+        context.Log.Info("mod directory=" + context.ModDirectory);
     }
+}
 
-    /// <summary>访问游戏类型的一个字段，验证字段绑定也能成立。</summary>
-    public static int TicksSnapshot() => Game1.ticks;
+/// <summary>
+/// Compile-time proof that a mod can reference game types directly
+/// (<c>using StardewValley;</c> + <c>Game1</c>), exactly like a desktop mod would.
+///
+/// This class is intentionally not called by <see cref="HelloWorldEntry"/>: the loader must be
+/// able to run the mod on a host that has no game assembly loaded, and calling a <c>Game1</c>
+/// member there would fail at JIT time.
+/// </summary>
+public static class GameBindings
+{
+    /// <summary>Reads a static property of <c>Game1</c>.</summary>
+    public static string Describe() => "multiplayer=" + StardewValley.Game1.IsMultiplayer;
+
+    /// <summary>Reads a static field of <c>Game1</c>.</summary>
+    public static int TicksSnapshot() => StardewValley.Game1.ticks;
 }

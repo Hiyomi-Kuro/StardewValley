@@ -7,9 +7,17 @@
 | `ModInjector` | C# / net8.0 / Mono.Cecil | 把 Bootstrap 合并进 `StardewValley.dll`，并在指定的 `MainActivity` 方法首行插入调用 |
 | `AssemblyStore` | Python 3（无第三方依赖） | 读写 `assemblies.blob`（XABA v1 + XALZ/LZ4），把改好的程序集**原位替换**回去 |
 | `deploy-apk.ps1` | PowerShell（ASCII） | 一条命令完成"换 blob → 构建 → 还原 → 卸载重装 → **用设备端 sha256 证明装的是这个包**" |
-| `device-precheck.ps1` | PowerShell（ASCII） | E0 只读设备预检（ABI/API/包信息/APK 哈希/残留文件），默认不改设备 |
-| `tests/test_mod_pipeline.py` | Python 3 | 注入器 + 容器的离线回归（27 项，含负向用例） |
+| `device-precheck.ps1` | PowerShell（ASCII） | E0 只读设备预检（ABI/API/包信息/APK 哈希/残留文件），默认不改设备；`-ResolveAdbOnly` 只做 adb 定位自检 |
+| `tests/test_mod_pipeline.py` | Python 3 | 注入器 + 容器的离线回归（27 项，含负向用例；**需要游戏程序集**） |
 | `tests/LoaderContract/` | C# 桌面宿主 | 验证 `Loader.Start()` 返回契约（成功返回 null + 落盘报告） |
+| `tests/ModFramework.Tests/` | C# 控制台 | Loader 的单元 + 宿主测试（125 项），不需要设备 |
+| `tests/FixtureMods/` | C# | 测试用 mod 包（一个 dll 内含 8 种入口形态 + 一个私有依赖 dll） |
+| `tests/fixtures/manifests/` | JSON | 25 个 manifest 夹具 + `index.json` 期望表 |
+| `tests/test_loader.py` | Python 3 | 构建并运行 Loader 测试；`--refs` 时额外编示例 mod |
+| `tests/test_ci_offline.py` | Python 3 | CI 可跑的 13 项检查（语法/编码/夹具/schema/隐私/CI 结构） |
+| `tests/test_device_precheck.ps1` | PowerShell | adb 解析自测（10 项，不连设备） |
+| `tests/run-all.ps1` | PowerShell | 一键跑全部本地套件并输出汇总表 |
+| `privacy-scan.py` | Python 3 | 隐私/秘密扫描（用户目录、token、私钥、设备序列号） |
 
 `deploy-apk.ps1` 的存在是为了杜绝一类自欺：**无法确认设备上跑的是哪个 APK**。
 它会把已安装 APK 的哈希与本地产物比对，不一致直接失败。
@@ -116,15 +124,35 @@ hash→(store,index) 映射表)` + 负载。新增条目必须同步改 gap 表�
 
 ## 离线回归
 
+一键跑全部（需要 `.tmp/phase0.5/refs` 的 65 个程序集；没有则相关套件标 SKIPPED）：
+
 ```powershell
-python Tools/tests/test_mod_pipeline.py                       # 27 项
-python Tools/tests/test_mod_pipeline.py --dotnet <dotnet.exe> # 指定 SDK
+powershell -NoProfile -ExecutionPolicy Bypass -File Tools\tests\run-all.ps1 -Refs .tmp\phase0.5\refs
 ```
 
-覆盖：默认加载 API 必须是 `loadfrom`（负向对照 `--loader-api load` 可复现 `load(byte[])`）、
-注入后结构校验、MVID 变更、幂等重跑、容器原位替换的全部不变量、
+| 套件 | 命令 | 项数 | 需要游戏程序集 |
+| --- | --- | --- | --- |
+| CI 离线检查 | `python Tools/tests/test_ci_offline.py` | 13 | ❌ |
+| 隐私扫描 | `python Tools/privacy-scan.py` | — | ❌ |
+| adb 解析自测 | `powershell -File Tools/tests/test_device_precheck.ps1` | 10 | ❌ |
+| Loader 单元 + 宿主 | `python Tools/tests/test_loader.py [--refs <dir>]` | 9 驱动 + 125 内部 | 示例 mod 部分需要 |
+| 注入 / 容器 / Loader 契约 | `python Tools/tests/test_mod_pipeline.py` | 27 | ✅ |
+| E0 只读预检 | `powershell -File Tools/device-precheck.ps1` | — | ❌（需要设备） |
+
+`test_mod_pipeline.py` 覆盖：默认加载 API 必须是 `loadfrom`（负向对照 `--loader-api load` 可复现
+`load(byte[])`）、注入后结构校验、MVID 变更、幂等重跑、容器原位替换的全部不变量、
 `verify` 的负向用例、`Loader.Start()` 成功返回 null 且落盘报告、
 以及"Runtime 仍能用 Android 参考程序集编译"。
+
+`test_loader.py` 覆盖：SemVer / 版本范围 / JSON / 25 个 manifest 夹具 / 发现 / 依赖图（含环与确定性）/
+状态机 / 错误码 / 11 种 mod 包形态的端到端 / 重复运行 / 重入 / 私有依赖解析 / 示例 mod 全链路。
+
+### 编码事故的防线
+
+`Tools/`、`Mod/` 里的源文件**不要**用 `Get-Content` / `Set-Content` 往返（会把中文注释变成乱码，
+甚至把下一行代码并进注释）。需要改就用编辑工具或 Python 显式 UTF-8。
+CI 现在会拦住新的乱码：`test_ci_offline.py` 检查私用区字符与 24 个已知 mojibake 记号，
+并检查所有会被发布的文本文件都是合法 UTF-8。
 
 ## 完整链路（E1 需要，尚未在真机执行）
 

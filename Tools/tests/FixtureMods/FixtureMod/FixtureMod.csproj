@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Test-only mod package used by Tools/tests/ModFramework.Tests.
+       One DLL carries every entry-point shape the loader must accept or reject, so the
+       tests can point a manifest at a specific type instead of building many projects. -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>FixtureMod</AssemblyName>
+    <RootNamespace>FixtureMod</RootNamespace>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\..\Mod\ModFramework.Runtime\ModFramework.Runtime.csproj" />
+    <ProjectReference Include="..\FixtureMod.Dependency\FixtureMod.Dependency.csproj" />
+  </ItemGroup>
+
+</Project>
