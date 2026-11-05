@@ -18,6 +18,19 @@
 > 明确不宣称：没有 Harmony/方法补丁，不宣称 SMAPI 兼容，没有 Events/Content/Data/Save API，
 > 没有在真实设备上跑过任何 mod。
 
+> **Phase 1.1 后续（2026-11-05）**：本文件保留 Phase 1 当时的事实与数字，不回改。
+> Phase 1.1 处理了其中三项已知限制，当前状态见
+> [`phase1.1-report.md`](phase1.1-report.md)：
+>
+> | Phase 1 当时的限制 | Phase 1.1 后的状态 |
+> | --- | --- |
+> | 裸 `MonoRuntimeProbe.dll` 会被 Loader 自动 `LoadFrom` 并反射调用 | 该路径已删除；报告固定 `probe=not-run-by-loader`（P11-01） |
+> | 显式 `gameVersion` 在版本未知时只警告、仍放行 | 改为 Fail-Closed：`MF0503`/`MF0504`/`MF0505`（P11-02/P11-03） |
+> | 同名私有程序集"先加载者胜"，未见冲突预检 | 第一次 `Assembly.LoadFrom` 之前完成全局身份预检（P11-04/P11-05） |
+>
+> **没有改变**的部分：设备 E1/E2 仍是 BLOCKED（无 ARM64 物理设备），本文件 §8.2 与 §9.2/§9.3
+> 的结论继续有效。
+
 ---
 
 ## 1. 唯一验收目标与达成情况
@@ -308,7 +321,7 @@ id=FixtureMod.Good state=Failed code=MF0309
 | 1 | 设备端 E1/E2 | **BLOCKED** | 唯一硬阻塞 |
 | 2 | `Directory.GetDirectories` 在 Mono/Android 上的**行为** | 未验证 | 只有编译期证据；设备上第一次跑就知道 |
 | 3 | `AppDomain.CurrentDomain.GetAssemblies()` 在 Mono 上是否含 `StardewValley` | 未验证 | 影响 `game-version=`；找不到就不做版本判定（不误拒） |
-| 4 | 同名不同版本私有依赖 | 已知限制 | 先加载者胜；不同 mod 携带同名库会互相影响。文档已写明，未做冲突拒绝 |
+| 4 | 同名不同版本私有依赖 | 已知限制 | 先加载者胜；不同 mod 携带同名库会互相影响。文档已写明，未做冲突拒绝。（**Phase 1.1 已修复**：改为加载前全局预检 `MF0206`/`MF0207`，见 `phase1.1-report.md` §4） |
 | 5 | `Initialize` 在 UI 线程同步执行的耗时上限 | 未验证 | 当前示例只写日志；将来需要异步/分帧时要先验证 |
 | 6 | 日志文件增长 | 已知 | mod 日志追加、框架日志覆盖；没有轮转 |
 | 7 | `gameVersion` 语义 | 已定 | 取 `major.minor.build`，丢弃 revision；写进 `manifest-spec.md` |

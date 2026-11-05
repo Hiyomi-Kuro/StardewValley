@@ -63,7 +63,14 @@ jobs:
         run: |
           dotnet build Mod/ModFramework.Runtime/ModFramework.Runtime.csproj -c Release --artifacts-path "$RUNNER_TEMP/artifacts" -v q
           dotnet build Tools/tests/FixtureMods/FixtureMod/FixtureMod.csproj -c Release --artifacts-path "$RUNNER_TEMP/artifacts" -v q
+          dotnet build Tools/tests/FixtureMods/FakeMonoRuntimeProbe/FakeMonoRuntimeProbe.csproj -c Release --artifacts-path "$RUNNER_TEMP/artifacts" -v q
+          dotnet build Tools/tests/FixtureMods/ConflictLib/ConflictLib.csproj -c Release --artifacts-path "$RUNNER_TEMP/artifacts" -v q
+          dotnet build Tools/tests/FixtureMods/PlainLib/PlainLib.csproj -c Release --artifacts-path "$RUNNER_TEMP/artifacts" -v q
 
+      # test_loader.py also builds the parameterised identity variants (same simple name at two
+      # versions, same identity with different content, ...) and runs the whole Phase 1.1
+      # regression set: LegacyProbe removal, fail-closed version gates, assembly preflight,
+      # dependency propagation and the logger degradation report.
       - name: loader host tests (no game assemblies)
         run: python Tools/tests/test_loader.py --dotnet dotnet --artifacts "$RUNNER_TEMP/artifacts"
 

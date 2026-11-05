@@ -10,29 +10,65 @@ namespace ModFramework.Runtime;
 ///   * <c>null</c> - the scan completed; individual mods may still have failed, and that is
 ///     recorded in the report and in the per-mod logs;
 ///   * a diagnostic string - the loader itself could not run (missing root, unexpected
-///     exception). Bootstrap turns it into an exception which its catch handler swallows, so
-///     the game still starts.
+///     exception, or no report file could be written at all). Bootstrap turns it into an
+///     exception which its catch handler swallows, so the game still starts.
 ///
 /// The full report is always written to <c>&lt;mods root&gt;/loader-report.txt</c>, because in a
 /// default build the exception is swallowed and the file is the only surviving evidence.
+///
+/// Phase 1.1 guarantees, in this order:
+///   1. discovery and manifest validation never load a mod assembly;
+///   2. dependency resolution and the version gates run next;
+///   3. the global assembly identity preflight reads every declared assembly's metadata
+///      <b>without loading it</b> and rejects conflicting mods;
+///   4. only then is the first <c>Assembly.LoadFrom</c> issued (see the
+///      <c>assembly-load=</c> lines, which always follow the <c>preflight-stage=complete</c>
+///      line in the report).
 /// </summary>
 public static class Loader
 {
     private const string ReportFileName = "loader-report.txt";
     private const string LogFileName = "loader.log";
     private const string LogsDirectoryName = "logs";
-    private const string LegacyProbeAssembly = "MonoRuntimeProbe.dll";
     private const string GameAssemblyName = "StardewValley";
+
+    /// <summary>
+    /// Value of the <c>probe=</c> report line.
+    ///
+    /// Phase 1.1 removed the implicit <c>MonoRuntimeProbe.dll</c> execution: a bare DLL in the
+    /// mods root is never loaded, discovered, or invoked by the normal loader. The line is kept
+    /// (with this explicit value) so existing report readers see a definite status instead of a
+    /// silently missing field. Running the probe is now an explicit, separate diagnostic step -
+    /// see <c>Mod/MonoRuntimeProbe/README.md</c>.
+    /// </summary>
+    private const string ProbeStatus = "not-run-by-loader";
 
     private static bool s_running;
     private static string? s_completedRoot;
 
     /// <summary>
-    /// Test seam: when set, overrides the detected game version and marks it as authoritative.
-    /// Never set in production code; it exists so the host tests can exercise the
-    /// game-version compatibility gate on a desktop where no game assembly is loaded.
+    /// Test seams. Never set in production code; both exist so the host tests can exercise the
+    /// version gates on a desktop where neither a game assembly nor a second framework build is
+    /// available. Every test restores the previous value in a <c>finally</c> block.
     /// </summary>
     internal static string? GameVersionOverride;
+
+    /// <inheritdoc cref="GameVersionOverride"/>
+    internal static string? FrameworkVersionOverride;
+
+    /// <summary>
+    /// Canonical path -&gt; loaded assembly, for the whole process. Guarantees that one file is
+    /// handed to <c>Assembly.LoadFrom</c> exactly once even when several mods share it, and
+    /// prevents <c>FileLoadException</c> when the loader is invoked again for a second root.
+    /// Never cleared: the AppDomain keeps the assembly for the life of the process anyway.
+    /// </summary>
+    private static readonly Dictionary<string, Assembly> s_loadedByPath = new(StringComparer.Ordinal);
+
+    internal static void ResetOverridesForTests()
+    {
+        GameVersionOverride = null;
+        FrameworkVersionOverride = null;
+    }
 
     /// <summary>
     /// Runs the loader against the directory that contains <c>ModFramework.Runtime.dll</c>.
@@ -62,7 +98,7 @@ public static class Loader
         }
 
         var root = string.IsNullOrEmpty(modsRoot) ? DefaultModsRoot() : modsRoot;
-        if (s_completedRoot != null && string.Equals(s_completedRoot, Normalize(root), StringComparison.OrdinalIgnoreCase))
+        if (s_completedRoot != null && string.Equals(s_completedRoot, PathRules.Normalize(root), StringComparison.OrdinalIgnoreCase))
         {
             WriteAlreadyInitialized(root);
             return null;
@@ -76,9 +112,14 @@ public static class Loader
         catch (Exception ex)
         {
             var text = BuildFatalReport(root, ex);
-            TryWrite(Path.Combine(root, ReportFileName), text);
-            TryWrite(Path.Combine(root, LogFileName), text);
-            return "loader-report: loader-crashed: " + ex.GetType().Name + ": " + ex.Message;
+            var reportWritten = TryWrite(Path.Combine(root, ReportFileName), text);
+            var logWritten = TryWrite(Path.Combine(root, LogFileName), text);
+            var diagnostic = "loader-report: loader-crashed: " + ex.GetType().Name + ": " + ex.Message;
+            if (!reportWritten && !logWritten)
+            {
+                diagnostic += " (and neither loader-report.txt nor loader.log could be written)";
+            }
+            return diagnostic;
         }
         finally
         {
@@ -100,9 +141,10 @@ public static class Loader
 
     private static string? RunCore(string modsRoot)
     {
-        bool gameVersionKnown;
-        var gameVersion = DetectGameVersion(out gameVersionKnown);
-        var report = new LoadReport(modsRoot, DefaultModsRoot(), gameVersion, gameVersionKnown);
+        GameVersionState versionState;
+        string versionSource;
+        var gameVersion = DetectGameVersion(out versionState, out versionSource);
+        var report = new LoadReport(modsRoot, DefaultModsRoot(), gameVersion, versionState, versionSource);
         report.AddLine("framework-version=" + FrameworkVersion());
 
         var discovery = ModDiscovery.Discover(modsRoot);
@@ -122,12 +164,14 @@ public static class Loader
         }
 
         var validated = new List<ModManifest>();
+        var byId = new Dictionary<string, ModRecord>(StringComparer.OrdinalIgnoreCase);
         for (var i = 0; i < discovery.Records.Count; i++)
         {
             var record = discovery.Records[i];
             if (record.Manifest != null && !record.IsTerminalFailure)
             {
                 validated.Add(record.Manifest);
+                byId[record.Id] = record;
             }
         }
 
@@ -144,15 +188,39 @@ public static class Loader
             report.AddWarning("could not create the log directory: " + logDirectory);
         }
 
-        var byId = new Dictionary<string, ModRecord>(StringComparer.OrdinalIgnoreCase);
-        for (var i = 0; i < discovery.Records.Count; i++)
+        // ---- gate 1: version compatibility, still without touching any mod assembly --------
+        var compatibilityFailures = new Dictionary<string, GateProblem>(StringComparer.OrdinalIgnoreCase);
+        var preflightInput = new List<ModManifest>();
+        for (var i = 0; i < plan.Order.Count; i++)
         {
-            var record = discovery.Records[i];
-            if (record.Manifest != null && !record.IsTerminalFailure)
+            var manifest = plan.Order[i];
+            if (!byId.ContainsKey(manifest.Id))
             {
-                byId[record.Id] = record;
+                continue;
             }
+            DependencyProblem? dependencyProblem;
+            if (plan.Problems.TryGetValue(manifest.Id, out dependencyProblem) && dependencyProblem != null)
+            {
+                // Reported by the dependency pass below; do not let it participate in the
+                // assembly conflict map either.
+                continue;
+            }
+            var compatibility = CheckCompatibility(manifest, report);
+            if (compatibility != null)
+            {
+                compatibilityFailures[manifest.Id] = compatibility;
+                continue;
+            }
+            preflightInput.Add(manifest);
         }
+
+        // ---- gate 2: global assembly identity preflight (metadata only, no LoadFrom) ------
+        var preflight = AssemblyPreflight.Analyze(preflightInput);
+        for (var i = 0; i < preflight.Lines.Count; i++)
+        {
+            report.AddLine(preflight.Lines[i]);
+        }
+        report.AddLine("preflight-stage=complete");
 
         var initialized = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
 
@@ -183,10 +251,17 @@ public static class Loader
                 }
             }
 
-            var compatibility = CheckCompatibility(manifest, report);
-            if (compatibility != null)
+            GateProblem? gateFailure;
+            if (compatibilityFailures.TryGetValue(manifest.Id, out gateFailure) && gateFailure != null)
             {
-                record.Fail(compatibility.Value.Code, compatibility.Value.Message);
+                record.Fail(gateFailure.Code, gateFailure.Message);
+                initialized[manifest.Id] = false;
+                continue;
+            }
+
+            if (preflight.Rejections.TryGetValue(manifest.Id, out gateFailure) && gateFailure != null)
+            {
+                record.Fail(gateFailure.Code, gateFailure.Message);
                 initialized[manifest.Id] = false;
                 continue;
             }
@@ -200,37 +275,50 @@ public static class Loader
                 continue;
             }
 
-            LoadAndInitialize(record, manifest, report, logDirectory, logsReady, initialized);
+            LoadAndInitialize(record, manifest, report, logDirectory, logsReady, initialized, preflight);
         }
 
         report.Result = "ok";
         report.AddLine("result=ok");
-        report.AddLine("probe=" + RunLegacyProbe(modsRoot));
-        WriteReport(report);
-        s_completedRoot = Normalize(modsRoot);
+        report.AddLine("probe=" + ProbeStatus);
+        // Marked before the write: the mods have already initialized, so a second call must not
+        // run them again even when the report could not be persisted.
+        s_completedRoot = PathRules.Normalize(modsRoot);
+        if (!WriteReport(report))
+        {
+            // Nothing was persisted: do not pretend the scan produced evidence.
+            return ErrorCodes.ReportWriteFailed + ": " + ErrorCodes.Describe(ErrorCodes.ReportWriteFailed);
+        }
         return null;
     }
 
     /// <summary>
-    /// Game/framework version gate. The game version check is only enforced when the running
-    /// game assembly was actually found; guessing would reject every mod on a host that has
-    /// no game loaded (the desktop test host).
+    /// Game/framework version gate - <b>fail closed</b>.
+    ///
+    /// Only an explicit <c>"*"</c> means "no constraint". A mod that names a range must be
+    /// provably satisfied: a known and parseable version that fits passes, everything else is
+    /// rejected with its own stable code. Phase 1 used to warn and load; that turned a missing
+    /// detection into a silent bypass of the mod's own compatibility claim.
     /// </summary>
-    private static EntryProblem? CheckCompatibility(ModManifest manifest, LoadReport report)
+    private static GateProblem? CheckCompatibility(ModManifest manifest, LoadReport report)
     {
         if (manifest.FrameworkVersion.Text != "*")
         {
+            var frameworkText = FrameworkVersion();
             SemVersion framework;
-            string error;
-            if (SemVersion.TryParse(FrameworkVersion(), out framework, out error) &&
-                !manifest.FrameworkVersion.IsSatisfiedBy(framework))
+            string frameworkError;
+            if (!SemVersion.TryParse(frameworkText, out framework, out frameworkError))
             {
-                return new EntryProblem
-                {
-                    Code = ErrorCodes.FrameworkVersionUnsupported,
-                    Message = "requires framework \"" + manifest.FrameworkVersion.Describe() +
-                              "\" but this framework is " + FrameworkVersion(),
-                };
+                return new GateProblem(ErrorCodes.FrameworkVersionInvalid,
+                    "requires framework \"" + manifest.FrameworkVersion.Describe() +
+                    "\" but the running framework version " + Describe(frameworkText) +
+                    " is not a valid semantic version, so the range cannot be enforced");
+            }
+            if (!manifest.FrameworkVersion.IsSatisfiedBy(framework))
+            {
+                return new GateProblem(ErrorCodes.FrameworkVersionUnsupported,
+                    "requires framework \"" + manifest.FrameworkVersion.Describe() +
+                    "\" but this framework is " + frameworkText);
             }
         }
 
@@ -238,30 +326,44 @@ public static class Loader
         {
             return null;
         }
-        if (!report.GameVersionKnown)
+
+        if (report.GameVersionState == GameVersionState.Unknown)
         {
-            report.AddWarning(manifest.Id + ": game version could not be determined, so \"" +
-                              manifest.GameVersion.Describe() + "\" was not enforced");
-            return null;
+            return new GateProblem(ErrorCodes.GameVersionUnknown,
+                "requires game \"" + manifest.GameVersion.Describe() +
+                "\" but the running game version could not be determined, so the range cannot be enforced " +
+                "(declare \"gameVersion\": \"*\" if the mod does not depend on the game version)");
+        }
+
+        if (report.GameVersionState == GameVersionState.Invalid)
+        {
+            return new GateProblem(ErrorCodes.GameVersionInvalid,
+                "requires game \"" + manifest.GameVersion.Describe() + "\" but the detected game version " +
+                Describe(report.GameVersion) + " is not a valid semantic version");
         }
 
         SemVersion game;
         string gameError;
         if (!SemVersion.TryParse(report.GameVersion, out game, out gameError))
         {
-            report.AddWarning(manifest.Id + ": game version \"" + report.GameVersion + "\" is not SemVer, check skipped");
-            return null;
+            // Defensive: the state machine above already classifies this, but a report object
+            // built by a future caller must not fall through to "load".
+            return new GateProblem(ErrorCodes.GameVersionInvalid,
+                "requires game \"" + manifest.GameVersion.Describe() + "\" but the detected game version " +
+                Describe(report.GameVersion) + " is not a valid semantic version");
         }
         if (!manifest.GameVersion.IsSatisfiedBy(game))
         {
-            return new EntryProblem
-            {
-                Code = ErrorCodes.GameVersionUnsupported,
-                Message = "requires game \"" + manifest.GameVersion.Describe() +
-                          "\" but this game is " + report.GameVersion,
-            };
+            return new GateProblem(ErrorCodes.GameVersionUnsupported,
+                "requires game \"" + manifest.GameVersion.Describe() +
+                "\" but this game is " + report.GameVersion);
         }
         return null;
+    }
+
+    private static string Describe(string version)
+    {
+        return version.Length == 0 ? "\"\"" : "\"" + version + "\"";
     }
 
     private static string? FirstFailedDependency(ModManifest manifest, Dictionary<string, bool> initialized)
@@ -288,131 +390,64 @@ public static class Loader
         return null;
     }
 
-
-    /// <summary>
-    /// Loads the manifest's declared private assemblies before the entry assembly.
-    ///
-    /// Why this is explicit instead of automatic: <c>Assembly.LoadFrom</c> resolves a
-    /// dependency through the host's normal probing, not through the directory of the file
-    /// that was loaded (the host test proves this on .NET Core), and
-    /// <c>Directory.GetFiles</c> does not exist in the shipped runtime, so the set cannot be
-    /// enumerated. Two passes over the declared list make the result independent of the
-    /// declared order, which keeps the mod package format forgiving.
-    /// </summary>
-    private static EntryProblem? LoadPrivateAssemblies(ModManifest manifest)
-    {
-        if (manifest.PrivateAssemblies.Count == 0)
-        {
-            return null;
-        }
-
-        var pending = new List<string>();
-        for (var i = 0; i < manifest.PrivateAssemblies.Count; i++)
-        {
-            var name = manifest.PrivateAssemblies[i];
-            var path = Path.Combine(manifest.Directory, name);
-            if (!IsInside(manifest.Directory, path))
-            {
-                return new EntryProblem
-                {
-                    Code = ErrorCodes.ManifestEntryOutsidePackage,
-                    Message = "private assembly \"" + name + "\" resolves outside the mod package",
-                };
-            }
-            if (!File.Exists(path))
-            {
-                return new EntryProblem
-                {
-                    Code = ErrorCodes.EntryAssemblyMissing,
-                    Message = "missing private assembly \"" + name + "\"",
-                };
-            }
-            pending.Add(path);
-        }
-
-        var lastError = "";
-        while (pending.Count > 0)
-        {
-            var progressed = false;
-            for (var i = 0; i < pending.Count; i++)
-            {
-                try
-                {
-                    Assembly.LoadFrom(pending[i]);
-                    pending.RemoveAt(i);
-                    i--;
-                    progressed = true;
-                }
-                catch (Exception ex)
-                {
-                    lastError = Path.GetFileName(pending[i]) + ": " + DescribeException(ex);
-                }
-            }
-            if (!progressed)
-            {
-                break;
-            }
-        }
-
-        if (pending.Count > 0)
-        {
-            return new EntryProblem
-            {
-                Code = ErrorCodes.AssemblyLoadFailed,
-                Message = "private assembly could not be loaded (" + pending.Count + " pending): " + lastError,
-            };
-        }
-        return null;
-    }
-
     private static void LoadAndInitialize(
         ModRecord record,
         ModManifest manifest,
         LoadReport report,
         string logDirectory,
         bool logsReady,
-        Dictionary<string, bool> initialized)
+        Dictionary<string, bool> initialized,
+        AssemblyPreflightResult preflight)
     {
         var logger = new ModLogger(manifest.Id, logsReady ? logDirectory : record.Directory);
         var context = new ModContext(manifest, report.GameVersion, FrameworkVersion(), logger);
 
         try
         {
-            var assemblyPath = Path.Combine(manifest.Directory, manifest.EntryAssembly);
-            if (!IsInside(manifest.Directory, assemblyPath))
+            var entryClaim = preflight.FindClaim(manifest.Id, manifest.EntryAssembly);
+            if (entryClaim == null)
             {
-                record.Fail(ErrorCodes.ManifestEntryOutsidePackage, "entryAssembly resolves outside the mod package");
-                initialized[manifest.Id] = false;
-                return;
-            }
-            if (!File.Exists(assemblyPath))
-            {
-                record.Fail(ErrorCodes.EntryAssemblyMissing, "missing " + manifest.EntryAssembly);
+                record.Fail(ErrorCodes.AssemblyIdentityUnreadable,
+                    "the entry assembly \"" + manifest.EntryAssembly + "\" was not accepted by the preflight");
                 initialized[manifest.Id] = false;
                 return;
             }
 
-            record.SetAssemblyPath(assemblyPath);
-
-            var privateFailure = LoadPrivateAssemblies(manifest);
-            if (privateFailure != null)
+            // Private assemblies first, in the order the manifest declares them (explicit and
+            // therefore deterministic). Each claim already passed the preflight, so a failure
+            // here is a genuine load failure, not a conflict.
+            var claims = preflight.GetClaims(manifest.Id);
+            if (claims != null)
             {
-                record.Fail(privateFailure.Value.Code, privateFailure.Value.Message);
-                initialized[manifest.Id] = false;
-                return;
+                for (var i = 0; i < claims.Count; i++)
+                {
+                    var claim = claims[i];
+                    if (ReferenceEquals(claim, entryClaim))
+                    {
+                        continue;
+                    }
+                    Assembly privateAssembly;
+                    string privateError;
+                    if (!TryResolveClaim(claim, report, out privateAssembly, out privateError))
+                    {
+                        record.Fail(ErrorCodes.AssemblyLoadFailed, privateError);
+                        initialized[manifest.Id] = false;
+                        return;
+                    }
+                    NoteShared(record, claim);
+                }
             }
 
             Assembly assembly;
-            try
+            string entryError;
+            if (!TryResolveClaim(entryClaim, report, out assembly, out entryError))
             {
-                assembly = Assembly.LoadFrom(assemblyPath);
-            }
-            catch (Exception ex)
-            {
-                record.Fail(ErrorCodes.AssemblyLoadFailed, DescribeException(ex));
+                record.Fail(ErrorCodes.AssemblyLoadFailed, entryError);
                 initialized[manifest.Id] = false;
                 return;
             }
+            NoteShared(record, entryClaim);
+            record.SetAssemblyPath(entryClaim.CanonicalPath);
 
             var expectedName = Path.GetFileNameWithoutExtension(manifest.EntryAssembly);
             var actualName = assembly.GetName().Name;
@@ -501,6 +536,73 @@ public static class Loader
             record.Fail(ErrorCodes.EntryInitializeFailed, DescribeException(ex));
             initialized[manifest.Id] = false;
         }
+        finally
+        {
+            // Logging degradation is recorded on every exit path - success, failure and
+            // exception - and never changes the mod's own state.
+            record.SetLogStatus(logger.IsBroken, logger.FailureType);
+            if (logger.IsBroken)
+            {
+                report.AddWarning(manifest.Id + ": logging degraded (" + logger.FailureType +
+                                  "), the mod log file could not be written; the mod state is unchanged");
+            }
+        }
+    }
+
+    private static void NoteShared(ModRecord record, AssemblyClaim claim)
+    {
+        if (claim.Resolution == AssemblyResolution.ShareFromClaim)
+        {
+            record.AddSharedAssembly(claim.DeclaredName + " -> " + claim.CanonicalModId);
+        }
+        else if (claim.Resolution == AssemblyResolution.ShareFromHost)
+        {
+            record.AddSharedAssembly(claim.DeclaredName + " -> host");
+        }
+    }
+
+    /// <summary>
+    /// Materializes one preflight-approved claim exactly once per canonical path.
+    /// <c>Assembly.LoadFrom</c> is only ever reached here, i.e. after the preflight completed.
+    /// </summary>
+    private static bool TryResolveClaim(AssemblyClaim claim, LoadReport report, out Assembly assembly, out string error)
+    {
+        assembly = null!;
+        error = "";
+
+        if (claim.Resolution == AssemblyResolution.ShareFromHost)
+        {
+            if (claim.HostAssembly == null)
+            {
+                error = "the already loaded host assembly \"" + claim.Identity.Name + "\" is no longer present";
+                return false;
+            }
+            assembly = claim.HostAssembly;
+            return true;
+        }
+
+        var path = claim.CanonicalPath;
+        Assembly? cached;
+        if (s_loadedByPath.TryGetValue(path, out cached) && cached != null)
+        {
+            assembly = cached;
+            return true;
+        }
+
+        try
+        {
+            assembly = Assembly.LoadFrom(path);
+        }
+        catch (Exception ex)
+        {
+            error = claim.DeclaredName + ": " + DescribeException(ex);
+            return false;
+        }
+
+        s_loadedByPath[path] = assembly;
+        report.AddLine("assembly-load=" + claim.ModId + " file=" + claim.DeclaredName +
+                       " canonical=" + claim.CanonicalModId);
+        return true;
     }
 
     private struct EntryProblem
@@ -569,22 +671,6 @@ public static class Loader
         };
     }
 
-    private static bool IsInside(string root, string candidate)
-    {
-        var normalizedRoot = Normalize(root);
-        var normalizedCandidate = Normalize(candidate);
-        if (!normalizedRoot.EndsWith("/", StringComparison.Ordinal))
-        {
-            normalizedRoot += "/";
-        }
-        return normalizedCandidate.StartsWith(normalizedRoot, StringComparison.Ordinal);
-    }
-
-    private static string Normalize(string path)
-    {
-        return path.Replace('\\', '/');
-    }
-
     private static Exception Unwrap(Exception ex)
     {
         var target = ex as TargetInvocationException;
@@ -600,20 +686,37 @@ public static class Loader
         return ex.GetType().Name + ": " + ex.Message;
     }
 
+    /// <summary>How confident the loader is about the running game version.</summary>
+    internal enum GameVersionState
+    {
+        /// <summary>No assembly named <c>StardewValley</c> was found: the version is unknown.</summary>
+        Unknown = 0,
+
+        /// <summary>A game assembly was found and its version parses as SemVer.</summary>
+        Known = 1,
+
+        /// <summary>A game assembly was found but its version does not parse as SemVer.</summary>
+        Invalid = 2,
+    }
+
     /// <summary>
     /// Version of the running game, mapped to SemVer (the assembly revision is dropped).
-    /// <paramref name="confident"/> is true only when an assembly actually named
-    /// <c>StardewValley</c> was found; otherwise the version is <c>unknown</c> and the
-    /// compatibility gate stays open instead of guessing.
+    ///
+    /// Three distinct answers, because Phase 1.1 needs to fail closed on all but the first:
+    /// <see cref="GameVersionState.Known"/> (an assembly actually named <c>StardewValley</c>
+    /// provided a parseable version), <see cref="GameVersionState.Invalid"/> (such an assembly
+    /// was found but its version is not SemVer) and <see cref="GameVersionState.Unknown"/>
+    /// (no such assembly at all). The loader never guesses a version.
     /// </summary>
-    private static string DetectGameVersion(out bool confident)
+    private static string DetectGameVersion(out GameVersionState state, out string source)
     {
-        confident = false;
+        state = GameVersionState.Unknown;
+        source = "none";
 
         if (GameVersionOverride != null)
         {
-            confident = true;
-            return GameVersionOverride;
+            source = "override";
+            return Classify(GameVersionOverride, out state);
         }
 
         try
@@ -627,8 +730,8 @@ public static class Loader
                     var mapped = MapVersion(name);
                     if (mapped != null)
                     {
-                        confident = true;
-                        return mapped;
+                        source = "entry-assembly";
+                        return Classify(mapped, out state);
                     }
                 }
             }
@@ -649,8 +752,8 @@ public static class Loader
                     var mapped = MapVersion(name);
                     if (mapped != null)
                     {
-                        confident = true;
-                        return mapped;
+                        source = "appdomain";
+                        return Classify(mapped, out state);
                     }
                 }
             }
@@ -662,6 +765,14 @@ public static class Loader
         return "unknown";
     }
 
+    private static string Classify(string text, out GameVersionState state)
+    {
+        SemVersion parsed;
+        string error;
+        state = SemVersion.TryParse(text, out parsed, out error) ? GameVersionState.Known : GameVersionState.Invalid;
+        return text;
+    }
+
     private static string? MapVersion(AssemblyName name)
     {
         var version = name.Version;
@@ -669,14 +780,18 @@ public static class Loader
         {
             return null;
         }
-        var text = version.Major + "." + version.Minor + "." + version.Build;
-        SemVersion parsed;
-        string error;
-        return SemVersion.TryParse(text, out parsed, out error) ? text : null;
+        // Deliberately not validated here: an unparseable mapping must stay visible as
+        // "detected but invalid" instead of collapsing into "unknown".
+        return version.Major + "." + version.Minor + "." + version.Build;
     }
 
     internal static string FrameworkVersion()
     {
+        var text = FrameworkVersionOverride;
+        if (text != null)
+        {
+            return text;
+        }
         try
         {
             var name = typeof(Loader).Assembly.GetName();
@@ -714,36 +829,13 @@ public static class Loader
         return "/data/data/com.chucklefish.stardewvalley/files/Mods";
     }
 
-    private static string RunLegacyProbe(string modsRoot)
-    {
-        try
-        {
-            var probePath = Path.Combine(modsRoot, LegacyProbeAssembly);
-            if (!File.Exists(probePath))
-            {
-                return "absent";
-            }
-            var assembly = Assembly.LoadFrom(probePath);
-            var type = assembly.GetType("MonoRuntimeProbe.Probe", false, false);
-            var run = type == null ? null : type.GetMethod("Run");
-            if (run == null)
-            {
-                return "no-method";
-            }
-            var result = run.Invoke(null, new object?[] { Path.Combine(modsRoot, "probe-output"), false });
-            return Convert.ToString(result) ?? "null";
-        }
-        catch (Exception ex)
-        {
-            return "failed: " + DescribeException(Unwrap(ex));
-        }
-    }
-
-    private static void WriteReport(LoadReport report)
+    /// <summary>Writes both report files; returns false when neither could be written.</summary>
+    private static bool WriteReport(LoadReport report)
     {
         var text = report.Render();
-        TryWrite(Path.Combine(report.ModsRoot, ReportFileName), text);
-        TryWrite(Path.Combine(report.ModsRoot, LogFileName), text);
+        var written = TryWrite(Path.Combine(report.ModsRoot, ReportFileName), text);
+        var logWritten = TryWrite(Path.Combine(report.ModsRoot, LogFileName), text);
+        return written || logWritten;
     }
 
     private static bool TryWrite(string path, string text)
@@ -774,7 +866,8 @@ public static class Loader
 
     private static string BuildFatalReport(string modsRoot, Exception ex)
     {
-        var report = new LoadReport(modsRoot, DefaultModsRoot(), "unknown", false);
+        var report = new LoadReport(modsRoot, DefaultModsRoot(), "unknown",
+            GameVersionState.Unknown, "none");
         report.Result = "failed";
         report.AddLine("result=failed");
         report.AddLine("error=" + DescribeException(ex));
@@ -793,12 +886,18 @@ public static class Loader
         private readonly List<string> _warnings = new();
         private readonly List<ModRecord> _records = new();
 
-        internal LoadReport(string modsRoot, string runtimeDirectory, string gameVersion, bool gameVersionKnown)
+        internal LoadReport(
+            string modsRoot,
+            string runtimeDirectory,
+            string gameVersion,
+            GameVersionState gameVersionState,
+            string gameVersionSource)
         {
             ModsRoot = modsRoot;
             RuntimeDirectory = runtimeDirectory;
             GameVersion = gameVersion;
-            GameVersionKnown = gameVersionKnown;
+            GameVersionState = gameVersionState;
+            GameVersionSource = gameVersionSource;
         }
 
         internal string ModsRoot { get; }
@@ -807,7 +906,10 @@ public static class Loader
 
         internal string GameVersion { get; }
 
-        internal bool GameVersionKnown { get; }
+        internal GameVersionState GameVersionState { get; }
+
+        /// <summary>Where the version came from: <c>override</c>, <c>entry-assembly</c>, <c>appdomain</c> or <c>none</c>.</summary>
+        internal string GameVersionSource { get; }
 
         internal string Result { get; set; } = "ok";
 
@@ -830,21 +932,26 @@ public static class Loader
             sb.AppendLine("locate=" + RuntimeDirectory);
             sb.AppendLine("mods-root=" + ModsRoot);
             sb.AppendLine("game-version=" + GameVersion);
+            sb.AppendLine("game-version-state=" + StateText(GameVersionState));
+            sb.AppendLine("game-version-source=" + GameVersionSource);
             sb.AppendLine("mods-discovered=" + _records.Count);
 
             var initialized = 0;
             var failed = 0;
             var skipped = 0;
+            var degraded = 0;
             for (var i = 0; i < _records.Count; i++)
             {
                 var state = _records[i].State;
                 if (state == ModState.Initialized) { initialized++; }
                 else if (state == ModState.Failed) { failed++; }
                 else if (state == ModState.Skipped) { skipped++; }
+                if (_records[i].LogStatus == "degraded") { degraded++; }
             }
             sb.AppendLine("mods-initialized=" + initialized);
             sb.AppendLine("mods-failed=" + failed);
             sb.AppendLine("mods-skipped=" + skipped);
+            sb.AppendLine("logging=" + (degraded == 0 ? "healthy" : "degraded (" + degraded + " of " + _records.Count + " mods)"));
 
             var body = _body.ToString();
             sb.Append(body);
@@ -879,11 +986,41 @@ public static class Loader
                     {
                         sb.AppendLine("    assembly=" + record.AssemblyPath);
                     }
+                    sb.AppendLine("    log-status=" + record.LogStatus +
+                                  (record.LogStatus == "degraded" ? " log-error=" + record.LogFailureType : ""));
+                    if (record.SharedAssemblies.Count > 0)
+                    {
+                        sb.AppendLine("    shared=" + DescribeList(record.SharedAssemblies));
+                    }
                     sb.AppendLine("    history=" + record.DescribeHistory());
                 }
             }
 
             return sb.ToString();
+        }
+
+        private static string DescribeList(List<string> values)
+        {
+            var text = "";
+            for (var i = 0; i < values.Count; i++)
+            {
+                if (i > 0)
+                {
+                    text += ", ";
+                }
+                text += values[i];
+            }
+            return text;
+        }
+
+        private static string StateText(GameVersionState state)
+        {
+            switch (state)
+            {
+                case GameVersionState.Known: return "known";
+                case GameVersionState.Invalid: return "invalid";
+                default: return "unknown";
+            }
         }
     }
 }

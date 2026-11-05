@@ -19,7 +19,7 @@ app/                                          唯一的模块：内容 + 构建�
 Mod/                                          Mod Framework 的 C# 工程（.NET 8）
   ModFramework.Runtime/                       在游戏进程内跑的框架：契约 + Manifest + 依赖 + Loader
   ExampleMod.HelloWorld/                      参考 mod（manifest.json + IModEntry 实现）
-  MonoRuntimeProbe*/                          Phase 0 的运行时探针（诊断用，不属于 Loader）
+  MonoRuntimeProbe*/                          Phase 0 的运行时探针（诊断用，需显式启动；Loader 不再自动调用）
 Tools/                                        构建期工具与测试
   ModInjector/                                IL 注入：把 Bootstrap 合并进 StardewValley.dll
   AssemblyStore/                              assemblies.blob 的提取 / 原位替换 / 校验
@@ -56,14 +56,27 @@ apktool.yml         → decoded/apktool.yml
 | --- | --- |
 | 支持的游戏版本 | **1.6.15.0**（versionCode 239）。版本绑定：清单/资源/程序集都强相关，不做多版本兼容 |
 | 可构建的 APK | ✅ 直达标题界面，无更新/隐私/实名弹窗 |
-| Mod Framework：Manifest 发现 / 校验 / 依赖排序 / 加载 / 入口调用 | ✅ **离线实现完成**（宿主测试 125 项） |
+| Mod Framework：Manifest 发现 / 校验 / 依赖排序 / 加载 / 入口调用 | ✅ **离线实现完成**（宿主测试 206 项） |
+| Mod Framework：Phase 1.1 加固 | ✅ **离线实现完成**：裸 DLL 不执行 · 版本门禁 Fail-Closed · 加载前程序集身份预检 · 日志降级进报告（见 [`docs/audit/phase1.1-report.md`](docs/audit/phase1.1-report.md)） |
 | Mod Framework：ARM64 真机验证 | ❌ **BLOCKED**（无物理设备；只有 x86_64 模拟器） |
+| Mod Framework：设备上验证 `AssemblyName` 元数据读取与 SHA-256 | ❌ **BLOCKED**（只有编译期证据，见 phase1.1 报告 §3） |
 | Harmony / 方法补丁 / 事件钩子 / SMAPI 兼容 | ❌ **未实现**（Phase 2 及以后） |
 | 游戏内 Mod 管理器 / 配置 UI / 自动下载 | ❌ **未实现** |
 
 > 现在能保证的是"受信任的、符合规范的 mod 包会被发现、校验、按依赖顺序加载并调用其
 > `IModEntry.Initialize`，失败被隔离"。**不能**保证在真机上跑过——那一步仍缺设备。
 > `.NET` mod dll 在游戏进程内以完整权限执行，manifest 校验**不是**安全沙箱。
+
+### Loader 的四条硬语义（Phase 1.1）
+
+| 语义 | 含义 |
+| --- | --- |
+| 只有 manifest 包会执行 | Mods 根目录下的裸 DLL（含历史遗留的 `MonoRuntimeProbe.dll`）不会被加载；报告固定写 `probe=not-run-by-loader`。探针改为显式诊断启动，见 [`Mod/MonoRuntimeProbe/README.md`](Mod/MonoRuntimeProbe/README.md) |
+| 版本门禁 Fail-Closed | `gameVersion`/`frameworkVersion` 只有 `"*"` 才免除校验；显式范围遇到版本未知/无法解析 → 拒绝（`MF0503`/`MF0504`/`MF0505`），拒绝发生在入口 DLL 加载之前 |
+| 加载前身份预检 | 所有 `entryAssembly`/`privateAssemblies` 在**第一次 `Assembly.LoadFrom` 之前**完成元数据读取与冲突判定；同名不同身份/内容 → 双方拒绝（`MF0206`），同身份同内容 → 确定性共享一个代表文件 |
+| 日志降级可见 | `logs/<id>.log` 写不进去时报告记 `log-status=degraded` + 异常类型（不含路径），mod 状态仍是 `Initialized` |
+
+冲突与版本规则写进 [`docs/modding/manifest-spec.md`](docs/modding/manifest-spec.md) §3.4 / §5。
 
 ## 前置条件
 
@@ -119,7 +132,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Tools\tests\run-all.ps1 -Ref
 | CI 离线检查（13 项：Python/PS 语法、UTF-8、mojibake、manifest 夹具、schema、隐私、CI 结构） | `python Tools/tests/test_ci_offline.py` | ❌ |
 | 隐私扫描 | `python Tools/privacy-scan.py` | ❌ |
 | adb 解析自测（10 项，不连设备） | `powershell -File Tools/tests/test_device_precheck.ps1` | ❌ |
-| Loader 单元 + 宿主（125 项） | `python Tools/tests/test_loader.py --dotnet dotnet` | 示例 mod 部分需要（缺则 SKIP） |
+| Loader 单元 + 宿主（206 项） | `python Tools/tests/test_loader.py --dotnet dotnet` | 示例 mod 部分需要（缺则 SKIP） |
 | 注入 / 容器 / Loader 契约（27 项） | `python Tools/tests/test_mod_pipeline.py` | ✅ |
 | E0 只读设备预检 | `powershell -File Tools/device-precheck.ps1` | ❌（需要设备） |
 
@@ -166,9 +179,20 @@ public sealed class Entry : IModEntry
 ### 改 Loader
 
 先读 [`docs/architecture/phase1-loader-design.md`](docs/architecture/phase1-loader-design.md)。
-两条硬约束：
+三条硬约束：
 
 1. `Mod/ModFramework.Runtime` 里**不能**用 `System.Linq`、`System.Text.Json`、`FileInfo`/`DirectoryInfo`、
    `Directory.GetFiles`、`Environment.CurrentDirectory`、`Version.TryParse`——运行时没有。
    改完必须用 `-p:AndroidRefsDir=…` 编一遍。
 2. 不要给 `Loader` 加第二个叫 `Start` 的方法：Bootstrap 的 IL 用 `Type.GetMethod("Start")`。
+3. **不要试图"顺手"用桌面 .NET 的便利 API 读程序集身份**。裁剪后的运行时里：
+
+   | 想用 | 实际 | 替代 |
+   | --- | --- | --- |
+   | `AssemblyName.GetAssemblyName(path)` | ❌ 被裁掉 | `AssemblyMetadata.cs` 自己读 PE/CLI 元数据 |
+   | `SHA256.Create()` / `HashAlgorithm` | ❌ 被裁掉 | `SHA256.HashData(byte[])`（存在），否则 FNV-1a 回退 |
+   | `FileInfo` / `DirectoryInfo` | ❌ 被裁掉 | `File.OpenRead` + `FileStream.Length` |
+   | `Assembly.LoadFrom` | ✅ 存在 | 唯一可用的外部程序集加载方式 |
+
+   这几条不是文档推测：`docs/audit/phase1.1-evidence-index.md` 里有针对游戏 65 个参考程序集的
+   编译期证据（含"这些 API 不存在"的对照实验）。

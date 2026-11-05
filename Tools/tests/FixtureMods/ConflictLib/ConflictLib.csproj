@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Parameterised fixture assembly for the Phase 1.1 assembly-identity preflight tests.
+
+    The driver (Tools/tests/test_loader.py) builds this project several times with different
+    properties so one source can produce:
+      * the same simple name at two different versions      (DiffVersionLib v1 / v2),
+      * the same simple name+version with different content  (DiffContentLib x / y),
+      * identical bytes shared by two mod packages           (SharedLib),
+      * an entry assembly that collides with a private one   (EntryCollisionLib v1 / v2),
+      * a library used by the version-gate tests             (VersionGateLib).
+
+    Properties:
+      ConflictAssemblyName   assembly (and default file) name
+      ConflictAssemblyVersion  assembly version, e.g. 1.0.0.0
+      Variant                optional define: VARIANT_B / VARIANT_X / VARIANT_Y changes the
+                             IL bytes and the reported tag, without changing the assembly name.
+
+    Identity is decided by the compiled metadata, so this is the only way to get two genuinely
+    different assemblies with the same simple name without hand-writing IL.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>ConflictLib</RootNamespace>
+    <Deterministic>true</Deterministic>
+    <AssemblyName Condition="'$(ConflictAssemblyName)' != ''">$(ConflictAssemblyName)</AssemblyName>
+    <AssemblyName Condition="'$(ConflictAssemblyName)' == ''">ConflictLib</AssemblyName>
+    <AssemblyVersion Condition="'$(ConflictAssemblyVersion)' != ''">$(ConflictAssemblyVersion)</AssemblyVersion>
+    <AssemblyVersion Condition="'$(ConflictAssemblyVersion)' == ''">1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Version>1.0.0</Version>
+    <DefineConstants Condition="'$(Variant)' != ''">$(DefineConstants);$(Variant)</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\..\Mod\ModFramework.Runtime\ModFramework.Runtime.csproj" />
+  </ItemGroup>
+
+</Project>

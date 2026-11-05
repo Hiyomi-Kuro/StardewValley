@@ -8,13 +8,14 @@ namespace ModFramework.Runtime;
 ///
 /// Failure policy: a log write that throws is swallowed and remembered; the logger then
 /// stops touching the file so a broken file system cannot turn into an exception storm.
-/// The framework report records that logging was degraded.
+/// The framework report records that logging was degraded (see <see cref="ModRecord.SetLogStatus"/>).
 /// </summary>
 internal sealed class ModLogger : IModLogger
 {
     private readonly string _modId;
     private readonly string _path;
     private bool _broken;
+    private string _failureType = "";
 
     internal ModLogger(string modId, string logDirectory)
     {
@@ -23,6 +24,25 @@ internal sealed class ModLogger : IModLogger
     }
 
     internal bool IsBroken => _broken;
+
+    /// <summary>
+    /// Exception <b>type name only</b> of the first write failure. Nothing else is kept: the
+    /// report must not gain absolute paths, messages or environment details from here.
+    /// </summary>
+    internal string FailureType => _failureType;
+
+    /// <summary>
+    /// Test seam: when set, replaces the physical append so a deterministic failure can be
+    /// injected without permissions, locks or a full disk. <c>null</c> in production.
+    /// Internal on purpose - it is not part of the mod-author contract.
+    /// </summary>
+    internal static Action<string, string>? AppendOverride;
+
+    /// <summary>Report fragment: <c>ok</c> or <c>degraded(&lt;ExceptionType&gt;)</c>.</summary>
+    internal string DescribeStatus()
+    {
+        return _broken ? "degraded(" + _failureType + ")" : "ok";
+    }
 
     public void Info(string message) => Write(ModLogLevel.Info, message, null);
 
@@ -38,6 +58,7 @@ internal sealed class ModLogger : IModLogger
         {
             return;
         }
+        var text = "";
         try
         {
             var sb = new StringBuilder();
@@ -64,11 +85,24 @@ internal sealed class ModLogger : IModLogger
                 }
             }
             sb.Append(Environment.NewLine);
-            File.AppendAllText(_path, sb.ToString());
+            text = sb.ToString();
+
+            var append = AppendOverride;
+            if (append != null)
+            {
+                append(_path, text);
+            }
+            else
+            {
+                File.AppendAllText(_path, text);
+            }
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            // One failure disables the file for the rest of the session: no exception storm,
+            // no repeated file-system probes, and the report still gets a stable status.
             _broken = true;
+            _failureType = ex.GetType().Name;
         }
     }
 

@@ -16,6 +16,113 @@ internal static class UnitTests
         ManifestFixtureTests(t, repoRoot);
         DiscoveryTests(t);
         DependencyTests(t);
+        MetadataTests(t);
+    }
+
+    // ------------------------------------------------------- assembly metadata
+
+    /// <summary>
+    /// The preflight reads assembly identity from file bytes because the trimmed runtime has no
+    /// <c>AssemblyName.GetAssemblyName(string)</c>. These checks prove that reader against a real
+    /// assembly, and that it refuses everything that is not a managed assembly.
+    /// </summary>
+    private static void MetadataTests(TestRunner t)
+    {
+        var runtimePath = typeof(Loader).Assembly.Location;
+        t.Check("metadata_runtime_path_available", runtimePath != null && File.Exists(runtimePath),
+            runtimePath == null ? "(null)" : runtimePath);
+
+        byte[] bytes;
+        string readError;
+        var readOk = AssemblyClaimReader.TryReadAll(runtimePath, out bytes, out readError);
+        t.Check("metadata_read_all", readOk, readError);
+
+        AssemblyFileIdentity identity;
+        string error;
+        var parsed = ManagedAssemblyReader.TryReadIdentity(bytes, out identity, out error);
+        t.Check("metadata_reads_managed_identity", parsed, error);
+
+        var loadedName = typeof(Loader).Assembly.GetName();
+        t.Check("metadata_name_matches_loaded",
+            string.Equals(identity.Name, loadedName.Name, StringComparison.Ordinal),
+            identity.Name + " vs " + loadedName.Name);
+        t.Check("metadata_version_matches_loaded",
+            string.Equals(identity.VersionText, HostAssemblyIdentity.NormalizeVersion(loadedName.Version), StringComparison.Ordinal),
+            identity.VersionText + " vs " + HostAssemblyIdentity.NormalizeVersion(loadedName.Version));
+        t.Check("metadata_unsigned_fixture", !identity.IsStrongNamed, "the framework assembly is not strong-name signed");
+        t.Check("metadata_identity_text_is_path_free",
+            identity.Describe("none").IndexOf('/') < 0 && identity.Describe("none").IndexOf('\\') < 0,
+            identity.Describe("none"));
+
+        AssemblyFileIdentity ignored;
+        t.Check("metadata_rejects_empty",
+            !ManagedAssemblyReader.TryReadIdentity(new byte[0], out ignored, out error), error);
+        t.Check("metadata_rejects_text",
+            !ManagedAssemblyReader.TryReadIdentity(Encoding.UTF8.GetBytes("not an assembly at all"), out ignored, out error), error);
+
+        var truncated = new byte[300];
+        Array.Copy(bytes, truncated, truncated.Length);
+        t.Check("metadata_rejects_truncated",
+            !ManagedAssemblyReader.TryReadIdentity(truncated, out ignored, out error), error);
+
+        var mzOnly = new byte[2048];
+        mzOnly[0] = (byte)'M';
+        mzOnly[1] = (byte)'Z';
+        mzOnly[0x3C] = 0x40;
+        t.Check("metadata_rejects_mz_without_pe",
+            !ManagedAssemblyReader.TryReadIdentity(mzOnly, out ignored, out error), error);
+
+        var digest = AssemblyClaimReader.ComputeDigest(bytes);
+        t.Check("metadata_digest_is_sha256",
+            digest.StartsWith("sha256:", StringComparison.Ordinal) && digest.Length == 7 + 64,
+            digest.Length + " chars");
+        t.Check("metadata_digest_is_stable",
+            string.Equals(digest, AssemblyClaimReader.ComputeDigest(bytes), StringComparison.Ordinal), digest);
+
+        var previous = AssemblyClaimReader.DisableSha256ForTests;
+        try
+        {
+            AssemblyClaimReader.DisableSha256ForTests = true;
+            var fallback = AssemblyClaimReader.ComputeDigest(bytes);
+            t.Check("metadata_digest_fallback_is_deterministic",
+                fallback.StartsWith("fnv1a64:", StringComparison.Ordinal) &&
+                string.Equals(fallback, AssemblyClaimReader.ComputeDigest(bytes), StringComparison.Ordinal), fallback);
+            t.Check("metadata_digest_fallback_differs",
+                !string.Equals(fallback, digest, StringComparison.Ordinal), fallback);
+            t.Check("metadata_key_fingerprint_fallback",
+                string.Equals(AssemblyClaimReader.Fingerprint(new byte[] { 1, 2, 3 }),
+                    AssemblyClaimReader.Fingerprint(new byte[] { 1, 2, 3 }), StringComparison.Ordinal),
+                AssemblyClaimReader.Fingerprint(new byte[] { 1, 2, 3 }));
+        }
+        finally
+        {
+            AssemblyClaimReader.DisableSha256ForTests = previous;
+        }
+
+        t.Check("metadata_fingerprint_none_for_unsigned",
+            string.Equals(AssemblyClaimReader.Fingerprint(Array.Empty<byte>()), "none", StringComparison.Ordinal), "none");
+
+        t.Check("path_rules_inside", PathRules.IsInside("/mods/A", "/mods/A/x.dll"), "same directory prefix");
+        t.Check("path_rules_rejects_sibling_prefix", !PathRules.IsInside("/mods/A", "/mods/AB/x.dll"), "AB is not inside A/");
+        t.Check("path_rules_accepts_subdirectory", PathRules.IsInside("/mods/A", "/mods/A/sub/x.dll"), "subdirectory");
+
+        var codes = new[]
+        {
+            ErrorCodes.AssemblyIdentityUnreadable, ErrorCodes.AssemblyIdentityConflict,
+            ErrorCodes.HostAssemblyConflict, ErrorCodes.GameVersionUnknown,
+            ErrorCodes.GameVersionInvalid, ErrorCodes.FrameworkVersionInvalid,
+            ErrorCodes.ReportWriteFailed,
+        };
+        var described = 0;
+        for (var i = 0; i < codes.Length; i++)
+        {
+            if (!string.Equals(ErrorCodes.Describe(codes[i]), "unknown error", StringComparison.Ordinal))
+            {
+                described++;
+            }
+        }
+        t.Check("errorcodes_new_codes_have_text", described == codes.Length,
+            described + "/" + codes.Length + " new codes documented in Describe()");
     }
 
     // ---------------------------------------------------------------- SemVer

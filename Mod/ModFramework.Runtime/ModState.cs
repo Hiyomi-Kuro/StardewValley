@@ -46,6 +46,19 @@ internal sealed class ModRecord
 
     internal string AssemblyPath { get; private set; } = "";
 
+    /// <summary>
+    /// <c>ok</c> or <c>degraded</c>. Logging failure is deliberately <b>not</b> a mod failure:
+    /// a mod whose <c>Initialize</c> returned normally stays <see cref="ModState.Initialized"/>
+    /// even when its log file could not be written.
+    /// </summary>
+    internal string LogStatus { get; private set; } = "ok";
+
+    /// <summary>Exception type of the first log write failure, or empty. Never a path.</summary>
+    internal string LogFailureType { get; private set; } = "";
+
+    /// <summary>Assemblies the preflight made this mod share instead of loading its own copy.</summary>
+    internal List<string> SharedAssemblies { get; } = new();
+
     internal List<string> History { get; } = new();
 
     internal bool IsTerminalFailure => State == ModState.Failed || State == ModState.Skipped;
@@ -59,6 +72,17 @@ internal sealed class ModRecord
             State = state;
             History.Add(state.ToString());
         }
+    }
+
+    internal void SetLogStatus(bool broken, string failureType)
+    {
+        LogStatus = broken ? "degraded" : "ok";
+        LogFailureType = broken ? failureType : "";
+    }
+
+    internal void AddSharedAssembly(string text)
+    {
+        SharedAssemblies.Add(text);
     }
 
     internal void SetAssemblyPath(string path)

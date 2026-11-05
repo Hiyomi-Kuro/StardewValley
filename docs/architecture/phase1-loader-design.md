@@ -27,13 +27,18 @@
 | `Json.cs` | 严格 JSON 解析器（无 `System.Text.Json`）、深度/大小/重复 key 限制 | ✅ 单元 |
 | `SemVersion.cs` | SemVer 2.0.0 + 版本范围（无 `Version.TryParse`） | ✅ 单元 |
 | `DependencyResolver.cs` | 依赖校验、环检测、确定性拓扑排序 | ✅ 单元 |
-| `ModState.cs` | 生命周期状态机 + 每个 mod 的记录 | ✅ 单元 |
-| `ModLogger.cs` | 每 mod 一个日志文件；写失败自我熔断 | ✅ 宿主 |
+| `ModState.cs` | 生命周期状态机 + 每个 mod 的记录（含 `log-status` / `shared`） | ✅ 单元 |
+| `ModLogger.cs` | 每 mod 一个日志文件；写失败自我熔断 + 状态上报（Phase 1.1） | ✅ 宿主 |
 | `ModContext.cs` | `IModContext` 实现（只读视图） | ✅ 宿主 |
 | `Contracts.cs` | `IModEntry` / `IModContext` / `IModLogger` / `ModLogLevel` | — |
 | `ErrorCodes.cs` | 稳定错误码 + 文案 | ✅ 单元 |
+| `PathRules.cs` | 包内路径判定（`IsInside`），Loader 与预检共用 | ✅ 单元 |
+| `AssemblyMetadata.cs` | **Phase 1.1**：只读 PE/CLI 元数据（Assembly 表行 0），不加载程序集 | ✅ 单元 |
+| `AssemblyIdentity.cs` | **Phase 1.1**：声明文件 → 身份 + 内容摘要；宿主已加载程序集的同形身份 | ✅ 单元 |
+| `AssemblyPreflight.cs` | **Phase 1.1**：全局冲突判定、宿主冲突判定、确定性代表文件选择 | ✅ 宿主 |
 
-依赖方向是单向的：`Loader` → 其它；其它之间只有 `ModManifest`/`SemVersion` 的引用。
+依赖方向是单向的：`Loader` → 其它；预检三件套只依赖 `PathRules`/`ErrorCodes`/`ModManifest`，
+不依赖 `Loader`（因此可以单独测试，也不会反过来加载任何东西）。
 
 ---
 
@@ -43,30 +48,44 @@
 Loader.Run(modsRoot)
 ├── 重入保护（静态标志）                     → MF0901
 ├── 同一 root 已初始化过？                    → 直接 null + result=already-initialized
-├── 探测游戏/框架版本                        → game-version=<x|unknown>
+├── 探测游戏/框架版本                        → game-version + game-version-state + game-version-source
 ├── ModDiscovery.Discover
 │   ├── Directory.GetDirectories(root) 排序
-│   ├── 过滤 . / _ 前缀、无 manifest.json
+│   ├── 过滤 . / _ 前缀、无 manifest.json     ← 裸 DLL 永不被发现（Phase 1.1）
 │   └── ManifestReader.Load 逐个校验          → 失败记录 MF01xx，不影响别人
 ├── DependencyResolver.Resolve
 │   ├── 缺失/版本不符 → 该 mod MF0401/MF0402
 │   ├── DFS 找环 → 环上 MF0403
 │   └── Kahn 拓扑排序（就绪集按 id 排序）
+├── 门禁 1：版本兼容（按拓扑序预判，不加载任何东西）
+│   └── 显式范围 + 未知/非法/不满足 → MF0503 / MF0504 / MF0505 / MF0501 / MF0502
+├── 门禁 2：全局程序集身份预检（Phase 1.1，一次覆盖所有仍存活的 mod）
+│   ├── 只读 PE/CLI 元数据 + 内容摘要（不 LoadFrom、不执行代码）
+│   ├── 同名不同身份/内容        → 双方 MF0206
+│   ├── 与宿主已加载同名同身份冲突 → MF0207
+│   ├── 损坏 / 非托管            → MF0205；文件缺失 → MF0201
+│   └── preflight-stage=complete   ← 这一行之前没有任何 assembly-load=
 ├── 逐个（按拓扑序）：
 │   ├── 依赖问题？            → Failed(码)
-│   ├── 游戏/框架版本不符？    → Failed(MF0501/MF0502)
+│   ├── 版本门禁拒绝？        → Failed(码)
+│   ├── 预检拒绝？            → Failed(码)
 │   ├── 依赖未初始化？        → Failed(MF0404)
 │   └── LoadAndInitialize：
-│       ├── 入口文件存在/在包内            → MF0201/MF0119
-│       ├── privateAssemblies 逐个 LoadFrom → MF0202
-│       ├── 入口程序集 LoadFrom            → MF0202
+│       ├── privateAssemblies（按声明序，走预检给出的 canonical 路径）→ MF0202
+│       ├── 入口程序集（同身份共享时复用已加载实例）      → MF0202
 │       ├── 程序集名 == 文件名？            → MF0203
 │       ├── entryType 存在且合法            → MF0301..MF0307
 │       ├── Activator.CreateInstance        → MF0308
 │       ├── 是 IModEntry（类型身份）        → MF0204
-│       └── Initialize(context)             → MF0309
-└── 写 loader-report.txt + loader.log；返回 null
+│       ├── Initialize(context)             → MF0309
+│       └── finally：记录 log-status（不改变 mod 状态）
+└── 写 loader-report.txt + loader.log；返回 null（两个文件都写不出 → MF0905）
 ```
+
+> Phase 1 的时序里，版本门禁与私有程序集 `LoadFrom` 都在"逐个 mod"的循环内部，
+> 因此第一个 mod 的 DLL 可能已经加载后才发现第二个 mod 的冲突。Phase 1.1 把两件事
+> 提到循环之前，并用 `preflight-stage=complete` / `assembly-load=` 两行在报告里
+> **可验证地**固定这个顺序。
 
 `Run` 的返回值只表达 **Loader 级**结果：
 
@@ -74,7 +93,8 @@ Loader.Run(modsRoot)
 | --- | --- |
 | `null` | 扫描跑完了。个别 mod 失败也返回 `null`（失败在报告与日志里） |
 | `"MF0902: ..."` | Mods 根目录不存在 |
-| `"loader-report: loader-crashed: ..."` | Loader 自己抛了未捕获异常（已写报告） |
+| `"MF0905: ..."` | `loader-report.txt` 与 `loader.log` 都写不出来（扫描可能已经完成，但没有证据落盘） |
+| `"loader-report: loader-crashed: ..."` | Loader 自己抛了未捕获异常（已尽力写报告） |
 
 Bootstrap 把非 null 当失败抛异常，而它自己的 catch 会吞掉——所以**报告必须落盘**。
 

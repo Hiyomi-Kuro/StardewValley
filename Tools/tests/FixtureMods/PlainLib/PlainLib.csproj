@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Reference-free fixture library (Phase 1.1).
+
+    Kept separate from ConflictLib because it must be able to take the assembly name
+    "ModFramework.Runtime" without a ProjectReference to the real framework assembly: a
+    reference would make the build overwrite the produced file with the real one, and the
+    host-collision test would silently test nothing.
+
+    The driver builds this once with:
+      -p:PlainAssemblyName=ModFramework.Runtime -p:PlainAssemblyVersion=9.9.9.0
+    which is a managed assembly whose simple name collides with the already loaded framework
+    but whose identity differs - the case the preflight must reject (MF0207).
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>PlainLib</RootNamespace>
+    <Deterministic>true</Deterministic>
+    <AssemblyName Condition="'$(PlainAssemblyName)' != ''">$(PlainAssemblyName)</AssemblyName>
+    <AssemblyName Condition="'$(PlainAssemblyName)' == ''">PlainLib</AssemblyName>
+    <AssemblyVersion Condition="'$(PlainAssemblyVersion)' != ''">$(PlainAssemblyVersion)</AssemblyVersion>
+    <AssemblyVersion Condition="'$(PlainAssemblyVersion)' == ''">1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+</Project>

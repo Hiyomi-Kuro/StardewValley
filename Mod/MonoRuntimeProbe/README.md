@@ -2,6 +2,10 @@
 
 Phase 0 的运行时探针：在**真实游戏进程**里验证 .NET for Android / MonoVM 的动态程序集加载、反射与代码生成能力。
 
+> **它不属于常规 Mod Loader 流程。** 正常 `Loader.Start()/Run()` 不会加载、不会调用、也不会因为
+> Mods 根目录里存在 `MonoRuntimeProbe.dll` 而做任何事（Phase 1.1 移除了那条隐式路径，
+> 报告里固定写 `probe=not-run-by-loader`）。调用方式见 §4，必须显式。
+
 > 状态（2026-11-05 Phase 0.5.1 复核）：
 > - **代码完成**，桌面基线通过；
 > - **Android 侧只在 MuMu 12 模拟器（x86_64 + `libnb.so` 翻译）跑过**：T00–T07、T11 记录为 PASS，T12 原生崩溃。
@@ -74,21 +78,48 @@ dotnet build Mod/MonoRuntimeProbe "-p:AndroidRefsDir=$refs" -c Release -o <输�
 产物：`MonoRuntimeProbe.dll` + `MonoRuntimeProbe.Dependency.dll`（+ `.pdb`）。
 `Probe.Run(string outputDirectory, bool allowGameInvocation)` 返回**报告文件路径**。
 
-## 4. 在 Android 上运行
+## 4. 在 Android 上运行（**必须显式启动**）
 
-调用方是 `ModFramework.Runtime.Loader`（不是 Bootstrap 直接调）：
+> **Phase 1.1 起，正常 Loader 不再执行这个探针。**
+>
+> 旧版 README 这里写的是"调用方是 `ModFramework.Runtime.Loader`"，并贴了一段 `RunProbe()`。
+> 那是 Phase 0 的诊断捷径：Loader 扫到 `<Mods>/MonoRuntimeProbe.dll` 就直接
+> `Assembly.LoadFrom` + 反射调用 `Probe.Run`。它绕过了 manifest、依赖解析和 `IModEntry`
+> 契约，等于给 Mods 根目录开了一个不受 Manifest 管理的代码执行入口。
+>
+> 现在这段逻辑已删除。`loader-report.txt` 里固定输出 `probe=not-run-by-loader`，
+> 以便旧报告读者看到明确状态而不是"字段消失"。
 
-```csharp
-// ModFramework.Runtime/Loader.cs 的 RunProbe()，与源码一致
-var probePath = Path.Combine(BaseDir(), "MonoRuntimeProbe.dll");
-if (!File.Exists(probePath)) return "absent";
-var asm = Assembly.LoadFrom(probePath);                      // 不是 Load(byte[])
-var run = asm.GetType("MonoRuntimeProbe.Probe")?.GetMethod("Run");
-run.Invoke(null, new object?[] { Path.Combine(BaseDir(), "probe-output"), false });
+探针仍然保留（Phase 0 的历史证据与设备诊断都需要它），但只能**显式**启动：
+
+**方式 A - 桌面宿主（开发机自测）**
+
+```powershell
+dotnet run --project Mod/MonoRuntimeProbe.Host -- <输出目录>
 ```
 
+**方式 B - 设备上的显式诊断 Mod**
+
+把探针包装成一个**普通的、符合 manifest 规范的 mod**，由它自己调用探针：
+
+```csharp
+// 你自己的诊断 Mod 的入口（manifest 里正常声明 entryAssembly/entryType）
+public sealed class ProbeRunner : IModEntry
+{
+    public void Initialize(IModContext context)
+    {
+        var probe = Assembly.LoadFrom(Path.Combine(context.ModDirectory, "MonoRuntimeProbe.dll"));
+        var run = probe.GetType("MonoRuntimeProbe.Probe")!.GetMethod("Run")!;
+        run.Invoke(null, new object[] { Path.Combine(context.ModDirectory, "probe-output"), false });
+    }
+}
+```
+
+这样触发是**明示的**：有 manifest、有 mod id、出现在 loader-report 里、失败会被隔离。
+Loader 不会因为某个目录里存在 `MonoRuntimeProbe.dll` 就执行它。
+
 报告落在 `<outputDirectory>/probe.txt`（纯文本，**不是 json/log**）。
-`outputDirectory` 为空时退化为 `Loader` 自身所在目录。
+`outputDirectory` 为空时退化为探针自身所在目录。
 写入失败时 `Run` 返回 `!write:<异常>`，不会抛。
 
 ## 5. 结果解读

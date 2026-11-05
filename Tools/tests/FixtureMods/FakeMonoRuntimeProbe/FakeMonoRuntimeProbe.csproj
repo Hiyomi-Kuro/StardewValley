@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Decoy assembly for the Phase 1.1 LegacyProbe regression test.
+
+    It deliberately:
+      * is named exactly like the Phase 0 diagnostic probe (assembly name MonoRuntimeProbe),
+      * exposes MonoRuntimeProbe.Probe.Run(string, bool) with the same shape the old loader
+        invoked,
+      * writes a unique marker file when Run executes,
+      * references nothing at all (no ModFramework.Runtime, no game assemblies).
+
+    Putting this file in the mods root must NOT make the loader load or call it.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>MonoRuntimeProbe</AssemblyName>
+    <RootNamespace>MonoRuntimeProbe</RootNamespace>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+</Project>

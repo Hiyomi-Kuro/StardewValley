@@ -7,8 +7,18 @@ Builds and runs Tools/tests/ModFramework.Tests, which covers:
                   discovery, dependency graph, determinism, error codes;
   * host level  - a real Manifest -> Loader -> Assembly.LoadFrom -> IModEntry.Initialize
                   chain against Tools/tests/FixtureMods;
+  * Phase 1.1   - bare-DLL probe is never loaded, fail-closed game/framework version gates,
+                  global assembly identity preflight (same name/different version, same
+                  identity/different content, deterministic sharing, host collision, damaged
+                  or missing declared files), dependency propagation, and the logger
+                  degradation report;
   * example mod - Mod/ExampleMod.HelloWorld, but only when --refs is given, because that
                   project compiles against the game's own assemblies.
+
+The Phase 1.1 identity fixtures are built from two parameterised projects
+(Tools/tests/FixtureMods/ConflictLib and PlainLib): one source produces every "same simple
+name, different identity/content" shape by passing MSBuild properties. A missing variant is
+reported as FAIL, never as SKIP.
 
 The game assemblies are never copied, hashed into the repository or uploaded: when --refs
 is absent the example-mod checks are reported as SKIPPED, never as passed.
@@ -52,6 +62,76 @@ def run(cmd, cwd=None):
 def tail(text, lines=12):
     parts = [p for p in text.strip().splitlines() if p.strip()]
     return " | ".join(parts[-lines:])
+
+
+# Phase 1.1 identity fixtures: one project per shape, driven by MSBuild properties.
+CONFLICT_LIB = os.path.join(ROOT, "Tools", "tests", "FixtureMods", "ConflictLib", "ConflictLib.csproj")
+PLAIN_LIB = os.path.join(ROOT, "Tools", "tests", "FixtureMods", "PlainLib", "PlainLib.csproj")
+FAKE_PROBE = os.path.join(ROOT, "Tools", "tests", "FixtureMods", "FakeMonoRuntimeProbe", "FakeMonoRuntimeProbe.csproj")
+
+# key -> (project, properties, assembly name, file name that the test host expects)
+VARIANTS = [
+    ("probe", FAKE_PROBE, {}, "MonoRuntimeProbe", "MonoRuntimeProbe.dll"),
+    ("diff_version_v1", CONFLICT_LIB,
+     {"ConflictAssemblyName": "DiffVersionLib", "ConflictAssemblyVersion": "1.0.0.0"},
+     "DiffVersionLib", "DiffVersionLib.v1.dll"),
+    ("diff_version_v2", CONFLICT_LIB,
+     {"ConflictAssemblyName": "DiffVersionLib", "ConflictAssemblyVersion": "2.0.0.0", "Variant": "VARIANT_B"},
+     "DiffVersionLib", "DiffVersionLib.v2.dll"),
+    ("diff_content_x", CONFLICT_LIB,
+     {"ConflictAssemblyName": "DiffContentLib", "ConflictAssemblyVersion": "1.0.0.0", "Variant": "VARIANT_X"},
+     "DiffContentLib", "DiffContentLib.x.dll"),
+    ("diff_content_y", CONFLICT_LIB,
+     {"ConflictAssemblyName": "DiffContentLib", "ConflictAssemblyVersion": "1.0.0.0", "Variant": "VARIANT_Y"},
+     "DiffContentLib", "DiffContentLib.y.dll"),
+    ("shared", CONFLICT_LIB,
+     {"ConflictAssemblyName": "SharedLib", "ConflictAssemblyVersion": "1.0.0.0"},
+     "SharedLib", "SharedLib.dll"),
+    ("entry_v1", CONFLICT_LIB,
+     {"ConflictAssemblyName": "EntryCollisionLib", "ConflictAssemblyVersion": "1.0.0.0"},
+     "EntryCollisionLib", "EntryCollisionLib.dll"),
+    ("entry_v2", CONFLICT_LIB,
+     {"ConflictAssemblyName": "EntryCollisionLib", "ConflictAssemblyVersion": "2.0.0.0", "Variant": "VARIANT_B"},
+     "EntryCollisionLib", "EntryCollisionLib.v2.dll"),
+    ("gate", CONFLICT_LIB,
+     {"ConflictAssemblyName": "VersionGateLib", "ConflictAssemblyVersion": "1.0.0.0"},
+     "VersionGateLib", "VersionGateLib.dll"),
+    ("host_collision", PLAIN_LIB,
+     {"PlainAssemblyName": "ModFramework.Runtime", "PlainAssemblyVersion": "9.9.9.0"},
+     "ModFramework.Runtime", "HostConflict.ModFramework.Runtime.dll"),
+]
+
+
+def find_artifact(root, file_name):
+    """Locate one produced dll inside an artifacts directory, preferring bin/<project>/<config>."""
+    hits = []
+    for base, _dirs, files in os.walk(root):
+        if file_name in files:
+            hits.append(os.path.join(base, file_name))
+    hits.sort()
+    preferred = [h for h in hits if os.sep + "bin" + os.sep in h]
+    chosen = preferred or hits
+    return chosen[0] if chosen else ""
+
+
+def build_variants(dotnet, variants_root, fixtures_dir):
+    ok = True
+    for key, project, props, assembly_name, target_name in VARIANTS:
+        out_dir = os.path.join(variants_root, key)
+        cmd = [dotnet, "build", project, "-c", "Release",
+               "--artifacts-path", out_dir, "-v", "q"]
+        for prop, value in sorted(props.items()):
+            cmd.append("-p:%s=%s" % (prop, value))
+        rc, out, secs = run(cmd)
+        produced = find_artifact(out_dir, assembly_name + ".dll") if rc == 0 else ""
+        if rc != 0 or not produced:
+            ok = False
+            check("fixture_variant_" + key, False,
+                  "rc=%d %.1fs %s" % (rc, secs, tail(out, 4) if rc != 0 else "no " + assembly_name + ".dll"))
+            continue
+        shutil.copy2(produced, os.path.join(fixtures_dir, target_name))
+        check("fixture_variant_" + key, True, target_name)
+    return ok
 
 
 def main():
@@ -103,6 +183,13 @@ def main():
             return finish()
         shutil.copy2(source, os.path.join(fixtures, name))
     check("fixture_artifacts_copied", True, fixtures)
+
+    # ------------------------------------------------- Phase 1.1 fixture variants
+    # One parameterised project produces every identity shape the preflight tests need.
+    # Each variant gets its own artifacts directory so MSBuild cannot reuse a stale build
+    # whose properties (assembly name / version / defines) differ.
+    if not build_variants(dotnet, os.path.join(work, "variants"), fixtures):
+        return finish()
 
     # ---------------------------------------------------------------- example mod
     hello_world_dir = ""
