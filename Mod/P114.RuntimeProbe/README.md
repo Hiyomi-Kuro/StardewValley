@@ -89,7 +89,16 @@ fixture），然后让 `Tools/tests/ModFramework.Tests` 用**真实 Loader** 跑
 本阶段**没有**在设备上运行它。以下是留给批准后的步骤，**不属于**本阶段的执行记录：
 
 1. 把整个 `P114.RuntimeProbe/` 目录放到游戏的 Mods 根目录（默认
-   `/data/data/com.chucklefish.stardewvalley/files/Mods/`，属主必须是应用 uid）；
+   `/data/data/com.chucklefish.stardewvalley/files/Mods/`，属主必须是应用 uid）。
+   Phase 1.1.5 起**只用**修复后的安全递归脚本推送，不要手工 `cp`：
+
+   ```powershell
+   pwsh -NoProfile -File Tools/deploy-apk-safe.ps1 -PushModsApproved -Serial <serial> -ModsSourceDirectory <完整 Mods 根目录>
+   ```
+
+   它递归保留完整目录树（`P114.RuntimeProbe/manifest.json`、`probe-fixtures/**`），在 staging
+   阶段逐个校验远端 SHA-256 后才复制，并在最终位置再校验一次属主与权限。旧实现的
+   "只枚举第一层 + 全部复制到 Mods 根目录"会破坏本 README 第 2 节要求的布局。
 2. 启动游戏（`am start -W -n com.chucklefish.stardewvalley/com.chucklefish.stardewvalley.MainActivity`）；
 3. 读两个文件：
    - `<Mods>/loader-report.txt`：R-03 / R-12（Loader 侧观察：`preflight-stage=complete` 是否先于

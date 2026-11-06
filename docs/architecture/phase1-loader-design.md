@@ -298,7 +298,30 @@ Bootstrap（注入进 `StardewValley.dll` 的 IL）只做四件事：
 因此 `Loader` 上**不能**有第二个叫 `Start` 的重载（`Type.GetMethod("Start")` 会抛
 `AmbiguousMatchException`）。测试用的入口叫 `Run(string)`。
 
-## 10. 扩展点（留给后续阶段，不在本阶段实现）
+## 9.1 部署契约（Phase 1.1.5）
+
+`ModDiscovery` 的规则决定了**部署器必须还原目录树**，不能只传文件：
+
+- `<Mods>/ModFramework.Runtime.dll` 必须在 Mods 根目录（Bootstrap 只 `File.Exists` 这一个路径）；
+- 每个 mod 在 Mods 的**一级子目录**里，且该子目录内必须有 `manifest.json`；
+- 子孙目录（例如 `P114.RuntimeProbe/probe-fixtures/`）不参与发现，但**必须完整存在**，
+  因为 mod 自己会按相对路径去读。
+
+因此部署的安全契约是：
+
+| 要求 | 原因 |
+| --- | --- |
+| 递归枚举源目录、保留相对路径 | 平铺复制会让 `manifest.json` 落在 Mods 根目录，`ModDiscovery` 永远发现不到该 mod |
+| 唯一 staging 目录 + 传输后逐文件 SHA-256 | "退出码 0"不等于"字节到了" |
+| 复制到最终位置后再校验哈希、属主、权限 | app 以自身 uid 读文件；root 创建的文件必须 chown |
+| 同路径同哈希跳过、不同哈希 fail-closed | 不覆盖其它 mod 的文件 |
+| 绝不清空/替换整个 Mods 目录 | 删一个目录等于删玩家的其它 mod |
+
+`Tools/deploy-apk-safe.ps1` 的 `-PushModsApproved` 分支实现了以上全部要求，
+`Tools/tests/test_deploy_safe.ps1` 用模拟设备文件系统的 fake adb 逐项断言
+（远端目录树、每文件哈希、覆盖保护、staging 清理、UID/GID 校验、失败路径）。
+
+
 
 - `IModContext` 以后可以加 Events/Content/Data 子接口——但**现在不加空接口**；
 - `Loader.Run(string)` 已经是"可指定根目录"的形态，方便将来做测试/管理器；
@@ -313,6 +336,7 @@ Bootstrap（注入进 `StardewValley.dll` 的 IL）只做四件事：
 | 2026-11-05 | Phase 1.1.1：预检不动点（依赖优先、冲突重算、事件按最终归类过滤）、内容相等改为逐字节判定、宿主匹配 Fail-Closed、PE/CLI 逐层边界、框架版本 Unknown/Invalid 分离、报告与日志脱敏 |
 | 2026-11-06 | Phase 1.1.2：预检字节写入私有快照并只从快照 `LoadFrom`（加载前二次校验指纹）、不动点显式 Converged/Exhausted 且未收敛时 Fail-Closed（`MF0208`）、ECMA-335 PublicKey 标志与 Blob 形状校验（`MF0205`） |
 | 2026-11-06 | Phase 1.1.3：去重键降级为候选索引（`dedup key -> List<SnapshotEntry>`，命中后逐字节比较才共享）、快照完整性改用独立 SHA-256 摘要且无 SHA-256 时 Fail-Closed、`LoadFrom` 返回对象与 claim 身份核对（`MF0210`）、暂存路径永不复用（同名追加 `~N`） |
+| 2026-11-06 | Phase 1.1.5：新增 §9.1 部署契约——`ModDiscovery` 只认一级子目录 + 各自 `manifest.json`，因此部署器必须递归还原目录树并逐文件校验远端 SHA-256；`deploy-apk-safe.ps1` 的平铺复制缺陷已修复 |
 | 2026-11-06 | Phase 1.1.4：**Loader 逻辑未改**。新增一个普通 manifest mod（`P114.RuntimeProbe`）作为可复现的端到端观察点，见 §12 |
 
 ---

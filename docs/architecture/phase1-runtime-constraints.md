@@ -300,3 +300,21 @@ Harmony。历史实验 T11/T12 被 `#if LEGACY_NATIVE_EXPERIMENTS` 整文件隔�
 - 旧脚本的卸载路径被 `-LegacyDestructiveInstall` 挡住，不传就只构建、不碰设备。
 
 完整契约与测试见 `docs/audit/phase1.1.4-report.md` §6。
+
+### 9.6 设备侧部署事实（Phase 1.1.5，E0 只读实测）
+
+在 MuMu / Android 12 / x86_64（`libnb.so` 翻译）目标上重新只读核实：
+
+| 项 | 观察值 | 对部署的意义 |
+| --- | --- | --- |
+| `su -c id` | `uid=0(root)` | 可用 root 在 `/data/data/<pkg>/files` 下建文件 |
+| `sha256sum` / `stat` / `mkdir` / `cp` / `chown` / `chmod` / `rm` | 全部存在（`/system/bin/*`） | 不需要假设 GNU 工具；也不依赖 `tar`/`rsync` |
+| `restorecon` | **不存在** | 不能靠它刷 SELinux 标签 |
+| `getenforce` | `Permissive` | 属主/权限（DAC）才是可读性的决定因素 |
+| app files 目录 | `drwxrwx--x u0_a152 u0_a152`（uid:gid `10152:10152`，mode `771`） | 部署后必须把属主改成 `10152:10152`，否则 app 读不到 |
+| Mods 目录 | 不存在 | 首次部署需要创建它并 chown 给 app uid |
+
+所以"文件已 push 到设备"并不等于"游戏进程能读到"：必须以 app uid 落地并用 `stat` 复核，
+`deploy-apk-safe.ps1` 在无法验证属主/权限时按失败处理。
+
+完整过程与证据见 `docs/audit/phase1.1.5-report.md`。

@@ -35,8 +35,8 @@
 | 3 | 设备上**已备份存档** | 复制 `/sdcard/Android/data/com.chucklefish.stardewvalley/files/Saves` 到电脑 | 未做 |
 | 4 | 用户明确批准"卸载原游戏 + 安装自签名测试包"（**会丢存档**，签名与原版不同） | 书面确认 | 未获得 |
 | 5 | 本地已构建基线 APK（回滚用） | `app/build/outputs/apk/debug/app-debug.apk`，SHA `65e1e2af…` | ✅（388,967,580 字节） |
-| 6 | `.tmp/phase0.5/refs/` 有 65 个程序集 | `(Get-ChildItem .tmp\phase0.5\refs -Filter *.dll).Count` = 65 | ✅ |
-| 7 | 私有 SDK 可用 | `.tmp/phase0.5/dotnet/dotnet.exe --list-sdks` | ✅（8.0.404） |
+| 6 | 游戏程序集 refs 目录有 65 个 `.dll` | `(Get-ChildItem .tmp\p113\refs -Filter *.dll).Count` = 65（`phase0.5\refs` 已随清理消失） | ✅（`.tmp/p113/refs`，65） |
+| 7 | 私有 SDK 可用 | `Tools/find-dotnet.ps1` 返回非空且 `--list-sdks` 非空 | ❌ **Phase 1.1.5 复核时本机无任何 SDK**（`C:\Program Files\dotnet` 只有 8.0 运行时；`.tmp/*/dotnet` 不存在），需先安装 .NET 8 SDK |
 | 8 | 测试包已生成 | `.tmp/phase0.5/out/sv.full.dll` + `assemblies.full.blob` + `mods/*.dll` | ✅（未安装） |
 | 9 | `adb` 可连该设备且 `su` 状态已知 | `adb devices -l`；`adb shell su -c id` | **不得假定 root** |
 

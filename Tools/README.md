@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | `ModInjector` | C# / net8.0 / Mono.Cecil | 把 Bootstrap 合并进 `StardewValley.dll`，并在指定的 `MainActivity` 方法首行插入调用 |
 | `AssemblyStore` | Python 3（无第三方依赖） | 读写 `assemblies.blob`（XABA v1 + XALZ/LZ4），把改好的程序集**原位替换**回去 |
-| `deploy-apk-safe.ps1` | PowerShell（ASCII） | **Phase 1.1.4 起的部署入口**：默认只读；安装需 `-InstallApproved`、推送需 `-PushModsApproved`；签名不一致/不可读时 fail-closed，**任何路径都不卸载、不清数据** |
+| `deploy-apk-safe.ps1` | PowerShell（ASCII） | **部署入口**：默认只读；安装需 `-InstallApproved`、推送需 `-PushModsApproved`；推送**递归**还原完整 Mods 目录树并逐文件校验远端 SHA-256；已存在相同内容跳过、不同内容 fail-closed（除非 `-OverwriteModsApproved`）；签名不一致/不可读时 fail-closed，**任何路径都不卸载、不清数据** |
 | `deploy-apk.ps1` | PowerShell（ASCII） | **已弃用/危险**：Phase 0 的"构建 → 卸载重装 → 用设备端 sha256 证明装的是这个包"。卸载会删存档；现在不传 `-LegacyDestructiveInstall` 就只构建、不碰设备 |
 | `device-precheck.ps1` | PowerShell（ASCII） | E0 只读设备预检（ABI/API/包信息/APK 哈希/残留文件），默认不改设备；`-ResolveAdbOnly` 只做 adb 定位自检 |
 | `find-dotnet.ps1` | PowerShell（ASCII） | 发现可用的 .NET SDK（`-Dotnet` → `$env:STARDEW_DOTNET` → `.tmp/*/dotnet` → `PATH`），要求 `--list-sdks` 非空 |
@@ -19,7 +19,7 @@
 | `tests/test_ci_offline.py` | Python 3 | CI 可跑的 13 项检查（语法/编码/夹具/schema/隐私/CI 结构） |
 | `tests/test_p114_probe.py` | Python 3 | P114 静态安全审计（46 项：默认探针路径无原生代码、T11/T12 已编译隔离、部署脚本无卸载路径） |
 | `tests/test_device_precheck.ps1` | PowerShell | adb 解析自测（10 项，不连设备） |
-| `tests/test_deploy_safe.ps1` | PowerShell | 部署门禁 fake adb/apksigner 自测（38 项，不连设备；断言危险命令未被调用） |
+| `tests/test_deploy_safe.ps1` | PowerShell | 部署门禁 fake adb 自测（95 项，不连设备）。fake adb **模拟设备文件系统**：断言远端目录树、每个文件 SHA-256、覆盖保护、staging 清理、UID/GID 校验、失败路径，并断言危险命令未被调用 |
 | `tests/run-all.ps1` | PowerShell | 一键跑全部本地套件并输出汇总表 |
 | `tests/toolchain.py` | Python 3 | 两个 Python 驱动共用的 SDK 发现（不写死用户目录） |
 | `privacy-scan.py` | Python 3 | 隐私/秘密扫描（用户目录、token、私钥、设备序列号） |
@@ -29,8 +29,14 @@
 ```powershell
 pwsh -NoProfile -File Tools/deploy-apk-safe.ps1                 # 只读预检 + 打印将要执行的命令
 pwsh -NoProfile -File Tools/deploy-apk-safe.ps1 -InstallApproved # 同签名覆盖安装（需批准）
-pwsh -NoProfile -File Tools/deploy-apk-safe.ps1 -PushModsApproved -ModsSourceDirectory <dir>
+pwsh -NoProfile -File Tools/deploy-apk-safe.ps1 -PushModsApproved -Serial <serial> -ModsSourceDirectory <完整 Mods 根目录>
 ```
+
+`-ModsSourceDirectory` 指的是**完整的 Mods 根目录**（不是某个 Mod 的子目录）。脚本会：
+递归枚举全部普通文件 → 按相对路径推到唯一 staging 目录 → **全部**远端 SHA-256 校验通过后
+才复制到 `/data/data/<pkg>/files/Mods` → 再次逐文件校验并检查属主/权限 → 清理 staging。
+目标已存在同路径文件时：内容相同跳过，内容不同 fail-closed（`-OverwriteModsApproved` 才覆盖）。
+它绝不清空或替换整个 Mods 目录，也不会删掉别的 Mod。
 
 它守住的是 Phase 0 那条教训的反面：**不要为了"证明装的是哪个包"而卸载玩家游戏**。
 已安装包与本地 APK 摘要一致时根本不需要重装；签名无法证明时脚本停下来要人工核验，
