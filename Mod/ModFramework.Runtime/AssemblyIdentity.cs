@@ -72,9 +72,13 @@ internal sealed class AssemblyClaim
     internal string StagedPath = "";
 
     /// <summary>
-    /// Content fingerprint of the staged snapshot (<c>sha256:…</c> or, when the runtime has no
-    /// SHA-256, the built-in <c>sha1:…</c> form). Recomputed immediately before the load so a
-    /// snapshot edited after staging is refused instead of being loaded.
+    /// Integrity record of the staged snapshot: always the <c>sha256:…</c> digest of the exact
+    /// bytes that were written, or empty when the claim has no snapshot.
+    ///
+    /// <para>Phase 1.1.3: this is <b>not</b> the deduplication key. The key may collide (real hash
+    /// collision, or the SHA-1 index form on a runtime without SHA-256) and is therefore never
+    /// recorded here; recomputing this value immediately before the load is what refuses a
+    /// snapshot edited after staging.</para>
     /// </summary>
     internal string SnapshotFingerprint = "";
 
@@ -330,59 +334,72 @@ internal sealed class HostAssemblyIdentity
         var loaded = AppDomain.CurrentDomain.GetAssemblies();
         for (var i = 0; i < loaded.Length; i++)
         {
-            var assembly = loaded[i];
-            if (assembly == null || assembly.IsDynamic)
+            var identity = From(loaded[i]);
+            if (identity != null)
             {
-                continue;
+                result.Add(identity);
             }
-            AssemblyName? name;
-            try
-            {
-                name = assembly.GetName();
-            }
-            catch (Exception)
-            {
-                continue;
-            }
-            if (name == null || string.IsNullOrEmpty(name.Name))
-            {
-                continue;
-            }
-
-            var identity = new HostAssemblyIdentity();
-            identity.SimpleName = name.Name!;
-            identity.VersionText = NormalizeVersion(name.Version);
-            identity.Culture = name.CultureName ?? "";
-            if (identity.Culture == "neutral")
-            {
-                identity.Culture = "";
-            }
-            identity.Assembly = assembly;
-
-            // The trimmed BCL has no AssemblyName.GetPublicKey() (verified by compiling against
-            // the game's own reference assemblies), so the token is the only strong-name identity
-            // the host can expose. The token is compared as bytes - never as a presence flag.
-            try
-            {
-                var token = name.GetPublicKeyToken();
-                identity.PublicKeyToken = token ?? Array.Empty<byte>();
-            }
-            catch (Exception)
-            {
-                identity.PublicKeyToken = Array.Empty<byte>();
-            }
-
-            try
-            {
-                identity.Location = assembly.Location ?? "";
-            }
-            catch (Exception)
-            {
-                identity.Location = "";
-            }
-            result.Add(identity);
         }
         return result;
+    }
+
+    /// <summary>
+    /// Identity of one loaded assembly, or <c>null</c> when it is dynamic or its name cannot be
+    /// read. Used by <see cref="Snapshot"/> and, in Phase 1.1.3, by the loader to check the
+    /// instance <c>Assembly.LoadFrom</c> actually returned against the preflighted claim.
+    /// </summary>
+    internal static HostAssemblyIdentity? From(Assembly? assembly)
+    {
+        if (assembly == null || assembly.IsDynamic)
+        {
+            return null;
+        }
+        AssemblyName? name;
+        try
+        {
+            name = assembly.GetName();
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+        if (name == null || string.IsNullOrEmpty(name.Name))
+        {
+            return null;
+        }
+
+        var identity = new HostAssemblyIdentity();
+        identity.SimpleName = name.Name!;
+        identity.VersionText = NormalizeVersion(name.Version);
+        identity.Culture = name.CultureName ?? "";
+        if (identity.Culture == "neutral")
+        {
+            identity.Culture = "";
+        }
+        identity.Assembly = assembly;
+
+        // The trimmed BCL has no AssemblyName.GetPublicKey() (verified by compiling against
+        // the game's own reference assemblies), so the token is the only strong-name identity
+        // the host can expose. The token is compared as bytes - never as a presence flag.
+        try
+        {
+            var token = name.GetPublicKeyToken();
+            identity.PublicKeyToken = token ?? Array.Empty<byte>();
+        }
+        catch (Exception)
+        {
+            identity.PublicKeyToken = Array.Empty<byte>();
+        }
+
+        try
+        {
+            identity.Location = assembly.Location ?? "";
+        }
+        catch (Exception)
+        {
+            identity.Location = "";
+        }
+        return identity;
     }
 
     internal static string NormalizeVersion(Version? version)

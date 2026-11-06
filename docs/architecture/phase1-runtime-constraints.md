@@ -124,7 +124,7 @@ Loader 在加载入口程序集之前**按声明逐个 `LoadFrom`**（两轮 fix
 - 因此契约程序集（`ModFramework.Runtime`）**绝不能**随 mod 打包：第二份副本会让
   `IModEntry` 变成另一个类型，Loader 会以 `MF0204` 拒绝（并给出"来自哪个程序集"的诊断）。
 
-### 4.4 快照加载：Phase 1.1.2 的结论
+### 4.4 快照加载：Phase 1.1.2 的结论，Phase 1.1.3 的修正
 
 `Assembly.LoadFrom(string)` 是唯一入口（§4.1），而"路径"本身是可变的：预检读完到加载之间，
 文件可以被替换或同长度原位改写。Phase 1.1.2 因此**不按 mod 声明的路径加载**，而是：
@@ -132,10 +132,22 @@ Loader 在加载入口程序集之前**按声明逐个 `LoadFrom`**（两轮 fix
 | 步骤 | 行为 | 依据 |
 | --- | --- | --- |
 | 读 | 一次读全文件进 buffer；身份/长度/摘要都来自这一个 buffer | A 级（源码 + 测试） |
-| 写 | 把同一个 buffer 写入 `<Mods>/.staging/<run>/<mod id>/<声明文件名>` | A 级 |
+| 写 | 把同一个 buffer 写入 `<Mods>/.staging/<run>/<mod id>/<声明文件名>`（同名已存在时追加 `~N`，永不复用路径） | A 级 |
 | 验 | 立刻读回快照**逐字节比较**（`ContentIdentity.VerifyExactBytes`） | A 级 |
-| 载 | `Assembly.LoadFrom(claim.StagedPath)`；加载前再校验长度 + 指纹 | A 级 |
-| 兜底 | 指纹不符 → 该 mod 失败（`MF0209` 语义），不加载 | A 级 |
+| 载 | `Assembly.LoadFrom(claim.StagedPath)`；加载前再校验长度 + **SHA-256 完整性摘要** | A 级 |
+| 兜底 | 摘要不符 / 文件消失 → 该 mod 失败（`MF0202`），不加载 | A 级 |
+
+Phase 1.1.3 补充的三条约束：
+
+| 主题 | 规则 | 依据 |
+| --- | --- | --- |
+| 去重 | `dedup key`（可碰撞，允许 SHA-1 索引形式）只找候选；命中后必须对**当前 claim 的 buffer**逐字节比较，`Same` 才共享；`Unverifiable` 直接失败 | A 级 |
+| 完整性 | 快照完整性**只用 SHA-256**；运行时算不出 SHA-256 → 该 claim `MF0209`（不落盘、不加载），不回退到 SHA-1 | A 级（桌面）／BLOCKED（真机 SHA-256 可用性） |
+| 身份 | `LoadFrom`/缓存/宿主复用返回的 `Assembly` 必须与 claim 预检身份一致，否则 `MF0210` 且不写成功缓存 | A 级 |
+
+`SHA256.HashData` 与 `File.ReadAllBytes` 在**目标引用程序集**（`.tmp/p113/refs` 的 65 个程序集，
+从 APK 的 XABA 容器解出）里存在，`-p:AndroidRefsDir=…` 编译通过（B 级：编译期证据）。
+真机 Mono 的**运行时**行为（算法实现是否被裁剪掉、异常类型、性能）未验证 → BLOCKED。
 
 事实与边界：
 

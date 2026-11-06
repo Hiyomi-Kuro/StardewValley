@@ -59,6 +59,8 @@ apktool.yml         → decoded/apktool.yml
 | Mod Framework：Manifest 发现 / 校验 / 依赖排序 / 加载 / 入口调用 | ✅ **离线实现完成**（宿主测试 283 项） |
 | Mod Framework：Phase 1.1 加固 | ✅ **离线实现完成**：裸 DLL 不执行 · 版本门禁 Fail-Closed · 加载前程序集身份预检 · 日志降级进报告（见 [`docs/audit/phase1.1-report.md`](docs/audit/phase1.1-report.md)） |
 | Mod Framework：Phase 1.1.1 预检正确性与安全加固 | ✅ **离线实现完成**：依赖失败不再误伤无关 mod · 内容相等改逐字节判定（去掉 FNV 回退）· 宿主匹配 Fail-Closed · PE/CLI 逐层边界 · 框架版本 Unknown/Invalid 分离 · 报告与日志脱敏（见 [`docs/audit/phase1.1.1-report.md`](docs/audit/phase1.1.1-report.md)） |
+| Mod Framework：Phase 1.1.2 程序集加载完整性 | ✅ **离线实现完成**：预检字节写入私有快照并只从快照 `LoadFrom` · 加载前二次校验 · 不动点显式收敛/耗尽（`MF0208`）· ECMA-335 公钥标志与 Blob 形状校验（见 [`docs/audit/phase1.1.2-report.md`](docs/audit/phase1.1.2-report.md)） |
+| Mod Framework：Phase 1.1.3 快照去重完整性与指纹抗碰撞 | ✅ **离线实现完成**：fingerprint 只做候选索引（完整字节比较才共享）· 一个键下可存多份不同内容 · 快照完整性用独立 SHA-256（无 SHA-256 → Fail-Closed）· `LoadFrom` 返回身份核对（`MF0210`）（见 [`docs/audit/phase1.1.3-report.md`](docs/audit/phase1.1.3-report.md)） |
 | Mod Framework：ARM64 真机验证 | ❌ **BLOCKED**（无物理设备；只有 x86_64 模拟器） |
 | Mod Framework：设备上验证 `AssemblyName` 元数据读取与 SHA-256 | ❌ **BLOCKED**（只有编译期证据，见 phase1.1 报告 §3） |
 | Harmony / 方法补丁 / 事件钩子 / SMAPI 兼容 | ❌ **未实现**（Phase 2 及以后） |
@@ -78,6 +80,9 @@ apktool.yml         → decoded/apktool.yml
 | 依赖失败优先、冲突重算 | 依赖了失败 mod 的下游先被排除，再重新计算冲突；不会把无关健康 mod 一起拒绝（`preflight-rounds=` 可验证收敛） |
 | 内容身份 | "内容相同"只由**逐字节比较**决定；SHA-256 仅用于快速否定，FNV/CRC 不再是共享许可。无法比较 → 拒绝（Fail-Closed） |
 | 宿主程序集复用 | 必须身份四项（Name/Version/Culture/公钥字节）全等 + 宿主文件可读 + 内容逐字节相同；否则 `MF0207`，不再"复用 + warning" |
+| 快照去重不是共享授权 | 只从**快照**加载（Phase 1.1.2）；去重键（`sha256:`，无 SHA-256 时退到 `sha1:`）**只找候选**，命中后必须对当前 claim 自己的字节逐字节比较，`Same` 才共享；一个键下可以有多份不同内容的快照（Phase 1.1.3） |
+| 快照完整性独立于去重键 | 加载前用**独立 SHA-256 摘要**校验快照（长度 + 全文件）；运行时没有 SHA-256 → 该 mod `MF0209`，不落盘也不加载，不回退 SHA-1 |
+| 加载对象身份核对 | `LoadFrom` / 缓存命中 / 宿主复用返回的 `Assembly` 身份与 claim 预检身份（Name/Version/Culture/公钥 Token）不一致 → `MF0210`，不初始化、不记成功（防御纵深；主防线是"只加载被批准的字节"） |
 | 日志降级可见 | `logs/<id>.log` 写不进去时报告记 `log-status=degraded` + 异常类型（不含路径），mod 状态仍是 `Initialized` |
 | 报告/日志不含绝对路径 | `locate=` / `mods-root=` / `dir=` 只保留末段或包内相对名；异常消息里的绝对路径脱敏为 `<path>` |
 

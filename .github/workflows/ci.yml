@@ -76,6 +76,11 @@ jobs:
       #                   fail-closed matching (C), PE/CLI boundary and fuzz samples (D),
       #                   framework-version Known/Unknown/Invalid (E), report/log path
       #                   redaction (F).
+      #   * Phase 1.1.2 - snapshot binding (TOCTOU), ContentIdentity fault branches, host share,
+      #                   ECMA-335 key flags, fixed-point convergence/exhaustion;
+      #   * Phase 1.1.3 - snapshot deduplication integrity: a forced fingerprint collision (A),
+      #                   cross-simple-name / private-assembly collisions end to end (B) and the
+      #                   independent SHA-256 snapshot verifier with its fail-closed branches (C).
       # The parser differential over the 65 reference assemblies is local-only (those files may
       # not be uploaded), so it is listed as SKIPPED below - never as passed.
       - name: loader host tests (no game assemblies)

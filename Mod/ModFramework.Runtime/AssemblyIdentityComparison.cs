@@ -94,6 +94,71 @@ internal static class AssemblyIdentityComparison
         return false;
     }
 
+    /// <summary>
+    /// Compares a preflighted file identity with the identity of an assembly that has already been
+    /// loaded (Phase 1.1.3). This is the defensive check the loader performs on the value
+    /// <c>Assembly.LoadFrom</c> actually returned.
+    ///
+    /// <para>It differs from <see cref="SameIdentity(AssemblyFileIdentity, HostAssemblyIdentity, out string)"/>
+    /// in exactly one way: the public-key side is compared through the <b>token representation</b>
+    /// on both sides. A loaded assembly exposes only its token on the trimmed BCL
+    /// (<c>AssemblyName.GetPublicKey()</c> does not exist there), while a file normally carries the
+    /// full key, so a literal key-vs-key comparison would reject every strong-named assembly.
+    /// The token is derived from the file's full key with the ECMA-335 rule already implemented by
+    /// <see cref="PublicKeyToken.Derive"/> - the same derivation the CLR uses - so the two sides
+    /// describe the same signing identity.</para>
+    ///
+    /// <para>Every other field is compared strictly: the simple name (case-insensitively, like the
+    /// binder), the exact four-part version, and the culture with <c>neutral</c> normalized.</para>
+    /// </summary>
+    internal static bool SameLoadedIdentity(
+        AssemblyFileIdentity expected,
+        HostAssemblyIdentity actual,
+        out string difference)
+    {
+        if (!SameName(expected.Name, actual.SimpleName))
+        {
+            difference = "different simple name (" + expected.Name + " vs " + actual.SimpleName + ")";
+            return false;
+        }
+        if (!string.Equals(expected.VersionText, actual.VersionText, StringComparison.Ordinal))
+        {
+            difference = "different version (" + expected.VersionText + " vs " + actual.VersionText + ")";
+            return false;
+        }
+        if (!SameCulture(expected.Culture, actual.Culture))
+        {
+            difference = "different culture";
+            return false;
+        }
+
+        var expectedToken = expected.PublicKeyToken.Length > 0
+            ? expected.PublicKeyToken
+            : PublicKeyToken.Derive(expected.PublicKey);
+        var actualToken = actual.PublicKeyToken.Length > 0
+            ? actual.PublicKeyToken
+            : PublicKeyToken.Derive(actual.PublicKey);
+
+        if (expectedToken.Length == 0 && actualToken.Length == 0)
+        {
+            difference = "";
+            return true;        // both unsigned
+        }
+        if (expectedToken.Length > 0 && actualToken.Length > 0)
+        {
+            if (BytesEqual(expectedToken, actualToken))
+            {
+                difference = "";
+                return true;
+            }
+            difference = "different public key token";
+            return false;
+        }
+
+        difference = "the public key token is present on one side only";
+        return false;
+    }
+
     private static bool SameFileKey(AssemblyFileIdentity left, AssemblyFileIdentity right, out string difference)
     {
         if (left.PublicKey.Length > 0 && right.PublicKey.Length > 0)

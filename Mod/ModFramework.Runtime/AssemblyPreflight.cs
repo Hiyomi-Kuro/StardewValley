@@ -178,6 +178,14 @@ internal sealed class AssemblyPreflightResult
 ///    filter). If they do, one representative is chosen deterministically and loaded once. If
 ///    they do not, every owner is rejected (<c>MF0206</c>) - never "first loaded wins".
 /// </summary>
+/// <remarks>
+/// Phase 1.1.3: grouping by simple name means two <i>different</i> simple names are never compared
+/// with each other here. That is correct for conflicts but it is not a content gate: the loader
+/// additionally relies on <see cref="AssemblyStagingArea"/> never handing a claim an artifact that
+/// was not proven byte-identical to <i>that claim's</i> buffer, and on
+/// <see cref="AssemblyIdentityComparison.SameLoadedIdentity"/> checking what
+/// <c>Assembly.LoadFrom</c> actually returned.
+/// </remarks>
 internal static class AssemblyPreflight
 {
     /// <summary>
@@ -546,6 +554,37 @@ internal static class AssemblyPreflight
         }
 
         // 3. Same identity and same content: one deterministic representative, loaded once.
+        //
+        // Phase 1.1.3: every claim is loaded from the representative's snapshot, which is only
+        // legitimate when that snapshot really holds this claim's own bytes. The staging area
+        // normally hands identical content the same path, so this loop is a no-op; if two
+        // different paths do exist for provably identical *declared* content, the staged files
+        // themselves are compared before they are unified - never assumed equal because their
+        // claims were.
+        for (var i = 1; i < ordered.Count; i++)
+        {
+            var staged = ordered[i];
+            if (canonical.StagedPath.Length == 0 || staged.StagedPath.Length == 0)
+            {
+                continue;
+            }
+            if (string.Equals(staged.StagedPath, canonical.StagedPath, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            ContentVerdict stagedVerdict;
+            string stagedReason;
+            stagedVerdict = ContentIdentity.CompareFiles(
+                staged.StagedPath, staged.Length, canonical.StagedPath, canonical.Length, out stagedReason);
+            if (stagedVerdict != ContentVerdict.Same)
+            {
+                ConflictWithinMods(simpleName, ordered, result,
+                    "the snapshots of two identical declarations could not be shown to be identical: " +
+                    stagedReason);
+                return;
+            }
+        }
+
         for (var i = 0; i < ordered.Count; i++)
         {
             var claim = ordered[i];

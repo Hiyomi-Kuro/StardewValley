@@ -146,17 +146,38 @@ internal static class ContentIdentity
     /// </summary>
     internal static bool VerifyExactBytes(string path, byte[] expected, out string error)
     {
-        error = "";
+        var verdict = Compare(path, expected, false, out error);
+        return verdict == ContentVerdict.Same;
+    }
+
+    /// <summary>
+    /// Compares an <b>already existing</b> file against bytes that are in memory (Phase 1.1.3).
+    ///
+    /// This is what decides a snapshot deduplication hit: the candidate staged file of the same
+    /// length is compared byte for byte against the <i>current</i> claim's own buffer. A digest is
+    /// never consulted here, so a collision in the deduplication key cannot turn two different
+    /// files into one shared artifact.
+    ///
+    /// <para>Unlike <see cref="VerifyExactBytes"/>, this comparison goes through
+    /// <see cref="OpenForTests"/>: the file was created by an earlier claim and may have been
+    /// changed since, which is exactly what the seam models.</para>
+    /// </summary>
+    internal static ContentVerdict CompareFileToBuffer(string path, byte[] expected, out string reason)
+    {
+        return Compare(path, expected, true, out reason);
+    }
+
+    private static ContentVerdict Compare(string path, byte[] expected, bool useSeam, out string reason)
+    {
+        reason = "";
         Stream? stream = null;
         try
         {
-            // Deliberately not Open(): this compares a file the loader itself just created, so the
-            // test seam (which models a third party changing a declared file) must not apply.
-            stream = File.OpenRead(path);
+            stream = useSeam ? Open(path) : File.OpenRead(path);
             if (stream.Length != expected.Length)
             {
-                error = "the file is " + stream.Length + " bytes, expected " + expected.Length;
-                return false;
+                reason = "the file is " + stream.Length + " bytes, expected " + expected.Length;
+                return ContentVerdict.Different;
             }
 
             var buffer = new byte[BufferSize];
@@ -167,15 +188,15 @@ internal static class ContentIdentity
                 var read = ReadFully(stream, buffer, want);
                 if (read != want)
                 {
-                    error = "the file ended before its recorded length";
-                    return false;
+                    reason = "the file ended before its recorded length";
+                    return ContentVerdict.Unverifiable;
                 }
                 for (var i = 0; i < want; i++)
                 {
                     if (buffer[i] != expected[offset + i])
                     {
-                        error = "the contents differ at offset " + (offset + i);
-                        return false;
+                        reason = "the contents differ at offset " + (offset + i);
+                        return ContentVerdict.Different;
                     }
                 }
                 offset += want;
@@ -183,15 +204,15 @@ internal static class ContentIdentity
 
             if (stream.ReadByte() != -1)
             {
-                error = "the file has more bytes than expected";
-                return false;
+                reason = "the file has more bytes than expected";
+                return ContentVerdict.Unverifiable;
             }
-            return true;
+            return ContentVerdict.Same;
         }
         catch (Exception ex)
         {
-            error = PathScrubber.Describe(ex);
-            return false;
+            reason = PathScrubber.Describe(ex);
+            return ContentVerdict.Unverifiable;
         }
         finally
         {

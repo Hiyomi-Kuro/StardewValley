@@ -74,6 +74,11 @@ internal static class Program
                 // Phase 1.1.2: snapshot binding (TOCTOU), ContentIdentity fault branches, the
                 // positive host-share path, ECMA-335 assembly flags and fixed-point convergence.
                 Phase112Tests.Run(runner, fixtureDir);
+                // Phase 1.1.3: snapshot deduplication integrity (a fingerprint is a candidate
+                // index, never a sharing permission), cross-simple-name and private-assembly
+                // collisions, the independent snapshot integrity verifier and the post-load
+                // assembly identity check.
+                Phase113Tests.Run(runner, fixtureDir);
                 if (helloWorldDir.Length > 0)
                 {
                     HostTests.HelloWorld(runner, helloWorldDir);

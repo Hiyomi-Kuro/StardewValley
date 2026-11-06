@@ -55,6 +55,14 @@ internal static class ErrorCodes
     /// </summary>
     internal const string AssemblyStagingFailed = "MF0209";
 
+    /// <summary>
+    /// Phase 1.1.3: the assembly that was handed back (a fresh <c>LoadFrom</c>, a cached instance
+    /// or a reused host instance) does not carry the identity the claim was preflighted with. The
+    /// mod is not initialized and the load is not recorded as a success for that claim. This is a
+    /// post-load <i>detection</i> code: the primary gate is that only preflighted bytes are loaded.
+    /// </summary>
+    internal const string AssemblyLoadIdentityMismatch = "MF0210";
+
     // ---- entry validation -----------------------------------------------------
     internal const string EntryTypeMissing = "MF0301";
     internal const string EntryTypeNotPublic = "MF0302";
@@ -133,6 +141,7 @@ internal static class ErrorCodes
             case HostAssemblyConflict: return "a mod assembly collides with an assembly already loaded by the host";
             case PreflightNotConverged: return "the assembly preflight did not reach a stable state, so no mod was loaded";
             case AssemblyStagingFailed: return "the preflighted bytes could not be snapshotted, so the approved bytes cannot be loaded";
+            case AssemblyLoadIdentityMismatch: return "the loaded assembly does not have the identity the preflight approved";
             case EntryTypeMissing: return "entryType does not exist in the entry assembly";
             case EntryTypeNotPublic: return "entryType is not public";
             case EntryTypeAbstract: return "entryType is abstract";

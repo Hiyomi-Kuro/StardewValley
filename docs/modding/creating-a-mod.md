@@ -194,6 +194,8 @@ python Tools/tests/test_loader.py --dotnet dotnet
 | `MF0118` | `entryAssembly` 写成了路径，或不是 `.dll` |
 | `MF0201` | dll 没拷进包目录，或文件名与 `entryAssembly` 不一致 |
 | `MF0203` | 文件被改名了（程序集内部名仍是旧名） |
+| `MF0209` | 预检字节写不成快照（磁盘/预算问题，或运行时没有 SHA-256） |
+| `MF0210` | 加载出来的程序集身份与预检身份不一致（多见于包内 dll 在运行期被别的进程改写） |
 | `MF0204` | mod 包里带了第二份 `ModFramework.Runtime.dll` |
 | `MF0305` | 忘了 `: IModEntry` |
 | `MF0307` | 只写了带参数的构造函数 |

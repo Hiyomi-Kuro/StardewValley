@@ -79,6 +79,7 @@ Loader.Run(modsRoot)
 │   └── LoadAndInitialize：
 │       ├── privateAssemblies（按声明序，走预检给出的 canonical 路径）→ MF0202
 │       ├── 入口程序集（同身份共享时复用已加载实例）      → MF0202
+│       ├── 加载/复用对象的身份 == claim 预检身份？       → MF0210（Phase 1.1.3）
 │       ├── 程序集名 == 文件名？            → MF0203
 │       ├── entryType 存在且合法            → MF0301..MF0307
 │       ├── Activator.CreateInstance        → MF0308
@@ -163,13 +164,47 @@ Phase 1.1.2 让"预检批准的字节"成为**唯一的加载源**：
    只有比较通过，claim 才会拿到 `StagedPath` / `SnapshotFingerprint`。
 3. `Assembly.LoadFrom` 的实参永远是 `claim.StagedPath`。mod 声明的路径之后只用于
    `ContentIdentity` 的字节比较，以及预检阶段"文件在读取期间变了"的判定。
-4. 加载前一刻再校验一次快照（长度 + 指纹：有 SHA-256 用 `sha256:`，运行时没有则用内置
-   `sha1:` 形式）。指纹不匹配 → 该 mod 以 `MF0209` 语义的错误失败，**不加载**。
-5. 同一内容只落一份快照（按指纹去重）；同一 canonical artifact 只 `LoadFrom` 一次
+4. 加载前一刻再校验一次快照（长度 + **SHA-256 完整性摘要**）。摘要不一致 → 该 mod 以
+   `MF0202`（"预检字节无法加载"）失败，**不加载**；`MF0209` 保留给预检阶段"写快照失败"。
+5. 同一内容只落一份快照；同一 canonical artifact 只 `LoadFrom` 一次
    （`s_loadedByPath` 的键仍是"实际加载的文件"，现在是快照路径）。
 
 报告因此能区分三个对象：声明文件（`file=`）、快照（`snapshot=`）、最终加载对象
 （`assembly-load=` 与 `canonical=`），且不含任何绝对路径。
+
+### 3.3 去重是候选索引，不是共享授权（Phase 1.1.3）
+
+Phase 1.1.2 的暂存区把"一个指纹"映射到"一个路径"，命中即共享，于是**摘要相等被当成了
+字节相等**。Phase 1.1.3 把三个问题彻底分开：
+
+| 概念 | 函数 | 允许碰撞 | 失败策略 |
+| --- | --- | --- | --- |
+| **Deduplication key** | `AssemblyStagingArea.ComputeDedupKey`（优先 `sha256:`，运行时无 SHA-256 时退到内置 `sha1:`，两者都没有则不做索引） | **是**（SHA-1 不是抗碰撞证明） | 键只用来找候选；找不到就新建 |
+| **Snapshot integrity** | `AssemblyStagingArea.VerifySnapshot`（**只用 SHA-256**，无 SHA-1 回退） | 否 | 算不出强摘要 → 该 claim 失败（fail-closed） |
+| **Assembly identity** | `AssemblyIdentityComparison.SameLoadedIdentity`（Name/Version/Culture/PublicKeyToken） | 否 | 不一致 → 该 mod `MF0210`，不初始化、不记成功 |
+
+去重索引因此改成 `dedup key -> List<SnapshotEntry>`，每个 `SnapshotEntry` 保存
+`Path` / `Length` / `IntegrityDigest`。命中一个键之后的决定顺序是：
+
+1. 候选长度不同 → 直接跳过（长度不同不可能是同一内容）；
+2. 长度相同 → `ContentIdentity.CompareFileToBuffer` 用**当前 claim 自己的 buffer**逐字节比较：
+   - `Same` → 共享该 artifact（只落一份、只 `LoadFrom` 一次）；
+   - `Different` → 继续看下一个候选（同一个键下可以有多份不同内容）；
+   - `Unverifiable`（IO 异常 / 提前 EOF / 文件在比较中变化）→ **该 claim 失败**，不猜。
+3. 没有候选匹配 → 新建 artifact。路径永不复用（同名已存在时追加 `~N` 后缀），
+   因此"同一 mod id + 同一声明名但内容不同"和"不同 mod id + 同名"都不会互相覆盖。
+
+关键点：比较的右手边永远是**当前 claim 的原始字节**，不是另一个 claim 的 staged path。
+Phase 1.1.2 的 Preflight 只在**同一 SimpleName 分组内**比较声明文件，跨 SimpleName 的两组
+不会互相比较；因此"分组前就已发生的暂存别名"不会被 Preflight 发现。Phase 1.1.3 把
+"每个 claim 的 staged 字节 == 该 claim 自己的字节"变成暂存区的**写入期不变量**，
+并在 `ResolveWithinMods` 里对"同内容共享"再加一次 staged 文件之间的完整字节比较。
+
+防御纵深（不是主防线）：`Loader.TryResolveClaim` 在三条路径上——复用宿主实例、命中
+`s_loadedByPath` 缓存、新 `LoadFrom`——都核对返回的 `Assembly` 身份与 claim 预检身份；
+不一致则 `MF0210`，且**不写入缓存**。加载后核对无法阻止程序集已经进入进程，所以主防线
+仍然是"只有被批准的字节才可能被加载"。
+
 
 不做的两件事，此处写清楚：
 
@@ -208,6 +243,10 @@ Discovered → ManifestValidated → DependenciesResolved → AssemblyLoaded
 | 程序集同名冲突 | 冲突组内**所有直接拥有者** | `MF0206`，绝不 first-loaded-wins；依赖失败者不参与 |
 | 宿主已经加载了同名程序集 | 该 mod | 身份逐项 + 内容逐字节证明后才复用，否则 `MF0207` |
 | 入口 dll 缺失/改名 | 仅该 mod | `MF0201`/`MF0203` |
+| 预检字节无法快照（写失败 / 超预算 / 无 SHA-256） | 仅该 mod | `MF0209`，不加载，不回退到声明路径 |
+| 快照在加载前被改动 / 删除 | 仅该 mod | `MF0202`（消息里点名 snapshot），不加载 |
+| 同一去重键下有不同内容 | 各自独立 artifact | 键只找候选，逐字节比较决定共享（Phase 1.1.3） |
+| `LoadFrom` 返回的身份与 claim 不一致 | 仅该 mod | `MF0210`，不初始化、不写成功缓存 |
 | 入口类型不合法 | 仅该 mod | `MF0301..MF0307` |
 | 构造函数/`Initialize` 抛异常 | 仅该 mod + 其下游 | 每阶段 `try/catch`，异常写进该 mod 日志 |
 | 日志写失败 | 不影响 mod | `ModLogger` 熔断，报告里记 warning |
@@ -273,3 +312,4 @@ Bootstrap（注入进 `StardewValley.dll` 的 IL）只做四件事：
 | 2026-11-05 | Phase 1.1：裸 DLL 不执行、三态版本门禁、加载前程序集预检、日志降级进报告 |
 | 2026-11-05 | Phase 1.1.1：预检不动点（依赖优先、冲突重算、事件按最终归类过滤）、内容相等改为逐字节判定、宿主匹配 Fail-Closed、PE/CLI 逐层边界、框架版本 Unknown/Invalid 分离、报告与日志脱敏 |
 | 2026-11-06 | Phase 1.1.2：预检字节写入私有快照并只从快照 `LoadFrom`（加载前二次校验指纹）、不动点显式 Converged/Exhausted 且未收敛时 Fail-Closed（`MF0208`）、ECMA-335 PublicKey 标志与 Blob 形状校验（`MF0205`） |
+| 2026-11-06 | Phase 1.1.3：去重键降级为候选索引（`dedup key -> List<SnapshotEntry>`，命中后逐字节比较才共享）、快照完整性改用独立 SHA-256 摘要且无 SHA-256 时 Fail-Closed、`LoadFrom` 返回对象与 claim 身份核对（`MF0210`）、暂存路径永不复用（同名追加 `~N`） |

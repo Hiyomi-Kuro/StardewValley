@@ -922,10 +922,11 @@ public static class Loader
                         continue;
                     }
                     Assembly privateAssembly;
+                    string privateCode;
                     string privateError;
-                    if (!TryResolveClaim(claim, report, out privateAssembly, out privateError))
+                    if (!TryResolveClaim(claim, report, out privateAssembly, out privateCode, out privateError))
                     {
-                        record.Fail(ErrorCodes.AssemblyLoadFailed, privateError);
+                        record.Fail(privateCode, privateError);
                         initialized[manifest.Id] = false;
                         return;
                     }
@@ -934,10 +935,11 @@ public static class Loader
             }
 
             Assembly assembly;
+            string entryCode;
             string entryError;
-            if (!TryResolveClaim(entryClaim, report, out assembly, out entryError))
+            if (!TryResolveClaim(entryClaim, report, out assembly, out entryCode, out entryError))
             {
-                record.Fail(ErrorCodes.AssemblyLoadFailed, entryError);
+                record.Fail(entryCode, entryError);
                 initialized[manifest.Id] = false;
                 return;
             }
@@ -1104,17 +1106,37 @@ public static class Loader
     /// <summary>
     /// Materializes one preflight-approved claim exactly once per canonical path.
     /// <c>Assembly.LoadFrom</c> is only ever reached here, i.e. after the preflight completed.
+    ///
+    /// <para>Phase 1.1.3: every path that hands back an <see cref="Assembly"/> - host reuse, the
+    /// per-path cache and a fresh <c>LoadFrom</c> - first checks that the instance carries the
+    /// identity the claim was preflighted with. A mismatch is never cached as a success for that
+    /// claim: the mod fails with <see cref="ErrorCodes.AssemblyLoadIdentityMismatch"/>. This is
+    /// defence in depth only - the authoritative gate is that only preflighted bytes reach this
+    /// method at all - because a mismatched load has already entered the process.</para>
     /// </summary>
-    private static bool TryResolveClaim(AssemblyClaim claim, LoadReport report, out Assembly assembly, out string error)
+    private static bool TryResolveClaim(
+        AssemblyClaim claim,
+        LoadReport report,
+        out Assembly assembly,
+        out string code,
+        out string error)
     {
         assembly = null!;
+        code = "";
         error = "";
 
         if (claim.Resolution == AssemblyResolution.ShareFromHost)
         {
             if (claim.HostAssembly == null)
             {
+                code = ErrorCodes.HostAssemblyConflict;
                 error = "the already loaded host assembly \"" + claim.Identity.Name + "\" is no longer present";
+                return false;
+            }
+            if (!VerifyLoadedIdentity(claim, claim.HostAssembly, out error))
+            {
+                code = ErrorCodes.AssemblyLoadIdentityMismatch;
+                error = claim.DeclaredName + ": " + error;
                 return false;
             }
             assembly = claim.HostAssembly;
@@ -1126,6 +1148,10 @@ public static class Loader
         // preflight cannot change what is loaded.
         if (claim.StagedPath.Length == 0 || claim.SnapshotFingerprint.Length == 0)
         {
+            // Deliberately MF0202, not MF0209: Phase 1.1.2's delivered contract is that "the
+            // approved bytes cannot be loaded at load time" is a load failure, while MF0209 stays
+            // the preflight-time staging failure. Phase 1.1.3 does not renumber either.
+            code = ErrorCodes.AssemblyLoadFailed;
             error = claim.DeclaredName + ": " + ErrorCodes.Describe(ErrorCodes.AssemblyStagingFailed) +
                     " (the claim has no snapshot)";
             return false;
@@ -1135,6 +1161,15 @@ public static class Loader
         Assembly? cached;
         if (s_loadedByPath.TryGetValue(path, out cached) && cached != null)
         {
+            // The cache is keyed by canonical artifact, so a hit still has to answer the same
+            // identity question as a fresh load - otherwise a poisoned entry would answer for
+            // every later claim that shares the path.
+            if (!VerifyLoadedIdentity(claim, cached, out error))
+            {
+                code = ErrorCodes.AssemblyLoadIdentityMismatch;
+                error = claim.DeclaredName + ": " + error;
+                return false;
+            }
             assembly = cached;
             return true;
         }
@@ -1150,8 +1185,9 @@ public static class Loader
         // Consistency check of the snapshot itself, immediately before it is used. This narrows -
         // it does not close - the window between "checked" and "loaded"; see AssemblyStagingArea.
         string snapshotError;
-        if (!AssemblyStagingArea.VerifyStagedFile(path, claim.SnapshotFingerprint, claim.Length, out snapshotError))
+        if (!AssemblyStagingArea.VerifySnapshot(path, claim.SnapshotFingerprint, claim.Length, out snapshotError))
         {
+            code = ErrorCodes.AssemblyLoadFailed;
             error = claim.DeclaredName + ": " + ErrorCodes.Describe(ErrorCodes.AssemblyStagingFailed) +
                     " (" + snapshotError + ")";
             return false;
@@ -1163,7 +1199,18 @@ public static class Loader
         }
         catch (Exception ex)
         {
+            code = ErrorCodes.AssemblyLoadFailed;
             error = claim.DeclaredName + ": " + DescribeException(ex);
+            return false;
+        }
+
+        // Defence in depth: the instance that was actually loaded must be the assembly the claim
+        // was preflighted as. A failure here is *not* recorded in the path cache, so it cannot
+        // become another claim's "successful" load either.
+        if (!VerifyLoadedIdentity(claim, assembly, out error))
+        {
+            code = ErrorCodes.AssemblyLoadIdentityMismatch;
+            error = claim.DeclaredName + ": " + error;
             return false;
         }
 
@@ -1171,6 +1218,31 @@ public static class Loader
         report.AddLine("assembly-load=" + claim.ModId + " file=" + claim.DeclaredName +
                        " canonical=" + claim.CanonicalModId +
                        " snapshot=" + (claim.SnapshotFingerprint.Length > 0 ? claim.SnapshotFingerprint : "none"));
+        return true;
+    }
+
+    /// <summary>
+    /// Compares the identity of a loaded instance with the identity the claim was preflighted
+    /// with (name, version, culture, public-key token). Never used to <i>authorize</i> a load; it
+    /// only refuses to treat a mismatch as this claim's successful load.
+    /// </summary>
+    private static bool VerifyLoadedIdentity(AssemblyClaim claim, Assembly assembly, out string error)
+    {
+        error = "";
+        var identity = HostAssemblyIdentity.From(assembly);
+        if (identity == null)
+        {
+            error = "the loaded assembly has no readable identity";
+            return false;
+        }
+
+        string difference;
+        if (!AssemblyIdentityComparison.SameLoadedIdentity(claim.Identity, identity, out difference))
+        {
+            error = "the loaded assembly is \"" + identity.Describe() + "\" but this claim was preflighted as \"" +
+                    claim.IdentityText + "\" (" + difference + ")";
+            return false;
+        }
         return true;
     }
 
