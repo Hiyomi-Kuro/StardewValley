@@ -19,10 +19,15 @@ app/                                          唯一的模块：内容 + 构建�
 Mod/                                          Mod Framework 的 C# 工程（.NET 8）
   ModFramework.Runtime/                       在游戏进程内跑的框架：契约 + Manifest + 依赖 + Loader
   ExampleMod.HelloWorld/                      参考 mod（manifest.json + IModEntry 实现）
-  MonoRuntimeProbe*/                          Phase 0 的运行时探针（诊断用，需显式启动；Loader 不再自动调用）
+  P114.RuntimeProbe/                          Phase 1.1.4 的运行时诊断 mod（普通 manifest mod；默认不部署）
+  P114.RuntimeProbe.Dependency/               上面的私有依赖 fixture（无 manifest.json）
+  P114.RuntimeProbe.Fixtures/                 Assembly.LoadFrom 研究用 fixture（参数化构建）
+  MonoRuntimeProbe*/                          Phase 0 的运行时探针（安全入口 RunSafe；Loader 不再自动调用）
 Tools/                                        构建期工具与测试
   ModInjector/                                IL 注入：把 Bootstrap 合并进 StardewValley.dll
   AssemblyStore/                              assemblies.blob 的提取 / 原位替换 / 校验
+  find-dotnet.ps1                             发现可用的 .NET SDK（不写死用户路径）
+  deploy-apk-safe.ps1                         非破坏性部署门禁（默认只读；安装/推送需显式批准）
   tests/                                      离线测试套件（见下）
 docs/
   modding/                                    Manifest 规范、写一个 mod
@@ -61,6 +66,7 @@ apktool.yml         → decoded/apktool.yml
 | Mod Framework：Phase 1.1.1 预检正确性与安全加固 | ✅ **离线实现完成**：依赖失败不再误伤无关 mod · 内容相等改逐字节判定（去掉 FNV 回退）· 宿主匹配 Fail-Closed · PE/CLI 逐层边界 · 框架版本 Unknown/Invalid 分离 · 报告与日志脱敏（见 [`docs/audit/phase1.1.1-report.md`](docs/audit/phase1.1.1-report.md)） |
 | Mod Framework：Phase 1.1.2 程序集加载完整性 | ✅ **离线实现完成**：预检字节写入私有快照并只从快照 `LoadFrom` · 加载前二次校验 · 不动点显式收敛/耗尽（`MF0208`）· ECMA-335 公钥标志与 Blob 形状校验（见 [`docs/audit/phase1.1.2-report.md`](docs/audit/phase1.1.2-report.md)） |
 | Mod Framework：Phase 1.1.3 快照去重完整性与指纹抗碰撞 | ✅ **离线实现完成**：fingerprint 只做候选索引（完整字节比较才共享）· 一个键下可存多份不同内容 · 快照完整性用独立 SHA-256（无 SHA-256 → Fail-Closed）· `LoadFrom` 返回身份核对（`MF0210`）（见 [`docs/audit/phase1.1.3-report.md`](docs/audit/phase1.1.3-report.md)） |
+| Mod Framework：Phase 1.1.4 运行时表征与非破坏性部署 | ⚠️ **部分完成**：安全探针入口 `RunSafe`（T11/T12 移出默认编译）· P114 诊断 mod 走真实 Loader 链路 · 部署脚本改为默认只读 + 双批准 + 签名门禁 · 桌面证据齐备；**MonoVM 上运行仍待批准，ARM64 真机 BLOCKED**（见 [`docs/audit/phase1.1.4-report.md`](docs/audit/phase1.1.4-report.md)） |
 | Mod Framework：ARM64 真机验证 | ❌ **BLOCKED**（无物理设备；只有 x86_64 模拟器） |
 | Mod Framework：设备上验证 `AssemblyName` 元数据读取与 SHA-256 | ❌ **BLOCKED**（只有编译期证据，见 phase1.1 报告 §3） |
 | Harmony / 方法补丁 / 事件钩子 / SMAPI 兼容 | ❌ **未实现**（Phase 2 及以后） |
@@ -96,7 +102,7 @@ apktool.yml         → decoded/apktool.yml
 | Android SDK `build-tools` | 需要 `aapt2`、`zipalign`、`apksigner`；优先 35.0.0，否则取最高版本 |
 | `ANDROID_HOME` | 可不设（依次找 `ANDROID_HOME` → `ANDROID_SDK_ROOT` → `%LOCALAPPDATA%\Android\Sdk`） |
 | 网络 | 首次构建下载 Gradle 发行包与 Kotlin/apktool 依赖（之后走缓存） |
-| .NET SDK 8（只有改 `Mod/` 或跑 Loader 测试时需要） | 本机可用项目私有 SDK：`.tmp/phase0.5/dotnet/dotnet.exe`；系统 SDK 也行 |
+| .NET SDK 8+（只有改 `Mod/` 或跑 Loader 测试时需要） | 必须是**带 SDK** 的主机。`pwsh -File Tools/find-dotnet.ps1` 会按 `-Dotnet` → `$env:STARDEW_DOTNET` → `.tmp/*/dotnet/dotnet[.exe]` → `PATH` 的顺序发现它，并要求 `dotnet --list-sdks` 非空（只有运行时不算可用） |
 | Python 3.10+（只有跑 `Tools/tests/*.py` 时需要） | 只用标准库（CI 里的 YAML 检查会用到 PyYAML，没有则退化为行级检查） |
 | 游戏自带的 65 个程序集（只有编 `Mod/` 与跑完整套件时需要） | 从仓库里的 blob 解出来：见下方"构建" |
 
@@ -116,38 +122,57 @@ wrapper 的 `distributionUrl` 默认指向腾讯镜像（国内 services.gradle.
 用**游戏自带的程序集**当参考程序集编译，否则"用了运行时被裁掉的 BCL 成员"只会在设备上炸：
 
 ```powershell
-# 1) 解出 65 个程序集（只需一次；.tmp/ 已 gitignore）
-python Tools/AssemblyStore/store.py extract app/src/main/apkroot/assemblies/assemblies.blob .tmp/phase0.5/refs --manifest app/src/main/apkroot/assemblies/assemblies.manifest
-python Tools/AssemblyStore/store.py extract app/src/main/apkroot/assemblies/assemblies.arm64_v8a.blob .tmp/phase0.5/refs --manifest app/src/main/apkroot/assemblies/assemblies.manifest
+# 0) 找到可用的 SDK（打印路径；找不到时退出码 1）
+$dotnet = (pwsh -NoProfile -File Tools/find-dotnet.ps1).Trim()
 
-# 2) 编框架与示例 mod
-.tmp/phase0.5/dotnet/dotnet.exe build Mod/ModFramework.Runtime -c Release -p:AndroidRefsDir=(Resolve-Path .tmp/phase0.5/refs)
-.tmp/phase0.5/dotnet/dotnet.exe build Mod/ExampleMod.HelloWorld -c Release -p:AndroidRefsDir=(Resolve-Path .tmp/phase0.5/refs)
+# 1) 解出 65 个程序集（只需一次；.tmp/ 已 gitignore）
+python Tools/AssemblyStore/store.py extract app/src/main/apkroot/assemblies/assemblies.blob .tmp/p113/refs --manifest app/src/main/apkroot/assemblies/assemblies.manifest
+python Tools/AssemblyStore/store.py extract app/src/main/apkroot/assemblies/assemblies.arm64_v8a.blob .tmp/p113/refs --manifest app/src/main/apkroot/assemblies/assemblies.manifest
+
+# 2) 编框架、示例 mod 与诊断 mod（AndroidRefsDir 必须是绝对路径）
+$refs = (Resolve-Path .tmp/p113/refs).Path
+& $dotnet build Mod/ModFramework.Runtime   -c Release -p:AndroidRefsDir=$refs
+& $dotnet build Mod/ExampleMod.HelloWorld  -c Release -p:AndroidRefsDir=$refs
+& $dotnet build Mod/P114.RuntimeProbe      -c Release -p:AndroidRefsDir=$refs
 ```
 
 `Mod/ExampleMod.HelloWorld` 的输出目录**本身就是一个合法的 mod 包**
 （`manifest.json` + `ExampleMod.HelloWorld.dll`）。怎么装到设备、怎么看日志见
 [`docs/modding/creating-a-mod.md`](docs/modding/creating-a-mod.md)。
 
+部署到设备**只走非破坏性门禁**（默认只读；安装需 `-InstallApproved`；签名不符直接停）：
+
+```powershell
+pwsh -NoProfile -File Tools/deploy-apk-safe.ps1                          # 只读预检 + 打印计划
+pwsh -NoProfile -File Tools/deploy-apk-safe.ps1 -Serial <serial>         # 仍然只读
+```
+
+> 旧的 `Tools/deploy-apk.ps1` 会先 `adb uninstall`（**删存档**）。它现在默认拒绝执行，
+> 必须显式传 `-LegacyDestructiveInstall` 才会走到卸载重装；新增改动不要再依赖它。
+
 ### 测试
 
 本地全量（需要上面解出的 65 个程序集）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File Tools\tests\run-all.ps1 -Refs .tmp\phase0.5\refs
+powershell -NoProfile -ExecutionPolicy Bypass -File Tools\tests\run-all.ps1 -Refs .tmp\p113\refs
 ```
 
 | 套件 | 命令 | 需要游戏程序集 |
 | --- | --- | --- |
 | CI 离线检查（13 项：Python/PS 语法、UTF-8、mojibake、manifest 夹具、schema、隐私、CI 结构） | `python Tools/tests/test_ci_offline.py` | ❌ |
+| P114 静态安全审计（46 项：探针无原生代码、T11/T12 已编译隔离、部署无卸载路径） | `python Tools/tests/test_p114_probe.py` | ❌ |
 | 隐私扫描 | `python Tools/privacy-scan.py` | ❌ |
 | adb 解析自测（10 项，不连设备） | `powershell -File Tools/tests/test_device_precheck.ps1` | ❌ |
-| Loader 单元 + 宿主（283 项） | `python Tools/tests/test_loader.py --dotnet dotnet` | 示例 mod 与 65 程序集差分需要（缺则 SKIP） |
-| 注入 / 容器 / Loader 契约（27 项） | `python Tools/tests/test_mod_pipeline.py` | ✅ |
+| 部署门禁 fake adb 自测（38 项，不连设备） | `powershell -File Tools/tests/test_deploy_safe.ps1` | ❌ |
+| Loader 单元 + 宿主 + P114 探针（45 项驱动 / 473 项内部） | `python Tools/tests/test_loader.py --refs .tmp/p113/refs` | 示例 mod 与 65 程序集差分需要（缺则 SKIP） |
+| 注入 / 容器 / Loader 契约（27 项） | `python Tools/tests/test_mod_pipeline.py --refs .tmp/p113/refs` | ✅ |
 | E0 只读设备预检 | `powershell -File Tools/device-precheck.ps1` | ❌（需要设备） |
 
 **CI（`.github/workflows/ci.yml`）只跑不需要游戏程序集的部分**：
-`test_ci_offline.py`、`privacy-scan.py`、ModInjector/Runtime/FixtureMod 构建、`test_loader.py`（无 `--refs`）。
+`test_ci_offline.py`、`test_p114_probe.py`、`privacy-scan.py`、ModInjector/Runtime/P114/FixtureMod 构建、
+`test_loader.py`（无 `--refs`），以及一个 Windows job 跑两个 PowerShell 门禁
+（`test_device_precheck.ps1`、`test_deploy_safe.ps1`）。
 依赖游戏程序集的套件（含 65 程序集的解析差分 `--diff-refs`）在 CI 里显式标 **SKIPPED**，不会伪装成通过。
 任何 E1/E2 设备证据都没有——那需要一台 ARM64 物理设备。
 
@@ -173,6 +198,8 @@ interface ApkPatch {
 - 格式与错误码：[`docs/modding/manifest-spec.md`](docs/modding/manifest-spec.md)
 - 从零开始：[`docs/modding/creating-a-mod.md`](docs/modding/creating-a-mod.md)
 - 能用哪些 BCL API（重要）：[`docs/architecture/phase1-runtime-constraints.md`](docs/architecture/phase1-runtime-constraints.md)
+- 需要"测量运行时"而不是"改玩法"时，看 [`Mod/P114.RuntimeProbe/README.md`](Mod/P114.RuntimeProbe/README.md)：
+  它是一个**普通 manifest mod**，演示了 private dependency、只读诊断、以及把报告写到自己包目录的完整做法。
 
 最小可用代码：
 

@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "P114.RuntimeProbe",
+  "name": "P114 Runtime Compatibility Probe",
+  "version": "1.1.4",
+  "author": "Stardew Valley Android Mod Framework",
+  "description": "Safe MonoVM runtime compatibility probe for Phase 1.1.4. Writes probe-output/phase1.1.4.txt. No P/Invoke, no detour, no game calls.",
+  "website": "https://github.com/Hiyomi-Kuro/StardewValley",
+  "entryAssembly": "P114.RuntimeProbe.dll",
+  "entryType": "P114.RuntimeProbe.P114RuntimeProbeEntry",
+  "gameVersion": "*",
+  "frameworkVersion": "*",
+  "privateAssemblies": [
+    "P114.RuntimeProbe.Dependency.dll"
+  ]
+}

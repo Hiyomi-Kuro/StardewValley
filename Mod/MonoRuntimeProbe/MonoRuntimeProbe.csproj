@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    MonoRuntimeProbe —— Phase 0 的运行时探针。
+    MonoRuntimeProbe —— Phase 0 的运行时探针（Phase 1.1.4 安全化）。
 
     设计约束（重要）：
     1. 目标框架固定 net8.0（游戏运行时是 .NETCoreApp v8.0，见 docs/audit/runtime-feasibility.md）。
@@ -10,6 +10,9 @@
     3. 不引用 Mono.Android：避免探针只能在 Android 上编译。
        需要 Android 路径时由调用方（Bootstrap）传入。
     4. 只依赖 BCL。
+    5. Phase 1.1.4：默认构建**不含**任何 P/Invoke / mprotect / RWX / detour / unsafe 代码。
+       历史实验（T11/T12）只在显式传 -p:LegacyNativeExperiments=true 时才参与编译，
+       而那个配置不属于本阶段测试，不得运行（见 Mod/MonoRuntimeProbe/README.md）。
   -->
 
   <PropertyGroup>
@@ -26,7 +29,16 @@
     <DebugType>portable</DebugType>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <Deterministic>true</Deterministic>
+    <!-- 默认关闭：安全路径没有任何 unsafe 代码 -->
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <!-- 显式选择加入的历史危险实验（T11/T12）。Phase 1.1.4 不构建、不运行这个配置。 -->
+  <PropertyGroup Condition="'$(LegacyNativeExperiments)' == 'true'">
+    <DefineConstants>$(DefineConstants);LEGACY_NATIVE_EXPERIMENTS</DefineConstants>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>MonoRuntimeProbe.legacy</AssemblyName>
+    <RootNamespace>MonoRuntimeProbe</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>

@@ -240,3 +240,63 @@ Java: mono.MonoRuntimeProvider (initOrder=1999999999)
 | 日期 | 变更 |
 | --- | --- |
 | 2026-11-05 | 初版：Phase 1 编译期能力矩阵、LoadFrom 依赖解析实测结论、启动时序与存储约束 |
+| 2026-11-06 | Phase 1.1.4：见 §9（安全探针入口、桌面观察值、仍然 BLOCKED 的项） |
+
+---
+
+## 9. Phase 1.1.4 补充：把"未验证"变成可执行的观察
+
+本节的每一条都标明证据等级：**A** = 源码/测试可复核，**B** = 编译期（AndroidRefsDir），
+**C** = 运行时观察（并注明平台），**D** = 历史记录不可复核。
+
+### 9.1 探针的安全边界（A）
+
+`Mod/MonoRuntimeProbe` 的默认编译（`AllowUnsafeBlocks=false`，无 `LEGACY_NATIVE_EXPERIMENTS`）
+**不含**任何 P/Invoke、`mprotect`、RWX 修改、机器码写入、`Reflection.Emit`、`DynamicMethod` 或
+Harmony。历史实验 T11/T12 被 `#if LEGACY_NATIVE_EXPERIMENTS` 整文件隔离，Phase 1.1.4 **不构建、不运行**
+那个配置。
+
+理由不是洁癖：**T12 曾在 MuMu 12 上让进程原生崩溃且报告来不及落盘**（§3.26，D 级）。
+把会崩溃的实验和安全诊断放在同一个聚合入口里，等于让每次诊断都带崩溃风险。
+
+### 9.2 `SHA256.HashData(byte[])`（B + C-Desktop）
+
+| 证据 | 结果 |
+| --- | --- |
+| 编译期（65 个 refs） | 存在（`ModFramework.Runtime` / `Mod/P114.RuntimeProbe` 均编译通过） |
+| 桌面运行时 | 空向量 `e3b0c442…b855`、`abc` 向量 `ba7816bf…0015ad`，均 `len=32` |
+| Android 运行时 | **未验证**（Emulator/真机均 NOT RUN） |
+
+> B 级只说明"元数据里有这个方法"，不说明 Mono 的实现可用、也不说明异常形状。
+> 不把桌面结果写进设备列。
+
+### 9.3 `Assembly.LoadFrom` 语义（C-Desktop，**不可外推到 Mono**）
+
+| 场景 | 桌面 .NET 8 观察值 |
+| --- | --- |
+| 同一路径两次 | 同一实例（`ReferenceEquals=true`） |
+| 相同身份/相同字节、不同路径 | 同一实例；`AppDomain` 计数不变 |
+| 相同身份/**不同字节**、不同路径 | 第二次抛 `FileLoadException: Assembly with same name is already loaded`；`AppDomain` 计数 +1 |
+| 两个不同简单名 | 两个独立实例 |
+
+含义：
+
+1. "先加载者胜"在桌面上表现为**异常**而不是"静默返回旧的"；Mono 上可能是另一种行为。
+   Loader 的预检（`MF0206`/`MF0207`）**不依赖**这个行为，所以不需要为了它改策略。
+2. 未获得 Red → Green 之前**不得**改 Loader 的缓存/去重逻辑。
+
+### 9.4 仍然 BLOCKED 的项（不变）
+
+§7 表格里的 6 条假设**全部仍然未验证**。Phase 1.1.4 只把它们从"没有探针"推进到"有探针、能跑、
+本阶段停在批准门槛前"，没有把任何一条改成 PASS。
+
+### 9.5 部署侧约束（A）
+
+`Tools/deploy-apk.ps1` 的默认路径会 `adb uninstall`，而卸载删除 `Saves/`。Phase 1.1.4 起：
+
+- 默认部署入口是 `Tools/deploy-apk-safe.ps1`，**默认只读**；
+- 安装要 `-InstallApproved`，推送 Mods 要 `-PushModsApproved`；
+- 签名证书无法证明一致时 **fail-closed**，不提供"卸载重装"作为回退；
+- 旧脚本的卸载路径被 `-LegacyDestructiveInstall` 挡住，不传就只构建、不碰设备。
+
+完整契约与测试见 `docs/audit/phase1.1.4-report.md` §6。

@@ -240,3 +240,42 @@ adb -s <serial> shell "su -c 'cat /data/data/com.chucklefish.stardewvalley/files
 > 依据：当前唯一可用设备 `127.0.0.1:16384` 的 `ro.product.cpu.abi = x86_64`、
 > `ro.dalvik.vm.native.bridge = libnb.so`（ARM 翻译层），`device-class = NOT-ARM64-PHYSICAL`。
 > 这些属性于 Phase 0.5.1 由 `Tools/device-precheck.ps1` 重新只读采集（C 级）。
+
+---
+
+## 8. Phase 1.1.4 E0 复跑（2026-11-06，只读）
+
+本节是**追加记录**，不覆盖 §7 的历史结论。
+
+| 项 | 值 |
+| --- | --- |
+| 采集时间 / 操作者 | 2026-11-06 20:0x（+08:00）/ DSH agent（`Tools/device-precheck.ps1`） |
+| 命令 | `powershell -NoProfile -ExecutionPolicy Bypass -File Tools\device-precheck.ps1 -OutFile <log>` |
+| adb 来源 | `%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe`（`adb-source=LOCALAPPDATA`） |
+| serial / transport | `emulator-5554` / `transport_id:1` |
+| `ro.product.cpu.abi` | `x86_64` |
+| `ro.product.cpu.abilist` | `x86_64,arm64-v8a,x86,armeabi-v7a,armeabi` |
+| `ro.dalvik.vm.native.bridge` | `libnb.so` |
+| `ro.kernel.qemu` | （空） |
+| Android 版本 / API / 安全补丁 | 12 / 32 / 2022-04-05 |
+| 厂商 / 型号 / device / fingerprint | vivo / V2309A / PD2309 / `vivo/PD2309/PD2309:12/V417IR/2721:user/release-keys` |
+| `device-class`（脚本判定） | `NOT-ARM64-PHYSICAL (emulator/translated/x86_64)` |
+| root 状态（`su -c id`） | `uid=0`（available） |
+| 游戏包是否安装 / versionCode / versionName | 已安装 / 239 / 1.6.15.0 |
+| `primaryCpuAbi` | `arm64-v8a`（被翻译层执行，**不是**物理 ARM64 证据） |
+| 设备上 APK 的 SHA-256 | `65e1e2af5583b1e765ec58df7e19264dd08dc8c8b0cf67072c39f69925051f9d` |
+| 本地基线 APK 的 SHA-256 | `65e1e2af5583b1e765ec58df7e19264dd08dc8c8b0cf67072c39f69925051f9d`（**与设备端相同**） |
+| `Mods/` 是否存在 / 是否有 `loader.log` | 否（`/sdcard/Android/data/<pkg>/files/Mods: No such file or directory`） |
+| E0 判定 | **PASS（只读）** |
+| E1/E2 判定 | **BLOCKED** `reason=no-arm64-physical-device` |
+
+结论：
+
+1. 当前唯一可用目标是 **x86_64 + `libnb.so` 翻译层模拟器**，不是 ARM64 物理设备；
+   Emulator 结果不得计入 Device 列。
+2. 已安装包与本地基线 APK **逐字节相同**（同一 SHA-256），因此"签名相同"在这一版上可由
+   文件摘要直接推出，不需要卸载重装，也不需要 `adb pull` 比对证书。
+3. 本阶段**没有**安装、卸载、推送、启动游戏，也没有创建 `Mods/`；探针的设备运行记为
+   **NOT RUN（缺用户批准）**，不是 FAIL。
+
+> Phase 1.1.4 的完整证据与验收矩阵见 `phase1.1.4-report.md` 与 `phase1.1.4-evidence-index.md`。

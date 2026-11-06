@@ -19,7 +19,7 @@ Covers the two build-time tools whose output must be verifiable without a phone:
 
 Usage (repo root, requires a .NET SDK):
     python Tools/tests/test_mod_pipeline.py
-    python Tools/tests/test_mod_pipeline.py --dotnet .tmp/phase0.5/dotnet/dotnet.exe
+    python Tools/tests/test_mod_pipeline.py --dotnet <path to a dotnet host with an SDK>
 
 Exit code 0 = every check passed.
 """
@@ -38,6 +38,9 @@ ASM_DIR = os.path.join(ROOT, "app", "src", "main", "apkroot", "assemblies")
 BLOB = os.path.join(ASM_DIR, "assemblies.blob")
 MANIFEST = os.path.join(ASM_DIR, "assemblies.manifest")
 ARCH_BLOB = os.path.join(ASM_DIR, "assemblies.arm64_v8a.blob")
+
+sys.path.insert(0, os.path.join(HERE))
+import toolchain  # noqa: E402
 
 sys.path.insert(0, os.path.join(ROOT, "Tools", "AssemblyStore"))
 import store as storelib  # noqa: E402
@@ -88,20 +91,27 @@ def parse_kv(out):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dotnet", default=os.path.join(ROOT, ".tmp", "phase0.5", "dotnet", "dotnet.exe"))
+    ap.add_argument("--dotnet", default="",
+                    help="dotnet executable (default: discovered from STARDEW_DOTNET, .tmp/*/dotnet, "
+                         "then PATH; the host must have an SDK, not only a runtime)")
     ap.add_argument("--artifacts", default=os.path.join(ROOT, ".tmp", "phase0.5", "artifacts"))
     ap.add_argument("--refs", default=os.path.join(ROOT, ".tmp", "phase0.5", "refs"),
                     help="directory holding the 65 assemblies extracted from the game")
     ap.add_argument("--workdir", default=os.path.join(ROOT, ".tmp", "phase0.5", "work", "pipeline"))
     args = ap.parse_args()
 
-    dotnet = os.path.abspath(args.dotnet)
+    dotnet = toolchain.resolve(args.dotnet)
     refs = os.path.abspath(args.refs)
     work = os.path.abspath(args.workdir)
     os.makedirs(work, exist_ok=True)
 
-    if not check("dotnet_sdk_available", os.path.exists(dotnet),
-                 dotnet + " (install the private SDK or pass --dotnet)"):
+    # A newer SDK can build net8.0 without carrying the 8.0 runtime. Roll-forward lets every
+    # `dotnet <dll>` invocation we make here run on the SDK's own runtime.
+    os.environ.setdefault("DOTNET_ROLL_FORWARD", "LatestMajor")
+
+    if not check("dotnet_sdk_available", bool(dotnet),
+                 (toolchain.describe(dotnet) if dotnet else
+                  "no SDK found via --dotnet, $%s, .tmp/*/dotnet or PATH" % toolchain.DOTNET_ENV_VAR)):
         return finish()
     if not check("game_assemblies_available", os.path.isdir(refs) and len(
             [f for f in os.listdir(refs) if f.endswith(".dll")]) >= 58,

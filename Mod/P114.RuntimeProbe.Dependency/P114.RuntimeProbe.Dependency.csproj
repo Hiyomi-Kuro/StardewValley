@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Private dependency fixture for Mod/P114.RuntimeProbe (Phase 1.1.4).
+
+    Purpose: prove the Loader's real `privateAssemblies` path. The mod does NOT declare a
+    dependency mod on this assembly; it declares the FILE in its manifest and calls it from
+    Initialize. If the Loader did not pre-load it, the call would throw FileNotFoundException
+    and the mod would fail with MF0309.
+
+    Never shipped as its own mod package: it has no manifest.json and therefore is invisible
+    to ModDiscovery (a directory without manifest.json is ignored).
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>P114.RuntimeProbe.Dependency</AssemblyName>
+    <RootNamespace>P114.RuntimeProbe.Dependency</RootNamespace>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+</Project>

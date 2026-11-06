@@ -3,16 +3,18 @@
 #
 # What runs:
 #   1. CI offline suite        (python, no game binaries)          always
-#   2. privacy scan            (python, no game binaries)          always
-#   3. device-precheck self-test (PowerShell, no device)           always
-#   4. mod pipeline            (needs the 65 game assemblies)      when --Refs is usable
-#   5. loader + host tests     (needs dotnet; --Refs for the example mod)
+#   2. P114 static safety audit (python, no game binaries)         always
+#   3. privacy scan            (python, no game binaries)          always
+#   4. device-precheck self-test (PowerShell, no device)           always
+#   5. deploy-apk-safe fake-adb suite (PowerShell, no device)      always
+#   6. mod pipeline            (needs the 65 game assemblies)      when --Refs is usable
+#   7. loader + host + P114 probe (needs dotnet; --Refs for the example mod)
 #
 # Nothing here installs anything, touches a device, or writes outside --LogDir.
 #
 # Usage (repo root):
 #   pwsh -NoProfile -File Tools/tests/run-all.ps1
-#   powershell -NoProfile -ExecutionPolicy Bypass -File Tools/tests/run-all.ps1 -Refs .tmp/phase0.5/refs
+#   pwsh -NoProfile -File Tools/tests/run-all.ps1 -Refs .tmp/p113/refs
 param(
     [string]$Dotnet = "",
     [string]$Refs = "",
@@ -26,8 +28,10 @@ if (-not $LogDir) { $LogDir = Join-Path $root ".tmp\phase0.5.1\logs" }
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 if (-not $Dotnet) {
-    $candidate = Join-Path $root ".tmp\phase0.5\dotnet\dotnet.exe"
-    $Dotnet = if (Test-Path $candidate) { $candidate } else { "dotnet" }
+    # Machine-independent discovery: argument, $env:STARDEW_DOTNET, .tmp/*/dotnet, PATH.
+    $found = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "Tools\find-dotnet.ps1") 2>$null
+    if ($LASTEXITCODE -eq 0 -and $found) { $Dotnet = ($found | Select-Object -First 1).Trim() }
+    if (-not $Dotnet) { $Dotnet = "dotnet" }
 }
 
 $refsUsable = $false
@@ -69,6 +73,7 @@ function Invoke-Skipped([string]$name, [string]$why) {
 Push-Location $root
 try {
     Invoke-Suite "ci-offline" "ci-offline.txt" { python Tools\tests\test_ci_offline.py }
+    Invoke-Suite "p114-static-audit" "p114-static-audit.txt" { python Tools\tests\test_p114_probe.py }
     Invoke-Suite "privacy-scan" "privacy-scan.txt" { python Tools\privacy-scan.py --include-untracked }
 
     if ($SkipDeviceSelfTest) {
@@ -77,6 +82,10 @@ try {
         Invoke-Suite "device-precheck-selftest" "device-precheck-selftest.txt" {
             & powershell.exe -NoProfile -ExecutionPolicy Bypass -File Tools\tests\test_device_precheck.ps1
         }
+    }
+
+    Invoke-Suite "deploy-safe-fake-adb" "deploy-safe-fake-adb.txt" {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File Tools\tests\test_deploy_safe.ps1
     }
 
     if ($refsUsable) {

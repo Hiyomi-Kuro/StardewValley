@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    P114.RuntimeProbe: the Phase 1.1.4 safe runtime diagnostic mod.
+
+    It is an ORDINARY manifest mod: the loader discovers it through manifest.json, validates it,
+    resolves dependencies, preflights the declared assemblies, stages a snapshot and then calls
+    P114RuntimeProbeEntry.Initialize. Nothing in the loader, the APK build, or any script of
+    this phase references this project, so it is never part of a default deployment: it has to
+    be copied into <Mods>/ deliberately (see Mod/P114.RuntimeProbe/README.md).
+
+    Build (desktop or AndroidRefsDir; it references no game assembly). The MSBuild switch for
+    the artifacts directory is passed exactly as in Tools/tests/test_p114_probe.py:
+
+    The output directory is a complete mod package: manifest.json + P114.RuntimeProbe.dll +
+    P114.RuntimeProbe.Dependency.dll. The packaging step of Tools/tests/test_p114_probe.py adds
+    the probe-fixtures/ subdirectory, which is NOT declared in the manifest on purpose (the
+    loader must never auto-load it; the probe loads it explicitly with Assembly.LoadFrom).
+
+    Safety: no P/Invoke, no unsafe, no mprotect, no machine-code writes, no Reflection.Emit,
+    no DynamicMethod, no Harmony, no Game1 access.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>P114.RuntimeProbe</AssemblyName>
+    <RootNamespace>P114.RuntimeProbe</RootNamespace>
+    <Version>1.1.4</Version>
+    <AssemblyVersion>1.1.4.0</AssemblyVersion>
+    <Deterministic>true</Deterministic>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Compile against the shared contract, but never ship a copy of it: a second copy would
+         give the mod a different IModEntry identity and the loader would reject it (MF0204). -->
+    <ProjectReference Include="..\ModFramework.Runtime\ModFramework.Runtime.csproj" Private="false" />
+    <!-- The declared private dependency: shipped next to the entry assembly and listed in
+         manifest.json "privateAssemblies" so the loader pre-loads it (that is what R-11 proves). -->
+    <ProjectReference Include="..\P114.RuntimeProbe.Dependency\P114.RuntimeProbe.Dependency.csproj" Private="true" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="manifest.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

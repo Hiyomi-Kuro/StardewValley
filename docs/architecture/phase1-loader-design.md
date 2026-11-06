@@ -313,3 +313,38 @@ Bootstrap（注入进 `StardewValley.dll` 的 IL）只做四件事：
 | 2026-11-05 | Phase 1.1.1：预检不动点（依赖优先、冲突重算、事件按最终归类过滤）、内容相等改为逐字节判定、宿主匹配 Fail-Closed、PE/CLI 逐层边界、框架版本 Unknown/Invalid 分离、报告与日志脱敏 |
 | 2026-11-06 | Phase 1.1.2：预检字节写入私有快照并只从快照 `LoadFrom`（加载前二次校验指纹）、不动点显式 Converged/Exhausted 且未收敛时 Fail-Closed（`MF0208`）、ECMA-335 PublicKey 标志与 Blob 形状校验（`MF0205`） |
 | 2026-11-06 | Phase 1.1.3：去重键降级为候选索引（`dedup key -> List<SnapshotEntry>`，命中后逐字节比较才共享）、快照完整性改用独立 SHA-256 摘要且无 SHA-256 时 Fail-Closed、`LoadFrom` 返回对象与 claim 身份核对（`MF0210`）、暂存路径永不复用（同名追加 `~N`） |
+| 2026-11-06 | Phase 1.1.4：**Loader 逻辑未改**。新增一个普通 manifest mod（`P114.RuntimeProbe`）作为可复现的端到端观察点，见 §12 |
+
+---
+
+## 12. Phase 1.1.4：用普通 mod 观察这条链路（不改 Loader）
+
+Phase 1.1.3 留下的问题是"这条链路在真实 MonoVM 上到底怎么表现"，而不是"设计哪里不满意"。
+所以本阶段**一行 Loader 代码都没改**，而是加了一个**普通的、符合 manifest 规范的诊断 mod**，
+让它在真实链路里跑，并把观察值写进自己的包目录。
+
+### 12.1 观察点与它证明的契约
+
+| 报告行 / 文件 | 证明的契约 |
+| --- | --- |
+| `preflight-stage=complete` 出现在第一条 `assembly-load=` **之前** | 预检严格先于加载（Phase 1.1 的时序承诺） |
+| `assembly-load=<id> file=P114.RuntimeProbe.Dependency.dll` 早于入口 dll | manifest 声明的 `privateAssemblies` 被**先行**加载 |
+| `assembly-load=… snapshot=sha256:<digest>` | 加载的是快照，且摘要可核对 |
+| 探针报告里 R-13 的 `sha256` 与上面**逐字符相同** | 实际被 `LoadFrom` 的文件就是预检批准的那份字节（端到端，不只是"设计如此"） |
+| 入口程序集 `Assembly.Location` 位于 `.staging/<run>/…` | 加载路径确实指向暂存区，不是 mod 包 |
+| `- id=P114.RuntimeProbe state=Initialized` | 构造 → `Initialize` 全程成功 |
+| `probe=not-run-by-loader` 仍然存在 | 裸 DLL 自动执行那条路**依然关闭** |
+
+### 12.2 为什么用"普通 mod"而不是"再加一个 Loader 钩子"
+
+1. 诊断入口如果又是 Loader 的一条捷径，就会重现 Phase 0 的老问题：一个不受 manifest 管理的执行入口；
+2. 只有走完整链路，`preflight → staging → LoadFrom → Initialize` 的时序才有意义；
+3. 失败被隔离、日志有归属（`logs/P114.RuntimeProbe.log`）、报告有 id —— 这些都靠"普通 mod"身份拿到。
+
+### 12.3 证据等级
+
+`Tools/tests/ModFramework.Tests/Phase114Tests.cs` 跑的是**桌面 .NET** 宿主。它证明"代码与链路正确"，
+**不**证明 MonoVM 行为。设备侧要单独跑 `Mod/P114.RuntimeProbe`（见该目录 README §4），
+且 Emulator 与 ARM64 真机必须分列——本阶段两者都是 **NOT RUN / BLOCKED**。
+
+详见 `docs/audit/phase1.1.4-report.md` §5 与 §9。

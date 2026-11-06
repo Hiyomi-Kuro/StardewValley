@@ -1,10 +1,22 @@
+// Phase 1.1.4: this file is NOT compiled by default.
+//
+// T12 wrote a 16-byte ARM64 absolute jump stub into a live method's code page and then
+// crashed the process natively on the MuMu 12 emulator (see Mod/MonoRuntimeProbe/README.md
+// and docs/audit/phase0-status.md 3.26). It is kept verbatim for source audit only.
+//
+// To even compile it you must opt in explicitly:
+//   dotnet build Mod/MonoRuntimeProbe -p:LegacyNativeExperiments=true
+// That build is NOT run by any test, script, Loader path or manifest mod in Phase 1.1.4,
+// and it must not be executed on any device, emulator or desktop process in this phase.
+#if LEGACY_NATIVE_EXPERIMENTS
+
 using System.Reflection;
 using System.Runtime.InteropServices;
 
 namespace MonoRuntimeProbe;
 
 /// <summary>
-/// 原生 detour 的最小实验（E5 第二半）。
+/// 原生 detour 的最小实验（E5 第二半）。**历史危险实验，不属于 Phase 1.1.4 测试范围。**
 ///
 /// 只对**本程序集里的方法**动手，不碰游戏代码：
 ///   1. 先调用一次，强制 JIT；
@@ -99,3 +111,5 @@ internal static class DetourProbe
                + " fn=0x" + fnTarget.ToInt64().ToString("x");
     }
 }
+
+#endif

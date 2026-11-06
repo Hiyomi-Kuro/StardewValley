@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Parameterised Assembly.LoadFrom fixture for Phase 1.1.4 (R-04 .. R-07).
+
+    One source, several builds. The packaging step (Tools/tests/test_p114_probe.py) builds the
+    variants and copies them into the probe package under `probe-fixtures/`, which is NOT
+    declared in any manifest:
+
+      P114Same   built once, copied to same-a/ and same-b/   -> same identity, same bytes,
+                                                               different paths (R-05)
+      P114Diff   Variant=A and Variant=B, same assembly name/version/culture/token
+                 but different bytes and a different marker  -> same identity, different
+                                                               bytes (R-06)
+      P114Alpha / P114Beta                                   -> different simple names (R-07)
+
+    Properties:
+      FixtureAssemblyName  assembly (and default file) name
+      FixtureVersion       assembly version, default 1.0.0.0
+      Variant              VARIANT_B changes the IL bytes and the reported tag
+
+    Never referenced by Mod/P114.RuntimeProbe: the probe loads these through
+    Assembly.LoadFrom at runtime, exactly like a third-party library would.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>P114Fixtures</RootNamespace>
+    <Deterministic>true</Deterministic>
+    <AssemblyName Condition="'$(FixtureAssemblyName)' != ''">$(FixtureAssemblyName)</AssemblyName>
+    <AssemblyName Condition="'$(FixtureAssemblyName)' == ''">P114Fixture</AssemblyName>
+    <AssemblyVersion Condition="'$(FixtureVersion)' != ''">$(FixtureVersion)</AssemblyVersion>
+    <AssemblyVersion Condition="'$(FixtureVersion)' == ''">1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Version>1.0.0</Version>
+    <DefineConstants Condition="'$(Variant)' != ''">$(DefineConstants);$(Variant)</DefineConstants>
+  </PropertyGroup>
+
+</Project>

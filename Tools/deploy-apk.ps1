@@ -1,3 +1,19 @@
+# ============================================================================
+#  DEPRECATED / DESTRUCTIVE - DO NOT USE AS THE DEFAULT DEPLOY PATH
+#
+#  This Phase 0 script runs `adb uninstall com.chucklefish.stardewvalley` before every
+#  install. Uninstalling DELETES THE PLAYER'S SAVES, and this project's APK is signed with
+#  a local debug certificate that does not match the official signature, so an in-place
+#  replace is not possible either.
+#
+#  Phase 1.1.4 added Tools/deploy-apk-safe.ps1: read-only by default, install only with
+#  -InstallApproved, and a signature gate that stops on mismatch. USE THAT INSTEAD.
+#
+#  This file is kept only so the historical build/patch pipeline stays auditable. The
+#  destructive part is now behind an explicit -LegacyDestructiveInstall switch; without it
+#  the script stops before touching any device.
+# ============================================================================
+#
 # Deploy one injected APK and prove which build is actually running.
 # ASCII only: PowerShell round-trips of non-ASCII files are unsafe in this workspace.
 #
@@ -28,7 +44,11 @@ param(
     [switch]$PushMods,
     # Restore the repository blob only (no build/install); used to leave the tree clean.
     [switch]$Restore,
-    [switch]$SkipInstall
+    [switch]$SkipInstall,
+    # Phase 1.1.4: required for the historical uninstall+install and for -PushMods.
+    # Without it the script still builds the APK, then stops before any device write.
+    # Uninstalling deletes Saves; prefer Tools/deploy-apk-safe.ps1.
+    [switch]$LegacyDestructiveInstall
 )
 
 $ErrorActionPreference = "Stop"
@@ -132,6 +152,24 @@ $localApkHash = Sha256 $apk
 Write-Host "local apk  : $localApkHash ($((Get-Item $apk).Length) bytes)"
 
 if ($SkipInstall) { exit 0 }
+
+# 3.4 Phase 1.1.4 safety gate. Everything from here on writes to the device, and the
+# historical path uninstalls the game (which deletes Saves). Refuse unless the operator
+# asked for the legacy behaviour explicitly.
+if (-not $LegacyDestructiveInstall) {
+    Write-Host ""
+    Write-Host "DANGER: the rest of this script uninstalls com.chucklefish.stardewvalley,"
+    Write-Host "        which deletes the player's Saves, and installs an APK signed with a"
+    Write-Host "        certificate that does not match the official one."
+    Write-Host ""
+    Write-Host "Nothing was done to the device."
+    Write-Host "Use the non-destructive gate instead:"
+    Write-Host "  pwsh -NoProfile -File Tools/deploy-apk-safe.ps1"
+    Write-Host "  pwsh -NoProfile -File Tools/deploy-apk-safe.ps1 -InstallApproved   # after approval"
+    Write-Host ""
+    Write-Host "To reproduce the historical behaviour anyway, re-run with -LegacyDestructiveInstall."
+    exit 2
+}
 
 # 3.5 pick a device explicitly. Auto-select only when exactly one is attached: this
 # script uninstalls the game, so silently targeting a guessed endpoint is unacceptable.

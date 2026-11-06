@@ -102,13 +102,16 @@ public sealed class Entry : IModEntry
 **仅本地**（需要游戏自带的 65 个程序集当参考程序集）：
 
 ```powershell
-# 1) 若还没有 refs：
-python Tools/AssemblyStore/store.py extract app/src/main/apkroot/assemblies/assemblies.blob .tmp/phase0.5/refs --manifest app/src/main/apkroot/assemblies/assemblies.manifest
-python Tools/AssemblyStore/store.py extract app/src/main/apkroot/assemblies/assemblies.arm64_v8a.blob .tmp/phase0.5/refs --manifest app/src/main/apkroot/assemblies/assemblies.manifest
+# 0) 找到可用的 SDK（必须是带 SDK 的主机，不是只有运行时）
+$dotnet = (pwsh -NoProfile -File Tools/find-dotnet.ps1).Trim()
 
-# 2) 构建（输出目录本身就是一个合法的 mod 包）
-.tmp/phase0.5/dotnet/dotnet.exe build Mod/ExampleMod.HelloWorld -c Release `
-    -p:AndroidRefsDir=(Resolve-Path .tmp/phase0.5/refs)
+# 1) 若还没有 refs：
+python Tools/AssemblyStore/store.py extract app/src/main/apkroot/assemblies/assemblies.blob .tmp/p113/refs --manifest app/src/main/apkroot/assemblies/assemblies.manifest
+python Tools/AssemblyStore/store.py extract app/src/main/apkroot/assemblies/assemblies.arm64_v8a.blob .tmp/p113/refs --manifest app/src/main/apkroot/assemblies/assemblies.manifest
+
+# 2) 构建（输出目录本身就是一个合法的 mod 包；AndroidRefsDir 必须是绝对路径）
+& $dotnet build Mod/ExampleMod.HelloWorld -c Release `
+    -p:AndroidRefsDir=(Resolve-Path .tmp/p113/refs)
 ```
 
 为什么必须用 `AndroidRefsDir`：桌面 net8.0 编译能过、设备上却会 `TypeLoadException`
@@ -170,11 +173,11 @@ mods:
 ## 8. 本地验证（不需要设备）
 
 ```powershell
-# 全套宿主测试：manifest → Loader → LoadFrom → Initialize，含 HelloWorld 端到端
-python Tools/tests/test_loader.py --refs .tmp/phase0.5/refs
+# 全套宿主测试：manifest → Loader → LoadFrom → Initialize，含 HelloWorld 端到端与 P114 探针
+python Tools/tests/test_loader.py --refs .tmp/p113/refs
 
-# 只跑不需要游戏程序集的部分（CI 用的就是这条）
-python Tools/tests/test_loader.py --dotnet dotnet
+# 只跑不需要游戏程序集的部分（CI 用的就是这条；SDK 会被自动发现）
+python Tools/tests/test_loader.py
 ```
 
 `test_loader.py` 会构建 `Tools/tests/ModFramework.Tests`，其中包含：

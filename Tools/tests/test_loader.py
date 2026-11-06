@@ -13,7 +13,10 @@ Builds and runs Tools/tests/ModFramework.Tests, which covers:
                   or missing declared files), dependency propagation, and the logger
                   degradation report;
   * example mod - Mod/ExampleMod.HelloWorld, but only when --refs is given, because that
-                  project compiles against the game's own assemblies.
+                  project compiles against the game's own assemblies;
+  * Phase 1.1.4 - the P114.RuntimeProbe diagnostic mod through the real loader chain, plus its
+                  parameterised Assembly.LoadFrom fixtures. It needs NO game assembly, so it
+                  always runs (CI included); a build failure is a FAIL, never a SKIP.
 
 The Phase 1.1 identity fixtures are built from two parameterised projects
 (Tools/tests/FixtureMods/ConflictLib and PlainLib): one source produces every "same simple
@@ -38,6 +41,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import toolchain  # noqa: E402  (local helper module, not a package)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 
@@ -51,10 +57,10 @@ def check(name, ok, detail="", skipped=False):
     return ok
 
 
-def run(cmd, cwd=None):
+def run(cmd, cwd=None, env=None):
     started = time.time()
     proc = subprocess.run(cmd, cwd=cwd or ROOT, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace")
+                          encoding="utf-8", errors="replace", env=env)
     elapsed = time.time() - started
     return proc.returncode, (proc.stdout or "") + (proc.stderr or ""), elapsed
 
@@ -166,6 +172,96 @@ def find_artifact(root, file_name):
     return chosen[0] if chosen else ""
 
 
+# ------------------------------------------------------------------ Phase 1.1.4
+# The probe package is an ordinary mod package. The probe-fixtures/ subdirectory is NEVER
+# declared in the manifest: the loader must not auto-load it, the probe loads it explicitly.
+P114_PROBE_PROJECT = os.path.join(ROOT, "Mod", "P114.RuntimeProbe", "P114.RuntimeProbe.csproj")
+P114_FIXTURE_PROJECT = os.path.join(ROOT, "Mod", "P114.RuntimeProbe.Fixtures", "P114Fixture.csproj")
+
+# key, MSBuild properties, assembly name that must be produced
+P114_FIXTURE_VARIANTS = [
+    ("p114_same", {"FixtureAssemblyName": "P114Same"}, "P114Same"),
+    ("p114_diff_a", {"FixtureAssemblyName": "P114Diff"}, "P114Diff"),
+    ("p114_diff_b", {"FixtureAssemblyName": "P114Diff", "Variant": "VARIANT_B"}, "P114Diff"),
+    ("p114_alpha", {"FixtureAssemblyName": "P114Alpha"}, "P114Alpha"),
+    ("p114_beta", {"FixtureAssemblyName": "P114Beta"}, "P114Beta"),
+]
+
+# package-relative destination for each variant. same-a/same-b receive the SAME bytes.
+P114_FIXTURE_LAYOUT = {
+    "p114_same": ["same-a", "same-b"],
+    "p114_diff_a": ["diff-a"],
+    "p114_diff_b": ["diff-b"],
+    "p114_alpha": ["alpha"],
+    "p114_beta": ["beta"],
+}
+
+
+def build_p114_package(dotnet, artifacts, work):
+    """Build the P114 mod plus its fixture variants and stage a complete mod package."""
+    rc, out, secs = run([dotnet, "build", P114_PROBE_PROJECT, "-c", "Release",
+                         "--artifacts-path", artifacts, "-v", "q"])
+    probe_out = os.path.join(artifacts, "bin", "P114.RuntimeProbe", "release")
+    produced = os.path.join(probe_out, "P114.RuntimeProbe.dll")
+    if rc != 0 or not os.path.exists(produced):
+        check("p114_probe_build", False, "rc=%d %.1fs %s" % (rc, secs, tail(out, 4)))
+        return ""
+    dependency = os.path.join(probe_out, "P114.RuntimeProbe.Dependency.dll")
+    manifest = os.path.join(probe_out, "manifest.json")
+    if not os.path.exists(dependency) or not os.path.exists(manifest):
+        check("p114_probe_build", False, "missing dependency dll or manifest.json in " + probe_out)
+        return ""
+    check("p114_probe_build", True, "rc=0 %.1fs" % secs)
+
+    package = os.path.join(work, "p114-package")
+    if os.path.isdir(package):
+        shutil.rmtree(package)
+    os.makedirs(package)
+    for name in ("manifest.json", "P114.RuntimeProbe.dll", "P114.RuntimeProbe.Dependency.dll"):
+        shutil.copy2(os.path.join(probe_out, name), os.path.join(package, name))
+
+    fixtures_root = os.path.join(package, "probe-fixtures")
+    variants_root = os.path.join(work, "p114-variants")
+    built = {}
+    for key, props, assembly_name in P114_FIXTURE_VARIANTS:
+        out_dir = os.path.join(variants_root, key)
+        cmd = [dotnet, "build", P114_FIXTURE_PROJECT, "-c", "Release",
+               "--artifacts-path", out_dir, "-v", "q"]
+        for prop, value in sorted(props.items()):
+            cmd.append("-p:%s=%s" % (prop, value))
+        rc, out, secs = run(cmd)
+        produced = find_artifact(out_dir, assembly_name + ".dll") if rc == 0 else ""
+        if rc != 0 or not produced:
+            check("p114_fixture_" + key, False, "rc=%d %s" % (rc, tail(out, 4) if rc != 0 else "missing dll"))
+            return ""
+        built[key] = produced
+        check("p114_fixture_" + key, True, assembly_name + ".dll")
+
+    for key, destinations in sorted(P114_FIXTURE_LAYOUT.items()):
+        source = built[key]
+        for destination in destinations:
+            target_dir = os.path.join(fixtures_root, destination)
+            os.makedirs(target_dir, exist_ok=True)
+            shutil.copy2(source, os.path.join(target_dir, os.path.basename(source)))
+
+    # A deliberately corrupt "assembly": R-14 needs one real load failure that must not abort
+    # the remaining safe cases.
+    corrupt_dir = os.path.join(fixtures_root, "corrupt")
+    os.makedirs(corrupt_dir, exist_ok=True)
+    with open(os.path.join(corrupt_dir, "P114Broken.dll"), "wb") as fh:
+        fh.write(b"\x00" * 64)
+
+    same_a = os.path.join(fixtures_root, "same-a", "P114Same.dll")
+    same_b = os.path.join(fixtures_root, "same-b", "P114Same.dll")
+    identical = open(same_a, "rb").read() == open(same_b, "rb").read()
+    diff_a = open(os.path.join(fixtures_root, "diff-a", "P114Diff.dll"), "rb").read()
+    diff_b = open(os.path.join(fixtures_root, "diff-b", "P114Diff.dll"), "rb").read()
+    check("p114_fixture_same_bytes_identical", identical, "same-a == same-b")
+    check("p114_fixture_diff_bytes_differ", diff_a != diff_b,
+          "same identity, different bytes (%d vs %d)" % (len(diff_a), len(diff_b)))
+    return package
+
+
 def build_variants(dotnet, variants_root, fixtures_dir):
     ok = True
     for key, project, props, assembly_name, target_name in VARIANTS:
@@ -192,27 +288,32 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dotnet", default=os.path.join(ROOT, ".tmp", "phase0.5", "dotnet", "dotnet.exe"),
-                    help="dotnet executable (default: the private SDK, or pass 'dotnet' for a system SDK)")
+    ap.add_argument("--dotnet", default="",
+                    help="dotnet executable (default: discovered from STARDEW_DOTNET, .tmp/*/dotnet, "
+                         "then PATH; the host must have an SDK, not only a runtime)")
     ap.add_argument("--artifacts", default=os.path.join(ROOT, ".tmp", "phase0.5", "artifacts-loader"))
     ap.add_argument("--refs", default="",
                     help="directory with the 65 game assemblies; enables the example-mod checks")
     ap.add_argument("--workdir", default=os.path.join(ROOT, ".tmp", "phase0.5", "work", "loader"))
     args = ap.parse_args()
 
-    dotnet = args.dotnet
-    if os.path.sep in dotnet:
-        if not os.path.exists(dotnet):
-            print("dotnet not found: %s" % dotnet)
-            print("RESULT: FAILED (no .NET SDK available)")
-            return 1
-    elif shutil.which(dotnet) is None:
-        print("dotnet not found on PATH: %s" % dotnet)
+    dotnet = toolchain.resolve(args.dotnet)
+    if not dotnet:
+        print("no .NET SDK found.")
+        print("  tried: --dotnet, $%s, .tmp/*/dotnet/dotnet[.exe], PATH" % toolchain.DOTNET_ENV_VAR)
+        print("  an SDK (not just a runtime) is required; `dotnet --list-sdks` must be non-empty")
         print("RESULT: FAILED (no .NET SDK available)")
         return 1
+    print("toolchain: " + toolchain.describe(dotnet))
     artifacts = os.path.abspath(args.artifacts)
     work = os.path.abspath(args.workdir)
     os.makedirs(work, exist_ok=True)
+
+    # Build with one SDK and RUN with another host: a newer SDK (e.g. 10.x) builds net8.0 fine
+    # but its apphost may not carry the 8.0 runtime. Roll-forward keeps that working without
+    # asking the operator to install a second runtime. Applies to every `dotnet <dll>` run.
+    run_env = dict(os.environ)
+    run_env.setdefault("DOTNET_ROLL_FORWARD", "LatestMajor")
 
     # ---------------------------------------------------------------- build
     targets = [
@@ -247,6 +348,8 @@ def main():
     if not build_variants(dotnet, os.path.join(work, "variants"), fixtures):
         return finish()
 
+    # ------------------------------------------------- Phase 1.1.4 probe package
+    p114_dir = build_p114_package(dotnet, artifacts, work)
     # ---------------------------------------------------------------- example mod
     hello_world_dir = ""
     refs = os.path.abspath(args.refs) if args.refs else ""
@@ -278,7 +381,10 @@ def main():
     cmd = [dotnet, test_dll, "--repo-root", ROOT, "--fixture-mod-dir", fixtures]
     if hello_world_dir:
         cmd += ["--hello-world-dir", hello_world_dir]
-    rc, out, secs = run(cmd)
+    if p114_dir:
+        cmd += ["--p114-dir", p114_dir]
+
+    rc, out, secs = run(cmd, env=run_env)
     print(out.rstrip())
     summary = ""
     for line in out.splitlines():
@@ -290,12 +396,22 @@ def main():
         check("hello_world_host_run", "hello_world_discovered" in out and "FAIL hello_world" not in out,
               "example mod initialized through the real manifest")
 
+    # ------------------------------------------- Phase 1.1.4 probe suite outcome
+    if p114_dir:
+        p114_failures = [line for line in out.splitlines() if line.startswith("FAIL p114_")]
+        check("p114_suite_ran", "p114_loader_mod_initialized" in out,
+              "the P114 probe went through discovery -> preflight -> staging -> load -> Initialize")
+        check("p114_suite_no_failures", not p114_failures,
+              "%d P114 checks failed %s" % (len(p114_failures), p114_failures[:2]))
+    else:
+        check("p114_suite_ran", False, "the P114 package could not be built")
+
     # ------------------------------------------- Phase 1.1.1 parser differential
     # Read-only: the game's own reference assemblies are parsed and compared against the desktop
     # BCL parser. Only counts and file names are printed; nothing is copied into the repository
     # and no absolute path is echoed.
     if refs:
-        rc, diff_out, secs = run([dotnet, test_dll, "--diff-refs", refs])
+        rc, diff_out, secs = run([dotnet, test_dll, "--diff-refs", refs], env=run_env)
         detail = ""
         for line in diff_out.splitlines():
             if "compared" in line:

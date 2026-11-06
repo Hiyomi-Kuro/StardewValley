@@ -52,7 +52,9 @@ function Redact-Path([string]$text) {
         }
     }
     # Any remaining Windows profile path (e.g. a stale log line) is redacted too.
-    $text = $text -replace '(?i)[A-Z]:\\Users\\[^\\\s"]+', '<home>'
+    # The user name may contain spaces, so replace the whole "Users\<name>" segment up to the
+    # next separator instead of only the first token.
+    $text = $text -replace '(?i)[A-Z]:\\Users\\[^\\\r\n]+?(?=\\)', '<home>'
     return $text
 }
 

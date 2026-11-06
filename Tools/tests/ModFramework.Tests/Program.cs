@@ -12,6 +12,7 @@ internal static class Program
         var keepTemp = false;
         var helloWorldDir = "";
         var diffRefsDir = "";
+        var p114Dir = "";
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -32,12 +33,16 @@ internal static class Program
                 case "--diff-refs":
                     if (i + 1 < args.Length) { diffRefsDir = args[++i]; }
                     break;
+                case "--p114-dir":
+                    if (i + 1 < args.Length) { p114Dir = args[++i]; }
+                    break;
                 case "--help":
                 case "-h":
                     Console.WriteLine("ModFramework.Tests [--repo-root <dir>] --fixture-mod-dir <dir>");
                     Console.WriteLine("  --repo-root        repository root (default: current directory)");
                     Console.WriteLine("  --fixture-mod-dir  directory containing FixtureMod.dll and FixtureMod.Dependency.dll");
                     Console.WriteLine("  --hello-world-dir  build output of ExampleMod.HelloWorld (optional)");
+                    Console.WriteLine("  --p114-dir         staged P114.RuntimeProbe mod package (optional, Phase 1.1.4)");
                     Console.WriteLine("  --diff-refs <dir>  run only the read-only parser differential over <dir>");
                     return 0;
                 default:
@@ -87,6 +92,18 @@ internal static class Program
                 {
                     Console.WriteLine("SKIP hello_world_package_present             --hello-world-dir not provided (needs the game assemblies to build)");
                 }
+            }
+
+            // Phase 1.1.4: the safe runtime probe through the real loader chain. Requires the
+            // staged P114.RuntimeProbe package; when it is absent the suite is reported as
+            // SKIPPED (never as passed) so a CI run without the build is not a false positive.
+            if (p114Dir.Length > 0)
+            {
+                Phase114Tests.Run(runner, p114Dir);
+            }
+            else
+            {
+                Console.WriteLine("SKIP p114_probe_suite                        --p114-dir not provided (needs the P114.RuntimeProbe build)");
             }
         }
         finally
