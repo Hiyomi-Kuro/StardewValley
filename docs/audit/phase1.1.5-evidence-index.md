@@ -27,6 +27,11 @@
 | ARM64 physical | ⛔ BLOCKED | 无合格物理设备 |
 | CI | ✅ OBSERVED | 仅 `ab1e10cb` 的历史运行；本阶段改动 NOT RUN（未 push） |
 
+> **Phase 1.1.6 后记（2026-11-06）**：上表"本阶段改动 NOT RUN（未 push）"是 **Phase 1.1.5 结束时**的状态。
+> 用户随后手动 commit + push 形成 `6e90ef2`，CI run `42238545103`（#7）completed / success，3/3 jobs；
+> 该 push 不是 DSH 执行的。计数口径同样以报告 §5.2 为准：39 + 9 + 14 + 9 + 2 + 8 + 10 + 4 = 95，
+> 其中本机 2 条 reparse-point 断言为 SKIP，CI 上为真实 PASS。
+
 > 铁律：`deploy 脚本测试 PASS ≠ 设备上真的能跑`；
 > `E0 PASS ≠ Mod 已安装或运行`；`bundle 组装 PASS ≠ Release 重新构建 PASS`；
 > `Emulator PASS ≠ ARM64 physical PASS`。
@@ -40,7 +45,7 @@
 
 | # | 命令（仓库根执行） | 退出码 | 结论 | 日志 |
 | --- | --- | --- | --- | --- |
-| 1 | `powershell -File Tools/tests/test_deploy_safe.ps1` | 0 | **95/95**（原 39 + 新 56） | `test_deploy_safe.txt` |
+| 1 | `powershell -File Tools/tests/test_deploy_safe.ps1` | 0 | **95/95**（原 39 + 新 56）；本机 2 条 symlink 用例记 SKIP（真实断言 93），CI runner 上 95/95 真实执行，见报告 §5.2 | `test_deploy_safe.txt` |
 | 2 | `python Tools/tests/test_ci_offline.py` | 0 | 13/13 | `ci-offline.txt` |
 | 3 | `python Tools/tests/test_p114_probe.py` | 0 | 46/46 | `p114-static.txt` |
 | 4 | `powershell -File Tools/tests/test_device_precheck.ps1` | 0 | 10/10 | `device-precheck.txt` |

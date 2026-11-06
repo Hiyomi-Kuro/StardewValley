@@ -246,7 +246,7 @@ host + 8.0 运行时，`shared/Microsoft.NETCore.App` 无 SDK，仓库 `.tmp/*/d
 
 ---
 
-## 5. Fake ADB 测试：旧 39 项 + 新 54 项 = 93 项
+## 5. Fake ADB 测试：旧 39 项 + 新 56 项 = 95 项
 
 ### 5.1 Harness 的改造
 
@@ -273,14 +273,32 @@ host + 8.0 运行时，`shared/Microsoft.NETCore.App` 无 SDK，仓库 `.tmp/*/d
 | 分组 | 覆盖内容 | 结果 |
 | --- | --- | --- |
 | 原 39 项（Phase 1.1.4 回归） | 默认只读、设备选择、签名门禁、安装门禁、脱敏、静态无卸载路径 | 39/39 PASS |
-| 计划与门禁（新） | 预检打印 12 文件计划且不写设备；推送必须显式 `-Serial`；源目录缺失/空/缺 Runtime DLL/缺 manifest；reparse point | 9/9 PASS（其中 symlink 用例在本机因权限不足记 SKIP，仍按 PASS 计并注明） |
-| 递归目录树（新） | 12 个相对路径全部存在、数量一致、逐文件本地/远端 hash 相同；`manifest.json` 在 `Mods/P114.RuntimeProbe/`；`probe-fixtures` 与三级嵌套完整 | 10/10 PASS |
-| Hash 完整性（新） | `verify-staged 12/12`、`verify-remote 12/12`、`verify-owner 12/12` | 3/3 PASS |
-| 覆盖保护（新） | 二次部署 `ALREADY-PRESENT` 且 0 次 push；不同内容 fail-closed 且文件未改；`-OverwriteModsApproved` 才替换 | 6/6 PASS |
+| 计划与门禁（新） | 预检打印 12 文件计划且不写设备；推送必须显式 `-Serial`；源目录缺失/空/缺 Runtime DLL/缺 manifest；reparse point（2 项） | 9/9 PASS（其中 2 项 reparse-point 用例在本机记 SKIP，见下方说明） |
+| 递归目录树（新） | 12 个相对路径全部存在、数量一致、逐文件本地/远端 hash 相同；`manifest.json` 在 `Mods/P114.RuntimeProbe/`；Runtime DLL 在 Mods 根；`probe-fixtures` 与三级嵌套完整；same/diff fixture 字节关系；staging 已清理；staged/remote/owner 三段校验输出 | 14/14 PASS |
+| 覆盖保护（新） | 首次部署 12 次 push；二次部署 `ALREADY-PRESENT` 且 0 次 push；不同内容 fail-closed、目标未被改、无 push、staging 清理；`-OverwriteModsApproved` 才替换且无破坏性命令 | 9/9 PASS |
 | 特殊路径（新） | 空格 / 方括号 / 圆括号 / 中文的目录与文件名，hash 仍一致 | 2/2 PASS |
 | 失败与清理（新） | push 失败、copy 失败、mkdir 失败、属主校验失败；每次失败都停止并清理 staging | 8/8 PASS |
 | 设备门禁（新） | 包未安装、版本不符、设备 APK hash 不符、uid 不可读、必需命令缺失、Mods 根属主错误；其它 Mod 未被触碰 | 10/10 PASS |
 | 无破坏性（新） | 每个推送场景均无 uninstall / pm clear / force-stop / am start / Saves / install | 4/4 PASS |
+| **合计** | 39 + 9 + 14 + 9 + 2 + 8 + 10 + 4 | **95/95**（56 项新增） |
+
+> **计数口径（Phase 1.1.6 校正）**：上表按 `Tools/tests/test_deploy_safe.ps1` 的真实执行顺序与
+> `Check` 调用逐项清点，**不重不漏**；只有这一个合计等于 `95 checks, 95 passed, 0 failed`。
+> 旧版本的 `39 + 9 + 10 + 3 + 6 + 2 + 8 + 10 + 4 = 91` 是分组重复/漏计：把
+> `verify-staged` / `verify-remote` / `verify-owner` 误算成 3 条独立断言（实际只有 2 条 `Check`，
+> 其中一条同时断言 staged 与 remote），同时递归树组漏算了 manifest 位置、fixture 关系、staging 清理等项。
+> 该旧表已废弃。
+
+> **symlink / reparse-point 的口径必须分开（Phase 1.1.6 校正）**：
+> - **DSH 本机（Windows，非管理员/未开启开发者模式）**：`New-Item -ItemType SymbolicLink` 抛异常，
+>   `$linkCreated = $false`，脚本走 `else` 分支，两条断言以 **`PASS` + detail `SKIPPED: symlink creation
+>   not permitted on this host`** 记入结果。因此本机的 `95/95` 中**有 2 条是 SKIP**，真实执行的断言是
+>   **93 条**；不能把这两条读成"本机验证过 reparse-point 拒绝"。
+> - **GitHub Windows runner（CI）**：runner 以管理员身份运行，能创建符号链接，`$linkCreated = $true`，
+>   两条断言**真实执行并 PASS**（`exit=3` + `reparse-point`，且无 push）。该结论来自 CI run
+>   `42238545103` 的 powershell-gates 作业；本阶段复核时 Actions 日志下载需要认证（未登录 API 返回 403），
+>   因此这里引用的是 CI 运行结果记录，而不是本次重新下载的日志文本。
+> - 结论：**这是测试宿主权限差异，不是产品缺陷**；本机 SKIP 与 CI PASS 必须分别陈述。
 
 关键回归点：**"旧实现能过、新实现也能过"的用例（如 `approved_push_pushes`）现在还会额外断言
 远端目录树与 hash**，所以"平铺复制"这种退化会在测试里立刻失败。
@@ -420,7 +438,7 @@ adb -s emulator-5554 shell su -c 'cat /data/data/com.chucklefish.stardewvalley/f
 
 | # | 命令 | 结果 | 日志 |
 | --- | --- | --- | --- |
-| 1 | `test_deploy_safe.ps1` | **95/95 PASS** | `logs/test_deploy_safe.txt` |
+| 1 | `test_deploy_safe.ps1` | **95/95 PASS**（本机：93 条真实断言 + 2 条 symlink SKIP，见 §5.2） | `logs/test_deploy_safe.txt` |
 | 2 | `test_loader.py --refs .tmp/p113/refs` | **45/45 驱动 + 473/473 宿主 PASS**（含 P114 套件与 65 refs 解析差分） | `logs/test_loader.txt` |
 | 3 | `test_mod_pipeline.py --refs .tmp/p113/refs` | **27/27 PASS**（见下方环境说明） | `logs/test_mod_pipeline.txt` |
 | 4 | `test_ci_offline.py` | **13/13 PASS** | `logs/ci-offline.txt` |
@@ -464,6 +482,22 @@ adb（`platform-tools`，由 `LOCALAPPDATA` 解析）、apksigner `build-tools/3
 - **DSH 没有执行 `git push`**，也没有通过任何 API/Connector 创建远程 commit 或更新 ref；
 - 远程 `main` 仍是 `ab1e10cb`，这是**预期**的，不代表本阶段失败。
 
+### 13.1 后记（Phase 1.1.6 追加，2026-11-06）
+
+上面 §13 是 **Phase 1.1.5 DSH 结束时的历史快照**，保留原样（当时确实未 commit、未 push）。
+用户随后按自己的工作流**手动**提交并 push，形成新的远程 `main`：
+
+| 项 | 值 |
+| --- | --- |
+| commit | `6e90ef2ac0e1d52832ad3564d4234640cc535d14` |
+| 父提交 | `ab1e10cb8a730ce593c463bdcfb48624c570c843`（即 §13 的 HEAD） |
+| 变更 | 9 个文件（7 modified + 2 added），+1946 / −68；包含新增的 `docs/audit/phase1.1.5-report.md` 与 `phase1.1.5-evidence-index.md` |
+| 关系 | relative to 父提交：1 commit ahead / 0 behind |
+| Actions | run `42238545103`（run #7，event=push，head_sha=`6e90ef2`）completed / **success**，3/3 jobs |
+| DSH 行为 | 该 commit 与 push **不是** DSH 执行的；DSH 没有调用 GitHub API/Connector 写 commit/branch/tag/ref |
+
+> 因此"本阶段未 push"仍是准确的历史事实；远程 `main` 现在前进到 `6e90ef2` 是**用户手动 push 的结果**。
+
 ---
 
 ## 14. 下一阶段建议（不自动启动）
@@ -471,6 +505,8 @@ adb（`platform-tools`，由 `LOCALAPPDATA` 解析）、apksigner `build-tools/3
 1. **等待批准**：先决定是否推送 P114 bundle；推送与启动必须分别批准。
 2. **工具链留在本机**：本阶段的 SDK 8.0.404 解压在任务目录
    `tasks/20261106-p115-recursive-deploy-a1/work/dotnet`（未改系统 PATH）。
+   Phase 1.1.6 复核：该目录仍存在，`dotnet.exe --list-sdks` 输出 `8.0.404 [...]`，
+   本阶段回归直接用这个 SDK，不需要"先安装 .NET 8 SDK 再重跑"。
    若要长期复现，把它移到固定的私有 SDK 目录或安装到系统，
    然后用 `Tools/find-dotnet.ps1` / `$env:STARDEW_DOTNET` 指向它；
    否则下一次会话又会退化成"无 SDK"。另外 `.tmp/` 里的旧构建状态会引起

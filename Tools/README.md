@@ -157,7 +157,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Tools\tests\run-all.ps1 -Ref
 | P114 静态安全审计 | `python Tools/tests/test_p114_probe.py` | 46 | ❌ |
 | 隐私扫描 | `python Tools/privacy-scan.py` | — | ❌ |
 | adb 解析自测 | `powershell -File Tools/tests/test_device_precheck.ps1` | 10 | ❌ |
-| 部署门禁 fake adb 自测 | `powershell -File Tools/tests/test_deploy_safe.ps1` | 38 | ❌ |
+| 部署门禁 fake adb 自测 | `powershell -File Tools/tests/test_deploy_safe.ps1` | 95 | ❌ |
 | Loader 单元 + 宿主 + P114 探针 | `python Tools/tests/test_loader.py [--refs <dir>]` | 45 驱动 + 473 内部 | 示例 mod 部分需要 |
 | 注入 / 容器 / Loader 契约 | `python Tools/tests/test_mod_pipeline.py --refs <dir>` | 27 | ✅ |
 | E0 只读预检 | `powershell -File Tools/device-precheck.ps1` | — | ❌（需要设备） |

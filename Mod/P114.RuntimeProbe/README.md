@@ -86,7 +86,9 @@ fixture），然后让 `Tools/tests/ModFramework.Tests` 用**真实 Loader** 跑
 
 ## 4. 在设备上运行（必须显式、必须批准）
 
-本阶段**没有**在设备上运行它。以下是留给批准后的步骤，**不属于**本阶段的执行记录：
+Phase 1.1.4 / 1.1.5 **没有**在设备上运行它。Phase 1.1.6 在用户明确批准后**已经**做了
+"推送 + 启动到标题界面"，但因为装机 APK 没有 Bootstrap，Loader 没有启动、探针没有执行（见 §4.1）。
+下面是完整步骤：
 
 1. 把整个 `P114.RuntimeProbe/` 目录放到游戏的 Mods 根目录（默认
    `/data/data/com.chucklefish.stardewvalley/files/Mods/`，属主必须是应用 uid）。
@@ -105,6 +107,32 @@ fixture），然后让 `Tools/tests/ModFramework.Tests` 用**真实 Loader** 跑
      第一条 `assembly-load=`，加载路径是否指向 `.staging`，mod 是否 `state=Initialized`）；
    - `<Mods>/P114.RuntimeProbe/probe-output/phase1.1.4.txt`：R-01 … R-14 的运行时观察。
 4. 用 `adb shell` 只读地取回这两个文件（不要 `pm clear`、不要卸载——会删存档）。
+
+### 4.1 当前设备前置条件与实测（Phase 1.1.6）
+
+推送 Mods **只是必要条件，不是充分条件**：Loader 必须先被 `Bootstrap` 调起来。
+
+| 事实 | 值 | 含义 |
+| --- | --- | --- |
+| 设备 | `emulator-5554`，Android 12 / API 32，x86_64 + `libnb.so` | Emulator（translated），不是 ARM64 physical |
+| 设备端 APK SHA-256 | `65e1e2af…051f9d`（388,967,580 字节） | 与本地 `app-debug.apk` 逐字节同一份 |
+| APK 内 `assemblies/assemblies.blob` | `c8ee504e…cabd9` = 仓库原始 blob | **未注入 Bootstrap 的基线 APK** |
+| APK 内 `ModFramework` / `P114` / `MonoRuntimeProbe` 条目 | 0 | 运行时不认识 `Mods/` 目录 |
+
+因此，在这台设备上**只推送 `Mods/` 再启动游戏，不会出现 `loader-report.txt`，也不会出现
+`probe-output/phase1.1.4.txt`**。要拿到 R-01…R-14 的真实设备结果，必须先把带 `Bootstrap` 的
+APK 装到设备上（那是**装机批准**，不在 Phase 1.1.6 的推送/启动批准范围内）。
+本阶段据实把这类结果记为 **BLOCKED（前置条件缺失）**，不补造数据。
+
+**实测到的第二个前置条件（Phase 1.1.6，Emulator）**：游戏冷启动时会把内部
+`/data/data/<pkg>/files/Mods/` **迁移到外部** `/sdcard/Android/data/<pkg>/files/Mods/`，
+字节不变（11/11 SHA-256 相同），日志为
+`[SDV_INIT] GetExternalFilesDir passed! There are files/folders in GetFilesDir that need to be copied.`。
+因此：
+
+- 部署后的"内部路径校验"必须在**启动前**做；启动后要到外部路径看；
+- 若将来 Bootstrap 读的是 `Context.FilesDir`，它在第一次冷启动后就会找不到 Mods；
+- 部署路径必须与 Bootstrap 实际使用的根一致，否则"文件确实在设备上"也不等于"Loader 能读到"。
 
 MuMu 12（x86_64 + `libnb.so` 翻译）上跑出来的结果只能记为 **Emulator**，不能写成 ARM64 真机。
 
