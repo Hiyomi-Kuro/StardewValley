@@ -1525,25 +1525,64 @@ public static class Loader
         }
     }
 
+    /// <summary>
+    /// The mods root the shipped APK actually uses: the app's external files directory.
+    ///
+    /// It is the same string <c>Tools/ModInjector</c> bakes into
+    /// <c>ModFramework.Bootstrap.Start()</c>, and Phase 1.1.6 observed the game migrating its
+    /// <c>files/Mods</c> here on first launch. A fallback to the app-private
+    /// <c>/data/data/&lt;pkg&gt;/files/Mods</c> would therefore point the loader at a directory
+    /// Bootstrap never loads from, so it is not used on the normal Android path.
+    /// </summary>
+    internal const string ExternalModsRoot =
+        "/sdcard/Android/data/com.chucklefish.stardewvalley/files/Mods";
+
     internal static string DefaultModsRoot()
     {
+        string? location;
         try
         {
-            var location = typeof(Loader).Assembly.Location;
-            if (!string.IsNullOrEmpty(location))
-            {
-                var directory = Path.GetDirectoryName(location);
-                if (!string.IsNullOrEmpty(directory))
-                {
-                    return directory!;
-                }
-            }
+            location = typeof(Loader).Assembly.Location;
         }
         catch (Exception)
         {
-            // fall through
+            // A host that cannot report a location can only mean "load from the external root".
+            return ExternalModsRoot;
         }
-        return "/data/data/com.chucklefish.stardewvalley/files/Mods";
+
+        return ResolveModsRoot(location);
+    }
+
+    /// <summary>
+    /// Pure resolver behind <see cref="DefaultModsRoot"/>: the directory that contains the
+    /// framework assembly, or <see cref="ExternalModsRoot"/> when the host reports no usable
+    /// location (the assembly was loaded from a <c>byte[]</c>, from a single-file bundle, or
+    /// <see cref="System.Reflection.Assembly.Location"/> threw).
+    ///
+    /// Separated from the production entry point so the desktop host tests can exercise every
+    /// branch without a device, and so the fallback stays one constant shared with the injector.
+    /// The returned path is normalized (<c>/</c> separators) exactly like
+    /// <see cref="PathRules.Normalize"/>, so an Android path and a desktop path compare the same.
+    /// </summary>
+    internal static string ResolveModsRoot(string? location)
+    {
+        if (!string.IsNullOrEmpty(location))
+        {
+            try
+            {
+                var directory = Path.GetDirectoryName(location!);
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    return PathRules.Normalize(directory!);
+                }
+            }
+            catch (Exception)
+            {
+                // An unusable location is the same answer as a missing one.
+            }
+        }
+
+        return ExternalModsRoot;
     }
 
     /// <summary>Writes both report files; returns false when neither could be written.</summary>

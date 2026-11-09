@@ -270,3 +270,4 @@ S1 优先：它修正的正是被校验的那个字段，且若不生效可以�
 | 2026-11-05 | Phase 0.5 | D1 改为 `Assembly.LoadFrom(string)`，`Load(byte[])` 降级为历史/否决方案 | 源码（`Loader.cs`、`ModInjector` 注入的 IL）与设备异常都只走 `LoadFrom`；`Load(byte[])` 在裁剪后的运行时不存在 |
 | 2026-11-05 | Phase 0.5 | D3 的 `Start()` 描述改为与注入 IL 一致的 5 阶段 + 吞异常语义；补充"默认 `--loader-api loadfrom`" | `Tools/ModInjector/Program.cs` 默认值曾是 `load(byte[])`（缺陷，已修）；见 `phase0.5-report.md` §5 |
 | 2026-11-05 | Phase 0.5 | 新增 §6.2 复核表：E1/E2 只在模拟器通过，ADR 维持 Proposed | 本机只有 x86_64 模拟器；真机 E1/E2 = BLOCKED |
+| 2026-11-07 | Phase 1.1.7 | D3 的"构建期 IL 注入"从工具能力变成**正式构建入口**：新增 `assembleModdedDebug`（独立产物/work dir/keystore 策略），baseline `assembleDebug` 保持不注入；D4 的目录约定与 `Loader` fallback 对齐（外部 Mods 根，不再回退内部 `files/Mods`） | `docs/audit/phase1.1.7-report.md`；ADR 仍为 **Proposed**——本阶段只完成构建与静态验收，没有在设备上跑过注入后的 APK |

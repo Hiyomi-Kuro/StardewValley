@@ -74,7 +74,13 @@ public static class Program
         Console.WriteLine();
         Console.WriteLine("  verify <in.dll> [--hook-method <name>]");
         Console.WriteLine("         Checks bootstrap type, Start(), the hook call, the assembly-load API");
-        Console.WriteLine("         baked into Start(), and the MVID.");
+        Console.WriteLine("         baked into Start(), the Mods directory baked into Start(), and the MVID.");
+        Console.WriteLine();
+        Console.WriteLine("  verify options:");
+        Console.WriteLine("    --hook-method <name>   method expected to carry the hook (default: OnCreatePartTwo)");
+        Console.WriteLine("    --mods-dir <dir>       Mods directory Start() must have baked in");
+        Console.WriteLine("                           (default: the external Mods root; a baked");
+        Console.WriteLine("                           /data/data/... path fails unless --allow-private-mods-dir)");
         Console.WriteLine();
         Console.WriteLine("  patch options:");
         Console.WriteLine("    --hook-method <name>   method to hook (default: OnCreatePartTwo)");
@@ -225,6 +231,8 @@ public static class Program
         {
             ["_0"] = output,
             ["hook-method"] = hookMethodName,
+            ["mods-dir"] = modsDir,
+            ["runtime-dll"] = runtimeDll,
         };
         if (!useLoadFrom)
         {
@@ -553,6 +561,43 @@ public static class Program
         var isFirst = firstReal is not null && ReferenceEquals(firstReal, call);
         Console.WriteLine("hook-is-first  : " + (isFirst ? "yes" : "no"));
         ok &= isFirst;
+
+        // Which mods directory did Start() bake in? Bootstrap and Loader have to agree on one
+        // root, and the shipped build has to use the external Mods directory: the app-private
+        // files/Mods is not where the injected path points, so a fallback there would make the
+        // loader read a directory Bootstrap never populated.
+        var runtimeDll = opts.TryGetValue("runtime-dll", out var rd) ? rd : DefaultRuntimeDll;
+        var expectedModsDir = opts.TryGetValue("mods-dir", out var emd) ? emd : DefaultModsDir;
+        var bakedModsDir = "(none)";
+        if (start is not null)
+        {
+            var suffix = "/" + runtimeDll;
+            foreach (var ins in start.Body.Instructions)
+            {
+                if (ins.OpCode == OpCodes.Ldstr
+                    && ins.Operand is string s
+                    && s.EndsWith(suffix, StringComparison.Ordinal))
+                {
+                    bakedModsDir = s.Substring(0, s.Length - suffix.Length);
+                }
+            }
+        }
+        Console.WriteLine("mods-dir       : " + bakedModsDir);
+        Console.WriteLine("mods-dir-expect: " + expectedModsDir);
+        var modsDirOk = string.Equals(bakedModsDir, expectedModsDir, StringComparison.Ordinal);
+        Console.WriteLine("mods-dir-ok    : " + (modsDirOk ? "yes" : "no"));
+        ok &= modsDirOk;
+
+        // The private directory is only ever accepted when a caller explicitly asks for it,
+        // so a default build cannot silently bake the wrong root.
+        if (!opts.ContainsKey("allow-private-mods-dir")
+            && bakedModsDir.StartsWith("/data/data/", StringComparison.Ordinal))
+        {
+            Console.WriteLine("                 (the app-private files/Mods is rejected by default;");
+            Console.WriteLine("                  pass --allow-private-mods-dir only for a diagnosis build)");
+            ok = false;
+        }
+
         Console.WriteLine("mvid           : " + module.Mvid);
         Console.WriteLine(ok ? "RESULT: OK" : "RESULT: FAILED");
         return ok ? 0 : 1;

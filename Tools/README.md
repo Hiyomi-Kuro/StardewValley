@@ -143,6 +143,46 @@ hash→(store,index) 映射表)` + 负载。新增条目必须同步改 gap 表�
 命名成 `_Microsoft.Android.Resource.Designer`（内容与文件名不符）。
 现在按 `entry_count` 自动判定 `Blob ID`，判定不唯一时直接报错；也可用 `--blob-id 001` 显式指定。
 
+## mod-enabled APK 构建（Phase 1.1.7）
+
+`Tools/ModInjector` 与 `Tools/AssemblyStore/store.py` 已经由两个脚本接进**正式的** APK 构建入口；
+不再需要手工"解包 → patch → replace → 放回 `apkroot`"。
+
+```powershell
+# 1) 准备注入后的 blob（只读源树；产物在 .tmp/build-modded）
+python Tools/build_modded_apk.py `
+    --dotnet <dotnet-8.0.404> `
+    --work .tmp/build-modded `
+    --out-blob .tmp/build-modded/modded-assemblies.blob `
+    --manifest-json .tmp/build-modded/modded-build-manifest.json
+
+# 2) 打包（独立产物；baseline app-debug.apk 不受影响）
+.\gradlew.bat :app:assembleModdedDebug `
+    "-Pdotnet=<dotnet-8.0.404>" "-Pkeystore=.work/debug.keystore"
+
+# 3) 静态验收 + 签名连续性判定
+python Tools/verify_modded_apk.py `
+    --candidate app/build/outputs/apk/modded/app-modded-debug.apk `
+    --baseline app/build/outputs/apk/debug/app-debug.apk `
+    --blob-manifest .tmp/build-modded/modded-build-manifest.json `
+    --report .tmp/build-modded/modded-apk-verify.json `
+    --keystore .work/debug.keystore
+```
+
+要点：
+
+| 项 | 行为 |
+| --- | --- |
+| `assembleDebug` | **baseline**：不注入，仍输出 `app/build/outputs/apk/debug/app-debug.apk` |
+| `assembleModdedDebug` | 注入 `Bootstrap.Start()`，输出 `app/build/outputs/apk/modded/app-modded-debug.apk`，work dir `.tmp/build-modded` |
+| 源树 | `app/src/main/apkroot` **永远不被写回**；`build_modded_apk.py` 的 `--out-blob` 没有默认值 |
+| 注入校验 | hook 必须是首条有效 IL、MVID 必须变、API 必须是 `Assembly.LoadFrom(string)`、烘焙 Mods 根必须是外部路径 |
+| 尺寸上限 | patched 解压长度必须 ≤ `libxamarin-app.so` 尺寸表（`descriptor_index=7` → 9,280,000）；超限直接失败，不填充 |
+| 签名 | `--require-existing-keystore`：keystore 缺失时**失败**，绝不自动生成新 key（新 key 装不上已装的包） |
+
+`verify_modded_apk.py` 的最后一项是**安装准入**判定：候选 signer 必须与 baseline（= 已安装包）完全一致，
+否则状态为 `UPDATE_INCOMPATIBLE_RISK`（退出码仍为 0——那是门禁 BLOCKED，不是构建失败）。
+
 ## 离线回归
 
 一键跑全部（需要 65 个程序集；没有则相关套件标 SKIPPED）：
@@ -154,11 +194,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Tools\tests\run-all.ps1 -Ref
 | 套件 | 命令 | 项数 | 需要游戏程序集 |
 | --- | --- | --- | --- |
 | CI 离线检查 | `python Tools/tests/test_ci_offline.py` | 13 | ❌ |
+| mod-enabled 构建静态检查 | `python Tools/tests/test_modded_build.py` | 49 | ❌ |
 | P114 静态安全审计 | `python Tools/tests/test_p114_probe.py` | 46 | ❌ |
 | 隐私扫描 | `python Tools/privacy-scan.py` | — | ❌ |
 | adb 解析自测 | `powershell -File Tools/tests/test_device_precheck.ps1` | 10 | ❌ |
 | 部署门禁 fake adb 自测 | `powershell -File Tools/tests/test_deploy_safe.ps1` | 95 | ❌ |
-| Loader 单元 + 宿主 + P114 探针 | `python Tools/tests/test_loader.py [--refs <dir>]` | 45 驱动 + 473 内部 | 示例 mod 部分需要 |
+| Loader 单元 + 宿主 + P114 探针 | `python Tools/tests/test_loader.py [--refs <dir>]` | 45 驱动 + 481 内部 | 示例 mod 部分需要 |
 | 注入 / 容器 / Loader 契约 | `python Tools/tests/test_mod_pipeline.py --refs <dir>` | 27 | ✅ |
 | E0 只读预检 | `powershell -File Tools/device-precheck.ps1` | — | ❌（需要设备） |
 
@@ -184,11 +225,15 @@ CI 现在会拦住新的乱码：`test_ci_offline.py` 检查私用区字符与 2
 ## 完整链路（E1 需要，尚未在真机执行）
 
 ```text
-extract blob → ModInjector patch → store.py replace → 放回 apkroot
-   → gradlew assembleDebug（apktool + zipalign + apksigner）
+python Tools/build_modded_apk.py        # extract blob → ModInjector patch/verify → store.py replace
+   → gradlew assembleModdedDebug        # apktool + zipalign + apksigner（独立产物）
+   → verify_modded_apk.py               # 条目逐 CRC 比对 + 签名连续性判定
    → deploy-apk-safe.ps1（默认只读；-InstallApproved 同签名覆盖；-PushModsApproved 放 Mods）
    → 启动 → 取 loader.log / loader-report.txt / probe-output/phase1.1.4.txt
 ```
+
+> Phase 1.1.7 起**没有**"把 blob 放回 `app/src/main/apkroot` 再 `assembleDebug`"这一步：
+> 那会让 baseline 构建意外带上注入。注入只走 `assembleModdedDebug` 的独立输入。
 
 > Phase 1.1.4 起**没有** `adb uninstall` 这一步。旧的 `deploy-apk.ps1` 之所以要先卸载，
 > 是因为它假设每次都是"自签名包换掉官方包"；那会删存档。现在的门禁要求"能证明签名一致才覆盖"，

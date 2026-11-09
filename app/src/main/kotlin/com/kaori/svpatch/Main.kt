@@ -3,6 +3,7 @@ package com.kaori.svpatch
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.nio.file.StandardCopyOption
 
 /**
  * 构建入口。
@@ -23,16 +24,50 @@ import java.nio.file.Paths
  *
  * 仓库里没有 payload/base.apk，也没有 smali：dex 以原始字节参与打包，
  * 唯一的行为改动是清单里的启动入口。
+ *
+ * Phase 1.1.7 增加了**可选的** mod-enabled 入口（Gradle `assembleModdedDebug`）：
+ *
+ *   --bootstrap-blob <path>      staging 之后用这份 assemblies.blob 覆盖 APK 根目录里的
+ *                                assemblies/assemblies.blob（由 Tools/build_modded_apk.py 生成）
+ *   --keystore <path>            显式指定签名用的 keystore（默认 <work>/debug.keystore）
+ *   --require-existing-keystore  keystore 不存在时失败，而不是生成新 key
+ *
+ * 不带这些参数时行为与 Phase 1.1.6 完全一致，`assembleDebug` 仍是 baseline 构建。
  */
 fun main(args: Array<String>) {
-    if (args.size < 3) {
-        System.err.println("用法: <app.dir> <output.apk> <work.dir>")
-        kotlin.system.exitProcess(2)
+    val positional = ArrayList<String>()
+    var bootstrapBlob: Path? = null
+    var keystoreOverride: Path? = null
+    var requireExistingKeystore = false
+
+    var i = 0
+    while (i < args.size) {
+        when (val arg = args[i]) {
+            "--bootstrap-blob" -> {
+                bootstrapBlob = Paths.get(args.getOrNull(++i) ?: fail("--bootstrap-blob 需要一个路径"))
+            }
+            "--keystore" -> {
+                keystoreOverride = Paths.get(args.getOrNull(++i) ?: fail("--keystore 需要一个路径"))
+            }
+            "--require-existing-keystore" -> requireExistingKeystore = true
+            else -> {
+                if (arg.startsWith("--")) fail("未知参数: $arg")
+                positional.add(arg)
+            }
+        }
+        i++
     }
 
-    val appModule = Paths.get(args[0]).toAbsolutePath()
-    val output = Paths.get(args[1]).toAbsolutePath()
-    val work = Paths.get(args[2]).toAbsolutePath()
+    if (positional.size < 3) {
+        fail(
+            "用法: <app.dir> <output.apk> <work.dir> " +
+                "[--bootstrap-blob <blob>] [--keystore <path>] [--require-existing-keystore]"
+        )
+    }
+
+    val appModule = Paths.get(positional[0]).toAbsolutePath()
+    val output = Paths.get(positional[1]).toAbsolutePath()
+    val work = Paths.get(positional[2]).toAbsolutePath()
 
     Log.step("校验 app/ 模块")
     AppSource.verify(appModule)
@@ -48,6 +83,12 @@ fun main(args: Array<String>) {
     LargeAssets.assemble(appModule, decoded)
     Log.ok("已组装 $decoded")
 
+    if (bootstrapBlob != null) {
+        Log.step("注入 mod-enabled assemblies.blob")
+        injectAssembliesBlob(decoded, bootstrapBlob)
+    } else {
+        Log.ok("baseline 构建：APK 使用 app/src/main/apkroot 里的原始 assemblies.blob")
+    }
     Log.step("套用补丁")
     val patches = listOf<ApkPatch>(LaunchEntryPatch())
     for (patch in patches) {
@@ -62,12 +103,43 @@ fun main(args: Array<String>) {
     val aligned = work.resolve("aligned.apk")
     tools.zipalign(unsigned, aligned)
 
-    ApkSigner(tools, work.resolve("debug.keystore")).sign(aligned, output)
+    val keystore = keystoreOverride ?: work.resolve("debug.keystore")
+    Log.ok("keystore: $keystore (require-existing=$requireExistingKeystore)")
+    ApkSigner(tools, keystore, requireExistingKeystore).sign(aligned, output)
 
     Log.step("完成")
     Log.ok("产物  : $output")
     Log.ok("大小  : ${"%.2f".format(Files.size(output) / 1024.0 / 1024.0)} MiB")
     Log.ok("sha256: ${Sha256.of(output)}")
+}
+
+/**
+ * 用已经注入好的 blob 覆盖 staging 树里的 assemblies.blob。
+ *
+ * 只动 staging：`app/src/main/apkroot` 永远不被写回，所以 baseline 构建和原始 blob 的
+ * SHA-256 都不受影响。容器内容（58 个条目、descriptor index、未改动条目）由
+ * `Tools/build_modded_apk.py` 在生成这份 blob 时逐条校验，这里只做形态检查。
+ */
+private fun injectAssembliesBlob(decoded: Path, blob: Path) {
+    require(Files.isRegularFile(blob)) { "缺少 --bootstrap-blob 文件: $blob" }
+    val target = decoded.resolve("unknown").resolve("assemblies").resolve("assemblies.blob")
+    require(Files.isRegularFile(target)) { "staging 树里没有 assemblies.blob: $target" }
+
+    val head = ByteArray(4)
+    Files.newInputStream(blob).use { stream ->
+        require(stream.read(head) == 4) { "blob 太小: $blob" }
+    }
+    require(String(head, Charsets.US_ASCII) == "XABA") { "不是 XABA 容器: $blob" }
+
+    Files.copy(blob, target, StandardCopyOption.REPLACE_EXISTING)
+    Log.ok("blob  : ${blob.toAbsolutePath()}")
+    Log.ok("sha256: ${Sha256.of(blob)}")
+    Log.ok("覆盖  : ${target.toAbsolutePath()}")
+}
+
+private fun fail(message: String): Nothing {
+    System.err.println("错误: $message")
+    kotlin.system.exitProcess(2)
 }
 
 /** 校验 app/ 模块结构，并把标准目录映射成 apktool 的布局。 */

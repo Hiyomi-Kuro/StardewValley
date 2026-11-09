@@ -3,12 +3,13 @@
 #
 # What runs:
 #   1. CI offline suite        (python, no game binaries)          always
-#   2. P114 static safety audit (python, no game binaries)         always
-#   3. privacy scan            (python, no game binaries)          always
-#   4. device-precheck self-test (PowerShell, no device)           always
-#   5. deploy-apk-safe fake-adb suite (PowerShell, no device)      always
-#   6. mod pipeline            (needs the 65 game assemblies)      when --Refs is usable
-#   7. loader + host + P114 probe (needs dotnet; --Refs for the example mod)
+#   2. modded-build static     (python, no game binaries)          always
+#   3. P114 static safety audit (python, no game binaries)         always
+#   4. privacy scan            (python, no game binaries)          always
+#   5. device-precheck self-test (PowerShell, no device)           always
+#   6. deploy-apk-safe fake-adb suite (PowerShell, no device)      always
+#   7. mod pipeline            (needs the 65 game assemblies)      when --Refs is usable
+#   8. loader + host + P114 probe (needs dotnet; --Refs for the example mod)
 #
 # Nothing here installs anything, touches a device, or writes outside --LogDir.
 #
@@ -73,6 +74,7 @@ function Invoke-Skipped([string]$name, [string]$why) {
 Push-Location $root
 try {
     Invoke-Suite "ci-offline" "ci-offline.txt" { python Tools\tests\test_ci_offline.py }
+    Invoke-Suite "modded-build-static" "modded-build-static.txt" { python Tools\tests\test_modded_build.py }
     Invoke-Suite "p114-static-audit" "p114-static-audit.txt" { python Tools\tests\test_p114_probe.py }
     Invoke-Suite "privacy-scan" "privacy-scan.txt" { python Tools\privacy-scan.py --include-untracked }
 

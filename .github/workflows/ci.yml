@@ -40,6 +40,13 @@ jobs:
       - name: offline suite
         run: python Tools/tests/test_ci_offline.py
 
+      - name: mod-enabled build static checks
+        # Source-text + synthetic-container checks: assembleDebug stays baseline,
+        # assembleModdedDebug is explicit and cannot generate a signing key, Bootstrap and the
+        # Loader share one external Mods root, and store.py keeps the XALZ descriptor index.
+        # No game assemblies, no APK, no device.
+        run: python Tools/tests/test_modded_build.py
+
       - name: P114 static safety audit
         # Source-text audit: the default probe path has no P/Invoke/mprotect/detour code, the
         # historical T11/T12 files are compiled out, and the deployment scripts have no

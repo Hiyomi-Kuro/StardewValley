@@ -90,8 +90,11 @@ Phase 1.1.4 / 1.1.5 **没有**在设备上运行它。Phase 1.1.6 在用户明�
 "推送 + 启动到标题界面"，但因为装机 APK 没有 Bootstrap，Loader 没有启动、探针没有执行（见 §4.1）。
 下面是完整步骤：
 
-1. 把整个 `P114.RuntimeProbe/` 目录放到游戏的 Mods 根目录（默认
-   `/data/data/com.chucklefish.stardewvalley/files/Mods/`，属主必须是应用 uid）。
+1. 把整个 `P114.RuntimeProbe/` 目录放到游戏的 Mods 根目录。Mods 根是**应用专属外部目录**
+   `/sdcard/Android/data/com.chucklefish.stardewvalley/files/Mods/`（属主必须是应用 uid）——
+   它同时是 `Tools/ModInjector` 烘焙进 `Bootstrap.Start()` 的路径。内部
+   `/data/data/com.chucklefish.stardewvalley/files/Mods/` 只在**第一次冷启动之前**有效：
+   游戏会把里面的内容迁移到外部目录（见 §4.1）。
    Phase 1.1.5 起**只用**修复后的安全递归脚本推送，不要手工 `cp`：
 
    ```powershell
@@ -135,6 +138,44 @@ APK 装到设备上（那是**装机批准**，不在 Phase 1.1.6 的推送/启�
 - 部署路径必须与 Bootstrap 实际使用的根一致，否则"文件确实在设备上"也不等于"Loader 能读到"。
 
 MuMu 12（x86_64 + `libnb.so` 翻译）上跑出来的结果只能记为 **Emulator**，不能写成 ARM64 真机。
+
+### 4.2 第三个前置条件：APK 必须注入 Bootstrap（Phase 1.1.7）
+
+Phase 1.1.6 暴露的根因是：装机 APK 就是 baseline APK，里面没有 `ModFramework.Bootstrap`，
+所以 `Loader` 从未被调用。Phase 1.1.7 把已有的 `Tools/ModInjector` + `Tools/AssemblyStore/store.py`
+真正接进了构建入口：
+
+```powershell
+# baseline（不注入，行为与 Phase 1.1.6 相同）
+./gradlew :app:assembleDebug
+
+# mod-enabled（把 Bootstrap.Start() 注入 StardewValley.dll 再打包）
+./gradlew :app:assembleModdedDebug `
+    -Pdotnet <dotnet-8.0.404> `
+    -Pkeystore <已存在的 debug.keystore>
+```
+
+产物是 `app/build/outputs/apk/modded/app-modded-debug.apk`，与 baseline 的
+`app-debug.apk` 完全分离。`-Pkeystore` 必须是**已经签过装机 APK 的那把 key**：
+`--require-existing-keystore` 会让构建在 keystore 缺失时直接失败，而不是生成新 key
+（新 key 无法覆盖安装，卸载会删存档）。
+
+两个可复核的静态证据：
+
+```powershell
+python Tools/build_modded_apk.py --dotnet <dotnet> --work .tmp/build-modded `
+    --out-blob .tmp/build-modded/modded-assemblies.blob `
+    --manifest-json .tmp/build-modded/modded-build-manifest.json
+python Tools/verify_modded_apk.py `
+    --candidate app/build/outputs/apk/modded/app-modded-debug.apk `
+    --baseline app/build/outputs/apk/debug/app-debug.apk `
+    --blob-manifest .tmp/build-modded/modded-build-manifest.json `
+    --report .tmp/build-modded/modded-apk-verify.json
+```
+
+第一个脚本会在替换后**从新 blob 重新解出** `StardewValley.dll` 再 verify，第二个脚本会把 APK
+里除 `assemblies.blob` 与 `META-INF/` 之外的每个条目与 baseline 逐 CRC 比对。安装仍然需要
+单独批准，见 `docs/audit/phase1.1.7-report.md` §6。
 
 ## 5. 用例
 

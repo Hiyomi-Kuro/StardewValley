@@ -32,6 +32,7 @@ internal static class HostTests
         IdempotentSecondRun(t, fixtureDll, dependencyDll);
         Reentrancy(t, fixtureDll);
         RootHandling(t);
+        ModsRootConsistency(t);
         VersionGateFailClosed(t, fixtureDir);
         AssemblyConflictPreflight(t, fixtureDir);
         LoggerDegraded(t, fixtureDir);
@@ -174,6 +175,59 @@ internal static class HostTests
         t.Check("host_missing_root_is_reported",
             missingResult != null && missingResult.IndexOf("MF0902", StringComparison.Ordinal) >= 0,
             missingResult ?? "(null)");
+    }
+
+    /// <summary>
+    /// Phase 1.1.7: one mods root, shared by Bootstrap and Loader.
+    ///
+    /// Bootstrap bakes <c>/sdcard/Android/data/&lt;pkg&gt;/files/Mods</c> into the injected
+    /// <c>Start()</c>; the loader must resolve the same directory when
+    /// <see cref="Assembly.Location"/> cannot name one, instead of the app-private
+    /// <c>files/Mods</c> the framework used to fall back to. These checks pin the pure resolver
+    /// (<see cref="Loader.ResolveModsRoot"/>) so every branch is covered on the desktop.
+    /// </summary>
+    private static void ModsRootConsistency(TestRunner t)
+    {
+        const string External = "/sdcard/Android/data/com.chucklefish.stardewvalley/files/Mods";
+
+        t.Check("modsroot_external_constant", Loader.ExternalModsRoot == External, Loader.ExternalModsRoot);
+
+        // Location unavailable in any of the three ways the runtime can express it.
+        t.Check("modsroot_null_location", Loader.ResolveModsRoot(null) == External, Loader.ResolveModsRoot(null));
+        t.Check("modsroot_empty_location", Loader.ResolveModsRoot("") == External, Loader.ResolveModsRoot(""));
+        t.Check("modsroot_bare_file_location", Loader.ResolveModsRoot("ModFramework.Runtime.dll") == External,
+            Loader.ResolveModsRoot("ModFramework.Runtime.dll"));
+
+        // Location points at the external root: the parent directory wins.
+        var located = Loader.ResolveModsRoot(External + "/ModFramework.Runtime.dll");
+        t.Check("modsroot_location_parent", located == External, located);
+
+        // Normalization: a Windows desktop path comes back with forward slashes, exactly like
+        // PathRules.Normalize, so the same string compares equal on both platforms.
+        var windows = Loader.ResolveModsRoot(@"C:\mods\test\ModFramework.Runtime.dll");
+        t.Check("modsroot_normalizes_separators", windows == "C:/mods/test", windows);
+
+        // The private directory is never produced by the resolver on any branch.
+        var branches = new[]
+        {
+            Loader.ResolveModsRoot(null),
+            Loader.ResolveModsRoot(""),
+            Loader.ResolveModsRoot("ModFramework.Runtime.dll"),
+            Loader.DefaultModsRoot(),
+        };
+        var privateHit = "";
+        foreach (var branch in branches)
+        {
+            if (branch.IndexOf("/data/data/", StringComparison.Ordinal) >= 0)
+            {
+                privateHit = branch;
+            }
+        }
+        t.Check("modsroot_never_private_fallback", privateHit.Length == 0, privateHit);
+
+        // Production default is unchanged where a location exists: it is that location's parent.
+        var expected = Loader.ResolveModsRoot(typeof(Loader).Assembly.Location);
+        t.Check("modsroot_default_uses_location", Loader.DefaultModsRoot() == expected, Loader.DefaultModsRoot());
     }
 
     /// <summary>

@@ -338,6 +338,7 @@ Bootstrap（注入进 `StardewValley.dll` 的 IL）只做四件事：
 | 2026-11-06 | Phase 1.1.3：去重键降级为候选索引（`dedup key -> List<SnapshotEntry>`，命中后逐字节比较才共享）、快照完整性改用独立 SHA-256 摘要且无 SHA-256 时 Fail-Closed、`LoadFrom` 返回对象与 claim 身份核对（`MF0210`）、暂存路径永不复用（同名追加 `~N`） |
 | 2026-11-06 | Phase 1.1.5：新增 §9.1 部署契约——`ModDiscovery` 只认一级子目录 + 各自 `manifest.json`，因此部署器必须递归还原目录树并逐文件校验远端 SHA-256；`deploy-apk-safe.ps1` 的平铺复制缺陷已修复 |
 | 2026-11-06 | Phase 1.1.4：**Loader 逻辑未改**。新增一个普通 manifest mod（`P114.RuntimeProbe`）作为可复现的端到端观察点，见 §12 |
+| 2026-11-07 | Phase 1.1.7：新增 §13——Bootstrap 与 Loader 必须用同一个 Mods 根（fallback 从内部 `files/Mods` 改为外部路径，抽出 `ResolveModsRoot` 纯函数）、baseline 与 mod-enabled 两条独立构建路径、注入与尺寸上限流程、`--require-existing-keystore`；`ModInjector verify` 增加烘焙路径校验。见 `docs/audit/phase1.1.7-report.md` |
 
 ---
 
@@ -372,3 +373,71 @@ Phase 1.1.3 留下的问题是"这条链路在真实 MonoVM 上到底怎么表�
 且 Emulator 与 ARM64 真机必须分列——本阶段两者都是 **NOT RUN / BLOCKED**。
 
 详见 `docs/audit/phase1.1.4-report.md` §5 与 §9。
+
+---
+
+## 13. Phase 1.1.7：Mods 根一致性 与 mod-enabled 构建入口
+
+### 13.1 三个"Mods 根"必须指向同一个目录
+
+| 来源 | 值 | 何时生效 |
+| --- | --- | --- |
+| Bootstrap 里烘焙的 `Ldstr`（`Tools/ModInjector` 默认） | `/sdcard/Android/data/com.chucklefish.stardewvalley/files/Mods` | 注入 IL 时写死，`--mods-dir` 可覆盖 |
+| `Loader.DefaultModsRoot()` | `typeof(Loader).Assembly.Location` 的父目录 | 正常 Android 路径：Bootstrap 从 Mods 根 `LoadFrom`，所以 Location 就在 Mods 根 |
+| `Loader.ResolveModsRoot(string?)` 的 fallback | 同一个外部路径 | Location 为空、抛异常、或没有父目录时 |
+
+Phase 1.1.6 实测：游戏冷启动会把内部 `/data/data/<pkg>/files/Mods` **迁移到外部**目录。旧代码在
+Location 不可用时回退到内部 `files/Mods`，与 Bootstrap 烘焙的路径不一致——Loader 会去读一个
+Bootstrap 永远不会写的目录。Phase 1.1.7 的修正：
+
+- fallback 改为外部路径（常量 `Loader.ExternalModsRoot`）；
+- "取父目录 + 归一化"抽成纯函数 `Loader.ResolveModsRoot(string?)`，`DefaultModsRoot()` 只负责
+  取 `Location`，不再自己拼路径；
+- 生产默认值不变：Location 可用时仍然是它的父目录。
+
+Host tests 覆盖四个分支（Location 为 `null` / 空串 / 只有文件名 / 正常路径），并断言任何分支
+都不会产生 `/data/data/...`。`Tools/tests/test_modded_build.py` 进一步断言
+Loader、ModInjector、构建脚本三处的字面值逐字符相同。
+
+### 13.2 baseline 构建与 mod-enabled 构建是两条独立的路
+
+| | `assembleDebug` | `assembleModdedDebug` |
+| --- | --- | --- |
+| 用途 | baseline（Phase 1.1.6 及之前的行为） | 注入 `Bootstrap.Start()` |
+| 输入 blob | `app/src/main/apkroot/assemblies/assemblies.blob` 原样 | `.tmp/build-modded/modded-assemblies.blob` |
+| 产物 | `app/build/outputs/apk/debug/app-debug.apk` | `app/build/outputs/apk/modded/app-modded-debug.apk` |
+| work dir | `.tmp/build` | `.tmp/build-modded` |
+| keystore | `<work>/debug.keystore`，缺失时生成 | 必须已存在（`--require-existing-keystore`） |
+| 依赖 | `classes` | `classes` + `prepareModdedAssemblies` |
+
+`assemble` 仍然只依赖 `assembleDebug`。mod-enabled 的产物路径、work dir、keystore 策略都与
+baseline 分离，因此不可能覆盖 baseline APK。`Main.kt` 的注入是**可选参数**
+（`--bootstrap-blob`）：缺省时不注入，行为与 Phase 1.1.6 相同。
+
+### 13.3 注入流程（`Tools/build_modded_apk.py`）
+
+1. 只读读取 `assemblies.blob` / `assemblies.manifest` / `assemblies.arm64_v8a.blob`，记录 SHA-256；
+2. 用 `Tools/AssemblyStore/store.py` 解出 58 + 7 = 65 个程序集，清单名与下标一一对应；
+3. `dotnet build Tools/ModInjector`（SDK 8.0.404）；
+4. 对 staging 里的 `StardewValley.dll` 执行 `ModInjector patch`（默认 `--loader-api loadfrom`、
+   外部 Mods 根、hook `OnCreatePartTwo`）；
+5. `ModInjector verify` 必须确认：Bootstrap 类型与 `Start` 存在、hook 是首条有效 IL、API 是
+   `Assembly.LoadFrom(string)`、烘焙路径等于外部 Mods 根、MVID 已变化；
+6. `store.py replace` 只替换既有的 `StardewValley` 条目；
+7. 复核新 blob：header/version、`entry_count=58`、`total_count=65`、gap 原样、
+   `descriptor_index=7`、其余 57 条解压后 SHA 不变、架构 blob 与 manifest 不变；
+8. 从新 blob **重新解出** `StardewValley.dll` 再 verify 一次（不是只验 staging 副本）；
+9. patched 长度必须 `<=` `libxamarin-app.so` 尺寸表里该 descriptor 的 expected size
+   （本次 9,261,568 ≤ 9,280,000）。超限即停止：不填充、不改 descriptor、不改 `.so`。
+
+### 13.4 签名连续性是安装的硬门槛
+
+`Signing.kt` 在 keystore 缺失时会自动生成新 key。对 baseline 构建这是方便，对"覆盖安装"则是
+灾难：新 key 与被安装包的证书不同，`adb install -r` 必然
+`INSTALL_FAILED_UPDATE_INCOMPATIBLE`，而卸载会删存档。因此 mod-enabled 构建显式传
+`--require-existing-keystore`：keystore 不存在就直接失败，绝不生成。
+
+Phase 1.1.7 的实测结论是**签名不连续**：设备上那份 APK 的 signer 是 `611c8fa4…`，而本机现存
+唯一的 keystore（`.work/debug.keystore`）给出 `858ef62d…`，原来那把 key 已不在本机。
+`Tools/verify_modded_apk.py` 把这种情况记为 `UPDATE_INCOMPATIBLE_RISK`（安装门禁 BLOCKED，
+不是构建失败）。详见 `docs/audit/phase1.1.7-report.md`。

@@ -117,6 +117,24 @@ wrapper 的 `distributionUrl` 默认指向腾讯镜像（国内 services.gradle.
 .\gradlew.bat assembleDebug
 ```
 
+产物 `app/build/outputs/apk/debug/app-debug.apk` 是 **baseline**：不含任何 Mod 支持代码。
+
+### mod-enabled APK（Phase 1.1.7）
+
+要让装机后能加载 `Mods/`，必须显式构建注入版——默认构建**不会**注入：
+
+```powershell
+python Tools/build_modded_apk.py --dotnet <SDK 8.0.404> --work .tmp/build-modded `
+    --out-blob .tmp/build-modded/modded-assemblies.blob `
+    --manifest-json .tmp/build-modded/modded-build-manifest.json
+
+.\gradlew.bat :app:assembleModdedDebug "-Pdotnet=<SDK 8.0.404>" "-Pkeystore=<debug.keystore>"
+```
+
+产物是 `app/build/outputs/apk/modded/app-modded-debug.apk`，与 baseline APK 完全分开。
+`-Pkeystore` 必须是**已经签过当前装机包的那把 key**：脚本不会自动生成新 key，
+因为不同的 key 无法覆盖安装，而卸载会删除存档。
+
 ### Mod Framework（C#）
 
 用**游戏自带的程序集**当参考程序集编译，否则"用了运行时被裁掉的 BCL 成员"只会在设备上炸：

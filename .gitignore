@@ -38,3 +38,8 @@ Thumbs.db
 # ---- Python 缓存（Tools/ 下的脚本）----
 __pycache__/
 *.pyc
+
+# ---- .NET 构建产物（Tools/ModInjector、Tools/tests/*）----
+# obj/ 里是 NuGet 还原结果，含本机绝对路径与用户名，绝不能 audit/扫描时被当成源码。
+bin/
+obj/
