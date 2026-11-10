@@ -22,7 +22,7 @@
 | 设备写入次数 | **0** |
 | `adb install` / `uninstall` / `pm clear` / `am start` / `force-stop` | **均未执行** |
 | 本地测试 | 9/9 suites PASS（见 §10） |
-| 工作区 | 12 modified + 3 added，**未 commit、未 push** |
+| 工作区 | 14 modified + 5 added（§1.2 的 diffstat 为准），**未 commit、未 push** |
 
 状态选择依据（任务书 §10）：构建成功但安装门禁被签名阻断，不属于"等待批准"，也不属于"构建失败"，
 而是任务书明确列出的 `UPDATE_INCOMPATIBLE_RISK` / `SIGNING_KEY_UNAVAILABLE` 分支。
@@ -568,3 +568,43 @@ CI 绿灯不能当成本阶段的设备结论：真实注入、加载与 R-01…
 批准——已做到（并因签名不连续而止步于批准之前）；签名不匹配绝不卸载——遵守；不碰 Saves——遵守；
 外部 Mods 路径与 Bootstrap/Loader 一致——已修正并测试；Emulator 不冒充 ARM64——遵守；
 DSH 永不自动 push——遵守（本文档写作时未 commit、未 push）。
+
+---
+
+## 15. 后记（2026-11-09 用户手动 push 与 Actions #9 失败）
+
+本节为**历史追加**，不修改上文任何结论；Phase 1.1.7 当时报告的"本地 9/9 suites PASS"仍然成立，
+但**不能替代 Ubuntu CI**。
+
+### 15.1 用户手动提交 / push（DSH 未参与）
+
+| 项 | 值 |
+| --- | --- |
+| commit | `8cbbb93358698ab66f702ca0b33e13011c1ac0b2` |
+| 父提交 | `35e3dc8f3b9f191abbf1c69affd905283c982a92`（= §1.1 的本地 HEAD） |
+| 时间 | 2026-11-09 19:06（本地时区），message `2026-11-09 19:06:00` |
+| 规模 | 19 个文件，+2,432 / -28（14 modified + 5 added） |
+| 与 §0 的差异 | §0 原写"12 modified + 3 added"，与 §1.2 的 diffstat 自相矛盾；本节按实际 19 文件（14+5）更正，§0 已同步 |
+
+### 15.2 Actions run #9 失败（唯一失败项）
+
+| 项 | 值 |
+| --- | --- |
+| run | `42606913384`（run #9），event=push，head SHA=`8cbbb93…` |
+| `offline checks` | **SUCCESS** |
+| `powershell gates` | **SUCCESS** |
+| `dotnet build + loader host tests` | **FAILURE** |
+| 失败步骤 | `loader host tests (no game assemblies)`（`python Tools/tests/test_loader.py --dotnet dotnet`） |
+| host tests | 475 checks / 474 passed / **1 failed**（Ubuntu runner） |
+| 失败检查 | `modsroot_normalizes_separators` |
+| 输入 / 期望 / 实际 | `C:\mods\test\ModFramework.Runtime.dll` / `C:/mods/test` / 外部 fallback `/sdcard/Android/data/com.chucklefish.stardewvalley/Mods` |
+
+### 15.3 根因
+
+`Loader.ResolveModsRoot()` 先 `Path.GetDirectoryName(location)`、后 `PathRules.Normalize(directory)`。
+Windows 把 `\` 当分隔符，所以本机通过；Ubuntu 的 `Path.GetDirectoryName` 只认 `/`，
+对 `C:\mods\test\ModFramework.Runtime.dll` 取不到父目录（返回空），于是提前走 fallback。
+**规范化发生得太晚**——不是测试过严，也不是期望值写错。
+
+生产路径（Android 上 `Assembly.Location` 永远用 `/`）不受影响，所以这是**跨平台可测性/CI 缺陷**，
+修复方式见 `docs/audit/phase1.1.8-report.md`（先归一化、再取父目录，Host tests 期望值平台无关）。

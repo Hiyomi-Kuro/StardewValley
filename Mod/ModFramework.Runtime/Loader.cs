@@ -1570,7 +1570,14 @@ public static class Loader
         {
             try
             {
-                var directory = Path.GetDirectoryName(location!);
+                // Normalize *before* asking the host for the parent directory. Windows accepts
+                // both '\' and '/' as separators, but Unix/Android only accepts '/', so
+                // "C:\mods\test\ModFramework.Runtime.dll" would otherwise yield no parent at all
+                // on a Linux CI host and silently fall back to ExternalModsRoot. PathRules.Normalize
+                // only rewrites separators (it never touches roots, UNC prefixes or URIs), so this
+                // keeps the answer independent of the OS the tests happen to run on.
+                var normalizedLocation = PathRules.Normalize(location!);
+                var directory = Path.GetDirectoryName(normalizedLocation);
                 if (!string.IsNullOrEmpty(directory))
                 {
                     return PathRules.Normalize(directory!);

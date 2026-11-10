@@ -204,8 +204,30 @@ internal static class HostTests
 
         // Normalization: a Windows desktop path comes back with forward slashes, exactly like
         // PathRules.Normalize, so the same string compares equal on both platforms.
+        //
+        // Phase 1.1.8: the parent is computed *after* separators are normalized, because
+        // Path.GetDirectoryName only treats '\' as a separator on Windows. On the Ubuntu CI host
+        // the raw Windows input used to yield no parent at all and fall back to ExternalModsRoot.
+        // Every expectation below is a platform-independent literal: the same assertion must hold
+        // on Windows and on Linux, so the contract cannot regress to host-specific behaviour.
         var windows = Loader.ResolveModsRoot(@"C:\mods\test\ModFramework.Runtime.dll");
         t.Check("modsroot_normalizes_separators", windows == "C:/mods/test", windows);
+
+        var windowsForward = Loader.ResolveModsRoot("C:/mods/test/ModFramework.Runtime.dll");
+        t.Check("modsroot_accepts_forward_slashes", windowsForward == "C:/mods/test", windowsForward);
+
+        var windowsTrailing = Loader.ResolveModsRoot(@"C:\mods\test\");
+        t.Check("modsroot_windows_trailing_separator", windowsTrailing == "C:/mods/test", windowsTrailing);
+
+        var unix = Loader.ResolveModsRoot("/opt/app/Mods/ModFramework.Runtime.dll");
+        t.Check("modsroot_unix_style_path", unix == "/opt/app/Mods", unix);
+
+        // Unusable locations fail closed, on every host, to the same external root.
+        var driveRelative = Loader.ResolveModsRoot("C:");
+        t.Check("modsroot_drive_relative_falls_back", driveRelative == External, driveRelative);
+
+        var rootOnly = Loader.ResolveModsRoot("/");
+        t.Check("modsroot_root_only_falls_back", rootOnly == External, rootOnly);
 
         // The private directory is never produced by the resolver on any branch.
         var branches = new[]
@@ -213,6 +235,13 @@ internal static class HostTests
             Loader.ResolveModsRoot(null),
             Loader.ResolveModsRoot(""),
             Loader.ResolveModsRoot("ModFramework.Runtime.dll"),
+            windows,
+            windowsForward,
+            windowsTrailing,
+            unix,
+            driveRelative,
+            rootOnly,
+            Loader.ResolveModsRoot(External + "/ModFramework.Runtime.dll"),
             Loader.DefaultModsRoot(),
         };
         var privateHit = "";

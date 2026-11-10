@@ -339,6 +339,7 @@ Bootstrap（注入进 `StardewValley.dll` 的 IL）只做四件事：
 | 2026-11-06 | Phase 1.1.5：新增 §9.1 部署契约——`ModDiscovery` 只认一级子目录 + 各自 `manifest.json`，因此部署器必须递归还原目录树并逐文件校验远端 SHA-256；`deploy-apk-safe.ps1` 的平铺复制缺陷已修复 |
 | 2026-11-06 | Phase 1.1.4：**Loader 逻辑未改**。新增一个普通 manifest mod（`P114.RuntimeProbe`）作为可复现的端到端观察点，见 §12 |
 | 2026-11-07 | Phase 1.1.7：新增 §13——Bootstrap 与 Loader 必须用同一个 Mods 根（fallback 从内部 `files/Mods` 改为外部路径，抽出 `ResolveModsRoot` 纯函数）、baseline 与 mod-enabled 两条独立构建路径、注入与尺寸上限流程、`--require-existing-keystore`；`ModInjector verify` 增加烘焙路径校验。见 `docs/audit/phase1.1.7-report.md` |
+| 2026-11-09 | Phase 1.1.8：§13.5 固化 `ResolveModsRoot` 的跨平台路径规范化契约——**先归一化分隔符、再取父目录**（原顺序在 Linux 上把 Windows 路径判成"无父目录"并落进 fallback，即 Actions #9 的唯一失败 `modsroot_normalizes_separators`）；keystore 策略改为项目外长期密钥库 + test key 卸载重装路径。见 `docs/audit/phase1.1.8-report.md` |
 
 ---
 
@@ -441,3 +442,38 @@ Phase 1.1.7 的实测结论是**签名不连续**：设备上那份 APK 的 sign
 唯一的 keystore（`.work/debug.keystore`）给出 `858ef62d…`，原来那把 key 已不在本机。
 `Tools/verify_modded_apk.py` 把这种情况记为 `UPDATE_INCOMPATIBLE_RISK`（安装门禁 BLOCKED，
 不是构建失败）。详见 `docs/audit/phase1.1.7-report.md`。
+
+Phase 1.1.8 的修订（同一节）：长期密钥库改为 `%USERPROFILE%/.android/keystores/StardewValley/`，
+构建时用 `-Pkeystore=<绝对路径>` 指向它；**禁止**把 `.work/debug.keystore` 或 `.tmp/` 下的任何副本
+当作唯一持久位置。原始 key（`611c8fa4…`）确认为"建库时由 `Signing.kt` 自动生成、只存在于已删除的
+`.tmp/build`"→ 不可恢复；现行候选包因此用已持久化的 **test key**（`858ef62d…`）签名，只能走
+"备份校验后卸载重装"，绝不能 `adb install -r`。
+
+### 13.5 路径规范化契约（Phase 1.1.8）
+
+`Loader.ResolveModsRoot(string? location)` 的契约由**平台无关的字面值**定义，Host tests 在
+Windows 与 Ubuntu 上断言同一组期望值：
+
+| 输入 | 期望输出 | 分支含义 |
+| --- | --- | --- |
+| `null` / `""` | `Loader.ExternalModsRoot` | Location 不可用 |
+| `ModFramework.Runtime.dll`（只有文件名） | `Loader.ExternalModsRoot` | 没有父目录 |
+| `C:` | `Loader.ExternalModsRoot` | 盘符相对路径，没有目录部分 |
+| `/` | `Loader.ExternalModsRoot` | 只有根，没有目录部分 |
+| `C:\mods\test\ModFramework.Runtime.dll` | `C:/mods/test` | Windows 分隔符输入 |
+| `C:/mods/test/ModFramework.Runtime.dll` | `C:/mods/test` | 已经是正斜杠 |
+| `C:\mods\test\` | `C:/mods/test` | 尾随分隔符 |
+| `/opt/app/Mods/ModFramework.Runtime.dll` | `/opt/app/Mods` | Unix/Android 风格 |
+| `/sdcard/Android/data/<pkg>/files/Mods/<dll>` | 该 Mods 根本身 | 生产路径 |
+
+实现规则（顺序是契约的一部分）：
+
+1. **先**用 `PathRules.Normalize()`（只把 `\` 换成 `/`，不碰根、UNC、URI 语义）处理输入；
+2. **再**调用 `Path.GetDirectoryName()` 取父目录；
+3. 对结果再次 `Normalize()`；
+4. 任何一步为空/抛异常 → `ExternalModsRoot`。
+
+Phase 1.1.7 的顺序是"先 `GetDirectoryName`、后 `Normalize`"，在 Ubuntu CI 上
+`Path.GetDirectoryName(@"C:\mods\test\x.dll")` 取不到父目录（Linux 不把 `\` 当分隔符），
+于是提前落进 fallback，`modsroot_normalizes_separators` 失败。生产 Android 路径不含 `\`，
+所以这个缺陷只影响跨平台可测性与 CI，不改变设备上的行为；修复后两者都是同一条纯函数路径。

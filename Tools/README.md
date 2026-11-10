@@ -143,10 +143,14 @@ hash→(store,index) 映射表)` + 负载。新增条目必须同步改 gap 表�
 命名成 `_Microsoft.Android.Resource.Designer`（内容与文件名不符）。
 现在按 `entry_count` 自动判定 `Blob ID`，判定不唯一时直接报错；也可用 `--blob-id 001` 显式指定。
 
-## mod-enabled APK 构建（Phase 1.1.7）
+## mod-enabled APK 构建（Phase 1.1.7 / 1.1.8）
 
 `Tools/ModInjector` 与 `Tools/AssemblyStore/store.py` 已经由两个脚本接进**正式的** APK 构建入口；
 不再需要手工"解包 → patch → replace → 放回 `apkroot`"。
+
+签名 key 必须是**项目外长期密钥库**里的那一份：
+`%USERPROFILE%\.android\keystores\StardewValley\`（Phase 1.1.8 起）。不要用 `.work/`、`.tmp/`
+或构建输出里的副本——那些位置会被清理，且"唯一副本放在临时目录"本身就是事故来源。
 
 ```powershell
 # 1) 准备注入后的 blob（只读源树；产物在 .tmp/build-modded）
@@ -158,7 +162,8 @@ python Tools/build_modded_apk.py `
 
 # 2) 打包（独立产物；baseline app-debug.apk 不受影响）
 .\gradlew.bat :app:assembleModdedDebug `
-    "-Pdotnet=<dotnet-8.0.404>" "-Pkeystore=.work/debug.keystore"
+    "-Pdotnet=<dotnet-8.0.404>" `
+    "-Pkeystore=$env:USERPROFILE\.android\keystores\StardewValley\stardewvalley-test-signing.keystore"
 
 # 3) 静态验收 + 签名连续性判定
 python Tools/verify_modded_apk.py `
@@ -166,7 +171,7 @@ python Tools/verify_modded_apk.py `
     --baseline app/build/outputs/apk/debug/app-debug.apk `
     --blob-manifest .tmp/build-modded/modded-build-manifest.json `
     --report .tmp/build-modded/modded-apk-verify.json `
-    --keystore .work/debug.keystore
+    --keystore "$env:USERPROFILE\.android\keystores\StardewValley\stardewvalley-test-signing.keystore"
 ```
 
 要点：
@@ -182,6 +187,7 @@ python Tools/verify_modded_apk.py `
 
 `verify_modded_apk.py` 的最后一项是**安装准入**判定：候选 signer 必须与 baseline（= 已安装包）完全一致，
 否则状态为 `UPDATE_INCOMPATIBLE_RISK`（退出码仍为 0——那是门禁 BLOCKED，不是构建失败）。
+signer 不一致时的合法路径只有"备份校验后卸载重装"，见 `docs/audit/phase1.1.8-report.md`。
 
 ## 离线回归
 

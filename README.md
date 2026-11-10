@@ -119,7 +119,7 @@ wrapper 的 `distributionUrl` 默认指向腾讯镜像（国内 services.gradle.
 
 产物 `app/build/outputs/apk/debug/app-debug.apk` 是 **baseline**：不含任何 Mod 支持代码。
 
-### mod-enabled APK（Phase 1.1.7）
+### mod-enabled APK（Phase 1.1.7 / 1.1.8）
 
 要让装机后能加载 `Mods/`，必须显式构建注入版——默认构建**不会**注入：
 
@@ -128,12 +128,17 @@ python Tools/build_modded_apk.py --dotnet <SDK 8.0.404> --work .tmp/build-modded
     --out-blob .tmp/build-modded/modded-assemblies.blob `
     --manifest-json .tmp/build-modded/modded-build-manifest.json
 
-.\gradlew.bat :app:assembleModdedDebug "-Pdotnet=<SDK 8.0.404>" "-Pkeystore=<debug.keystore>"
+.\gradlew.bat :app:assembleModdedDebug "-Pdotnet=<SDK 8.0.404>" `
+    "-Pkeystore=$env:USERPROFILE\.android\keystores\StardewValley\stardewvalley-test-signing.keystore"
 ```
 
 产物是 `app/build/outputs/apk/modded/app-modded-debug.apk`，与 baseline APK 完全分开。
-`-Pkeystore` 必须是**已经签过当前装机包的那把 key**：脚本不会自动生成新 key，
-因为不同的 key 无法覆盖安装，而卸载会删除存档。
+`-Pkeystore` 必须指向**项目外长期密钥库**（`%USERPROFILE%\.android\keystores\StardewValley\`），
+不要指向 `.work/`、`.tmp/` 或 `app/build` 里的副本——那些目录会被清理。脚本不会自动生成新 key。
+
+签名准入：signer 与已安装包**完全一致**才能 `adb install -r` 原位升级；不一致时只能在
+Saves/Mods 已备份并校验后，对指定测试机卸载重装（卸载本身会删应用数据）。详见
+`docs/audit/phase1.1.8-report.md`。
 
 ### Mod Framework（C#）
 
