@@ -1,9 +1,10 @@
 # Phase 1.2.1：无 Root Mods 安全部署工具设计
 
 - 日期：2026-11-14
-- 状态：**设计已实现并在真机验收**（`Tools/deploy-mods-safe.ps1`，工具版本 `1.2.3`）。Phase 1.2.2 的逐项审计、
+- 状态：**设计已实现并在真机验收**（`Tools/deploy-mods-safe.ps1`，工具版本 `1.2.4`）。Phase 1.2.2 的逐项审计、
   实现映射与偏差记录见本文 §9 与 [Phase 1.2.2 报告](../audit/phase1.2.2-report.md)；Phase 1.2.3 的
-  真机结果与两个 P0 修复见 [Phase 1.2.3 报告](../audit/phase1.2.3-report.md)
+  真机结果与两个 P0 修复见 [Phase 1.2.3 报告](../audit/phase1.2.3-report.md)；Phase 1.2.4 的
+  REPLACE 真机验收与回滚报告修复见 [Phase 1.2.4 报告](../audit/phase1.2.4-report.md)
 - 关联：[Phase 1.2 ARM64 真机验收报告](../audit/phase1.2-arm64-device-acceptance-report.md)、
   [Manifest 规范](../modding/manifest-spec.md)、[Loader 设计](phase1-loader-design.md)
 
@@ -492,3 +493,33 @@ Phase 1.2.3 在这台 V1963A 上第一次用**项目自己的完整 Mods 根**�
 工具版本 1.2.2 → **1.2.3**；fake-adb 套件新增两项回归（可选元数据接受、未知字段仍拒绝），并把夹具
 `entryAssembly` 改成带点号的 `Metadata.Assembly.dll`。Phase 1.2.3 的真机执行结果见
 [真机验收报告](../audit/phase1.2.3-device-acceptance-report.md)。
+
+### 9.6 Phase 1.2.4：回滚后的 JSON `journal.state` 以设备持久化状态为准
+
+§9.5 记录的 P2 偏差（`rollback -Apply` 的 JSON 仍是回滚前读取的 `committed`）在本阶段修复。根因不是序列化顺序，
+而是**报告值在回滚前就被复制**：`Invoke-RollbackCommand` 先把 `journal.state` 写入 `$script:Result`，再调用
+`Invoke-Rollback`；后者修改并写入最终 journal 后直接 `Exit-Tool`，JSON 因此保留旧值。自动回滚分支（`Invoke-Deploy`
+内 9 处）同样把 `applying` 写进结果后不再更新。
+
+修复后的契约：
+
+| 场景 | `journal.state`（stdout 与 `-JsonOut`） | 依据 |
+| --- | --- | --- |
+| rollback dry-run | 回滚前读取的状态（如 `committed`） | 没有写设备，报告读到的就是权威值 |
+| rollback -Apply 成功 | `rolled-back` | 回滚后**重新读取设备 journal**；读不到时使用本次已证明写入的状态 |
+| 已回滚事务再次 apply | `rolled-back` | 幂等分支直接读设备 journal |
+| 最终 journal 写入失败 | `rolling-back`（不是 `rolled-back`） | 本次只成功持久化了 `rolling-back`；文件可能已恢复，但事务未完成 |
+| 连 `rolling-back` 都写不进 | 保持回滚前状态 | 没有新的持久化证据，不能声称状态变化 |
+| 自动回滚（deploy 失败） | 设备 journal 的实际状态 | 同一条 `Sync-JournalResultState` 路径 |
+
+实现：`Invoke-Rollback` 返回 `JournalState`（本进程已证明持久化的最后一个状态）；`Sync-JournalResultState`
+优先重新读取设备 journal，读取失败才回退到该值。所有自动回滚分支统一经 `Invoke-AutomaticRollback`。
+另外，staging 失败分支在写 `staging-failed` / `staging-verified` 后也会同步报告状态，避免同一个“报告旧值”问题。
+
+退出码与 `category`/`reason` 语义不变；设备 journal 仍是唯一权威。回归用例：
+`approved REPLACE commits`、`rollback -Apply restores the pre-state`、`rollback -JsonOut agrees with stdout and the
+device journal`、`failed rolling-back write still reports the committed state`、`failed final journal write does not
+claim rolled-back`、`refused rollback reports the persisted journal state, not a rolled-back claim`。
+
+工具版本 1.2.3 → **1.2.4**。真机 REPLACE 验收见
+[Phase 1.2.4 真机验收记录](../audit/phase1.2.4-device-acceptance-report.md)。

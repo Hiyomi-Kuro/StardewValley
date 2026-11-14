@@ -26,7 +26,7 @@ $ErrorActionPreference = "Stop"
 # Decoding as UTF-8 here keeps the path round-trip byte-exact; a wrong guess still fails closed.
 try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
 
-$script:ToolVersion = "1.2.3"
+$script:ToolVersion = "1.2.4"
 $script:FixedPackage = "com.chucklefish.stardewvalley"
 $script:FilesRoot = "/sdcard/Android/data/com.chucklefish.stardewvalley/files"
 $script:ModsRoot = "/sdcard/Android/data/com.chucklefish.stardewvalley/files/Mods"
@@ -678,8 +678,12 @@ function Get-RemoteTree {
 }
 
 function Invoke-Rollback($journal, [switch]$Automatic) {
+    # The device journal is the only authority for the reported state. Every early return says
+    # which state the tool actually managed to persist, so a caller never echoes an in-memory
+    # expectation ("rolled-back") that never reached the device.
     $journal.state = "rolling-back"
-    if (-not (Write-Journal $journal)) { return [pscustomobject]@{ Ok = $false; Detail = "could not persist rolling-back journal" } }
+    if (-not (Write-Journal $journal)) { return [pscustomobject]@{ Ok = $false; Detail = "could not persist rolling-back journal"; JournalState = "" } }
+    $persisted = "rolling-back"
     $items = @($journal.expected | Where-Object { $_.action -ne "SKIP" } | Sort-Object path -Descending)
     foreach ($e in $items) {
         $target = $script:ModsRoot + "/" + $e.path
@@ -689,28 +693,50 @@ function Invoke-Rollback($journal, [switch]$Automatic) {
         $bs = Get-RemoteTargetState $backup
         if ($e.action -eq "ADD") {
             if ($ts.Kind -eq "file" -and $ts.Hash -eq $e.sha256) {
-                if (-not (New-RemoteDirs @((Split-PathPosix $rolled)))) { return [pscustomobject]@{ Ok = $false; Detail = "rollback directory unavailable" } }
-                if ((Move-Remote $target $rolled).Exit -ne 0) { return [pscustomobject]@{ Ok = $false; Detail = "could not preserve deployed file " + $e.path } }
-            } elseif ($ts.Kind -ne "missing") { return [pscustomobject]@{ Ok = $false; Detail = "rollback ownership unproven for " + $e.path } }
+                if (-not (New-RemoteDirs @((Split-PathPosix $rolled)))) { return [pscustomobject]@{ Ok = $false; Detail = "rollback directory unavailable"; JournalState = $persisted } }
+                if ((Move-Remote $target $rolled).Exit -ne 0) { return [pscustomobject]@{ Ok = $false; Detail = "could not preserve deployed file " + $e.path; JournalState = $persisted } }
+            } elseif ($ts.Kind -ne "missing") { return [pscustomobject]@{ Ok = $false; Detail = "rollback ownership unproven for " + $e.path; JournalState = $persisted } }
         } else {
             if ($ts.Kind -eq "file" -and $ts.Hash -eq $e.sha256) {
-                if (-not (New-RemoteDirs @((Split-PathPosix $rolled)))) { return [pscustomobject]@{ Ok = $false; Detail = "rollback directory unavailable" } }
-                if ((Move-Remote $target $rolled).Exit -ne 0) { return [pscustomobject]@{ Ok = $false; Detail = "could not preserve replacement " + $e.path } }
+                if (-not (New-RemoteDirs @((Split-PathPosix $rolled)))) { return [pscustomobject]@{ Ok = $false; Detail = "rollback directory unavailable"; JournalState = $persisted } }
+                if ((Move-Remote $target $rolled).Exit -ne 0) { return [pscustomobject]@{ Ok = $false; Detail = "could not preserve replacement " + $e.path; JournalState = $persisted } }
             } elseif ($ts.Kind -ne "missing" -and -not ($ts.Kind -eq "file" -and $ts.Hash -eq $e.existingSha256)) {
-                return [pscustomobject]@{ Ok = $false; Detail = "rollback ownership unproven for " + $e.path }
+                return [pscustomobject]@{ Ok = $false; Detail = "rollback ownership unproven for " + $e.path; JournalState = $persisted }
             }
             $ts = Get-RemoteTargetState $target
             if ($ts.Kind -eq "missing") {
                 $bs = Get-RemoteTargetState $backup
-                if ($bs.Kind -ne "file" -or $bs.Hash -ne $e.existingSha256) { return [pscustomobject]@{ Ok = $false; Detail = "backup ownership unproven for " + $e.path } }
-                if ((Move-Remote $backup $target).Exit -ne 0) { return [pscustomobject]@{ Ok = $false; Detail = "backup restore failed for " + $e.path } }
+                if ($bs.Kind -ne "file" -or $bs.Hash -ne $e.existingSha256) { return [pscustomobject]@{ Ok = $false; Detail = "backup ownership unproven for " + $e.path; JournalState = $persisted } }
+                if ((Move-Remote $backup $target).Exit -ne 0) { return [pscustomobject]@{ Ok = $false; Detail = "backup restore failed for " + $e.path; JournalState = $persisted } }
             }
         }
     }
     $journal.state = "rolled-back"
     $journal.stateReason = "pre-state restored; deployed bytes retained under rollback"
-    if (-not (Write-Journal $journal)) { return [pscustomobject]@{ Ok = $false; Detail = "rollback completed but journal update failed" } }
-    return [pscustomobject]@{ Ok = $true; Detail = "rollback completed; transaction-owned bytes were retained" }
+    if (-not (Write-Journal $journal)) { return [pscustomobject]@{ Ok = $false; Detail = "rollback completed but journal update failed"; JournalState = "rolling-back" } }
+    return [pscustomobject]@{ Ok = $true; Detail = "rollback completed; transaction-owned bytes were retained"; JournalState = "rolled-back" }
+}
+
+function Sync-JournalResultState($journal, [string]$persistedState) {
+    # Report what the device actually holds. A successful re-read wins; otherwise the state this
+    # process proved it wrote is used. When neither is available the previously reported value is
+    # kept, so a lost connection can never be presented as a successful state transition.
+    $read = Get-ReadJournal ([string]$journal.txid)
+    if ($read.Ok) {
+        $script:Result.journal.state = [string]$read.Journal.state
+        if ($read.Journal.PSObject.Properties["committedAt"]) { $script:Result.journal.committedAt = [string]$read.Journal.committedAt }
+        return $read.Journal
+    }
+    if ($persistedState) { $script:Result.journal.state = $persistedState }
+    return $null
+}
+
+function Invoke-AutomaticRollback($journal) {
+    # Every automatic rollback branch reports the persisted journal state before exiting: the
+    # in-memory journal is not evidence that the device recorded the transition.
+    $rb = Invoke-Rollback $journal -Automatic
+    [void](Sync-JournalResultState $journal $rb.JournalState)
+    return $rb
 }
 
 function Split-PathPosix([string]$path) {
@@ -830,6 +856,7 @@ function Invoke-Deploy($sourcePlan, $remotePlan) {
             $journal.state = "staging-failed"
             $journal.stateReason = "push failed for " + $f.Path
             [void](Write-Journal $journal)
+            [void](Sync-JournalResultState $journal "")
             Exit-Tool 4 "failed" "DeployFailed" "staging-write-failed" ($f.Path + ": " + ($push.Text -replace "`r?`n", " "))
         }
     }
@@ -838,6 +865,7 @@ function Invoke-Deploy($sourcePlan, $remotePlan) {
         $journal.state = "staging-failed"
         $journal.stateReason = "staging hash mismatch"
         [void](Write-Journal $journal)
+        [void](Sync-JournalResultState $journal "")
         Exit-Tool 4 "failed" "DeployFailed" "staging-hash-mismatch" (($stage.Bad | Select-Object -First 6) -join "; ")
     }
     Say ("verify-staged   : " + @($journal.expected | Where-Object { $_.action -ne "SKIP" }).Count + " ordered file(s) match local SHA-256")
@@ -854,6 +882,7 @@ function Invoke-Deploy($sourcePlan, $remotePlan) {
             $journal.state = "staging-failed"
             $journal.stateReason = "staging mode unreadable"
             [void](Write-Journal $journal)
+            [void](Sync-JournalResultState $journal "")
             Exit-Tool 4 "failed" "DeployFailed" "staging-mode-unreadable" (($modeProblems | Select-Object -First 6) -join "; ")
         }
     }
@@ -865,6 +894,7 @@ function Invoke-Deploy($sourcePlan, $remotePlan) {
         $journal.state = "staging-verified"
         $journal.stateReason = "target changed before switch"
         [void](Write-Journal $journal)
+        [void](Sync-JournalResultState $journal "")
         Exit-Tool 3 "refused" "PolicyRefused" "target-changed-since-plan" (($pre | Select-Object -First 6) -join "; ")
     }
     [void](Get-PackageState -RequireInstalled)
@@ -886,7 +916,7 @@ function Invoke-Deploy($sourcePlan, $remotePlan) {
     $allDirs = @($script:ModsRoot)
     foreach ($d in @($remotePlan.Directories)) { $allDirs += ($script:ModsRoot + "/" + $d) }
     if (-not (New-RemoteDirs $allDirs)) {
-        $rb = Invoke-Rollback $journal -Automatic
+        $rb = Invoke-AutomaticRollback $journal
         $code = if ($rb.Ok) { 4 } else { 5 }
         Exit-Tool $code "failed" $(if ($rb.Ok) { "DeployFailed" } else { "RecoveryRequired" }) "target-directory-create-failed" $rb.Detail
     }
@@ -897,7 +927,7 @@ function Invoke-Deploy($sourcePlan, $remotePlan) {
         $e = @($journal.expected | Where-Object { $_.path -eq $op.path })[0]
         $journal.operations[$opIndex].state = "started"
         if (-not (Write-Journal $journal)) {
-            $rb = Invoke-Rollback $journal -Automatic
+            $rb = Invoke-AutomaticRollback $journal
             Exit-Tool 5 "recovery-required" "RecoveryRequired" "journal-write-failed" $rb.Detail
         }
         $target = $script:ModsRoot + "/" + $e.path
@@ -906,28 +936,28 @@ function Invoke-Deploy($sourcePlan, $remotePlan) {
             $backup = Get-BackupPath $txid ([string]$e.path)
             $mvBackup = Move-Remote $target $backup
             if ($mvBackup.Exit -ne 0) {
-                $rb = Invoke-Rollback $journal -Automatic
+                $rb = Invoke-AutomaticRollback $journal
                 Exit-Tool $(if ($rb.Ok) { 4 } else { 5 }) $(if ($rb.Ok) { "failed" } else { "recovery-required" }) $(if ($rb.Ok) { "DeployFailed" } else { "RecoveryRequired" }) "switch-backup-failed" ([string]$e.path + ": " + ($mvBackup.Text -replace "`r?`n", " "))
             }
             $bstate = Get-RemoteTargetState $backup
             if ($bstate.Kind -ne "file" -or $bstate.Hash -ne $e.existingSha256) {
-                $rb = Invoke-Rollback $journal -Automatic
+                $rb = Invoke-AutomaticRollback $journal
                 Exit-Tool 5 "recovery-required" "RecoveryRequired" "backup-hash-mismatch" ([string]$e.path + " backup could not be proven")
             }
         }
         $mvNew = Move-Remote $staged $target
         if ($mvNew.Exit -ne 0) {
-            $rb = Invoke-Rollback $journal -Automatic
+            $rb = Invoke-AutomaticRollback $journal
             Exit-Tool $(if ($rb.Ok) { 4 } else { 5 }) $(if ($rb.Ok) { "failed" } else { "recovery-required" }) $(if ($rb.Ok) { "DeployFailed" } else { "RecoveryRequired" }) "switch-failed" ([string]$e.path + ": " + ($mvNew.Text -replace "`r?`n", " "))
         }
         $tstate = Get-RemoteTargetState $target
         if ($tstate.Kind -ne "file" -or $tstate.Hash -ne $e.sha256) {
-            $rb = Invoke-Rollback $journal -Automatic
+            $rb = Invoke-AutomaticRollback $journal
             Exit-Tool 5 "recovery-required" "RecoveryRequired" "switch-hash-mismatch" ([string]$e.path + " final bytes do not match")
         }
         $journal.operations[$opIndex].state = "done"
         if (-not (Write-Journal $journal)) {
-            $rb = Invoke-Rollback $journal -Automatic
+            $rb = Invoke-AutomaticRollback $journal
             Exit-Tool 5 "recovery-required" "RecoveryRequired" "journal-write-failed" $rb.Detail
         }
         Say ("  switched      : " + $e.action + " " + $e.path + " " + $e.sha256)
@@ -938,7 +968,7 @@ function Invoke-Deploy($sourcePlan, $remotePlan) {
     # Count and the failure would be treated as success.
     $final = @(Test-FinalState $journal)
     if ($final.Count -gt 0) {
-        $rb = Invoke-Rollback $journal -Automatic
+        $rb = Invoke-AutomaticRollback $journal
         Exit-Tool $(if ($rb.Ok) { 4 } else { 5 }) $(if ($rb.Ok) { "failed" } else { "recovery-required" }) $(if ($rb.Ok) { "DeployFailed" } else { "RecoveryRequired" }) "final-verify-failed" (($final | Select-Object -First 6) -join "; ")
     }
     Say ("verify-remote   : " + @($journal.expected).Count + "/" + @($journal.expected).Count + " planned files match local SHA-256")
@@ -1040,6 +1070,9 @@ function Invoke-RollbackCommand {
     # The rollback write path also mutates device state; report it truthfully.
     $script:Result.safety.deviceTouched = $true
     $rb = Invoke-Rollback $journal
+    # Report the persisted state, not the in-memory journal: the device journal is the authority
+    # and a failed final write must not look like a successful rollback.
+    [void](Sync-JournalResultState $journal $rb.JournalState)
     if ($rb.Ok) { Exit-Tool 0 "ok" "" "" $rb.Detail }
     Exit-Tool 5 "recovery-required" "RecoveryRequired" "rollback-failed" $rb.Detail
 }

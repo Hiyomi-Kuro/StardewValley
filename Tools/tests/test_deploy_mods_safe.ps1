@@ -21,6 +21,16 @@ $worker = Join-Path $fixtures "fake-adb-worker.ps1"
 $launcherSource = Join-Path $fixtures "fake-adb-launcher.cs"
 $script:results = New-Object System.Collections.Generic.List[object]
 $script:testNo = 0
+# Every virtual device created in this run, with the SHA-256 of its three sensitive sentinels at
+# creation time. The final check compares against these recorded values instead of re-hashing a
+# file against itself.
+$script:devices = New-Object System.Collections.Generic.List[string]
+$script:sentinels = @{}
+$script:sentinelRel = @(
+    "sdcard/Android/data/com.chucklefish.stardewvalley/files/Saves/save1.dat",
+    "data/data/com.chucklefish.stardewvalley/test.keystore",
+    "sdcard/Download/game.apk"
+)
 
 function Record([string]$name, [string]$status, [string]$detail) {
     $script:testNo++
@@ -210,11 +220,26 @@ switch ($w[0]) {
         # existing destination, so the second journal write always failed for the wrong reason.
         $from = Device-Path $w[-2]; $to = Device-Path $w[-1]
         if ($env:FAKE_MV_FAIL_MATCH -and $w[-1].Contains($env:FAKE_MV_FAIL_MATCH)) {
-            $flag = Join-Path $env:FAKE_DEVICE_ROOT ".mv-failed-once"
-            if ($env:FAKE_MV_FAIL_ONCE -ne "1" -or -not (Test-Path -LiteralPath $flag)) {
-                [IO.File]::WriteAllText($flag, "1")
-                [Console]::Error.WriteLine("injected mv failure")
-                exit 1
+            # FAKE_MV_FAIL_AFTER=<n> lets the first n matching mv calls succeed and fails the
+            # (n+1)th. Rollback writes the journal twice (rolling-back, then rolled-back), so a
+            # plain "fail the first match" cannot reach the "rollback completed but the final
+            # journal write failed" branch; the counter lives outside the virtual device tree.
+            $seen = 1
+            if ($env:FAKE_MV_COUNTER) {
+                if (Test-Path -LiteralPath $env:FAKE_MV_COUNTER) {
+                    $seen = [int]([IO.File]::ReadAllText($env:FAKE_MV_COUNTER)) + 1
+                }
+                [IO.File]::WriteAllText($env:FAKE_MV_COUNTER, [string]$seen)
+            }
+            $allow = 0
+            if ($env:FAKE_MV_FAIL_AFTER) { $allow = [int]$env:FAKE_MV_FAIL_AFTER }
+            if ($seen -gt $allow) {
+                $flag = Join-Path $env:FAKE_DEVICE_ROOT ".mv-failed-once"
+                if ($env:FAKE_MV_FAIL_ONCE -ne "1" -or -not (Test-Path -LiteralPath $flag)) {
+                    [IO.File]::WriteAllText($flag, "1")
+                    [Console]::Error.WriteLine("injected mv failure")
+                    exit 1
+                }
             }
         }
         if (-not (Test-Path -LiteralPath $from)) { exit 1 }
@@ -363,6 +388,9 @@ function New-Device([string]$name = "device") {
     $apkDir = Join-Path $d "sdcard\Download"
     [void][IO.Directory]::CreateDirectory($apkDir)
     [IO.File]::WriteAllText((Join-Path $apkDir "game.apk"), "apk-must-never-change", [Text.Encoding]::UTF8)
+    # Record the sentinel bytes BEFORE any tool invocation touches this virtual device.
+    $script:devices.Add($d)
+    $script:sentinels[$d] = Get-SentinelSnapshot $d
     return $d
 }
 
@@ -376,6 +404,45 @@ function Get-Snapshot([string]$device) {
     return $out
 }
 
+# Content identity of the three "must never change" sentinels. The baseline is captured by
+# New-Device and compared after every case; the hash is never compared with itself.
+function Get-SentinelSnapshot([string]$device) {
+    $out = @{}
+    foreach ($rel in $script:sentinelRel) {
+        $p = Join-Path $device ($rel -replace "/", "\")
+        if (Test-Path -LiteralPath $p -PathType Leaf) {
+            $out[$rel] = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()
+        } else {
+            $out[$rel] = "missing"
+        }
+    }
+    return $out
+}
+
+function Test-SentinelSnapshot([string]$device, [hashtable]$baseline) {
+    $bad = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $baseline) { return [pscustomobject]@{ Ok = $false; Bad = @("no-baseline") } }
+    $now = Get-SentinelSnapshot $device
+    foreach ($rel in $script:sentinelRel) {
+        if (-not $baseline.ContainsKey($rel)) { $bad.Add("no-baseline:" + $rel); continue }
+        if (-not $now.ContainsKey($rel) -or $now[$rel] -eq "missing") { $bad.Add("missing:" + $rel); continue }
+        if ($now[$rel] -ne $baseline[$rel]) { $bad.Add("changed:" + $rel) }
+    }
+    return [pscustomobject]@{ Ok = ($bad.Count -eq 0); Bad = $bad.ToArray() }
+}
+
+function Get-DeviceJournal([string]$device, [string]$txid) {
+    $p = Join-Path $device ("sdcard\Android\data\com.chucklefish.stardewvalley\files\.mods-deploy\" + $txid + "\journal.json")
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return $null }
+    try { return ([IO.File]::ReadAllText($p, [Text.Encoding]::UTF8) | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
+}
+
+function Get-DeviceText([string]$device, [string]$rel) {
+    $p = Join-Path $device ($rel -replace "/", "\")
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return $null }
+    return [IO.File]::ReadAllText($p, [Text.Encoding]::UTF8)
+}
+
 function Invoke-Case([string]$name, [string]$action, [hashtable]$params = @{}, [hashtable]$envs = @{}, [string]$device = "") {
     if (-not $device) { $device = New-Device $name }
     $log = Join-Path $work ("adb-" + $name + "-" + [Guid]::NewGuid().ToString("N").Substring(0, 6) + ".log")
@@ -386,6 +453,7 @@ function Invoke-Case([string]$name, [string]$action, [hashtable]$params = @{}, [
         FAKE_VERSION_CODE = "239"; FAKE_VERSION_NAME = "1.6.15.0"; FAKE_GAME_RUNNING = "0"
         FAKE_PUSH_FAIL = ""; FAKE_HASH_WRONG = ""; FAKE_MV_FAIL_MATCH = ""; FAKE_MV_FAIL_ONCE = ""
         FAKE_INTERRUPT_MATCH = ""; FAKE_SDCARD_LINK = "0"
+        FAKE_MV_FAIL_AFTER = ""; FAKE_MV_COUNTER = (Join-Path $logDir ("mvcount-" + [Guid]::NewGuid().ToString("N").Substring(0, 8) + ".txt"))
     }
     foreach ($k in $envs.Keys) { $values[$k] = [string]$envs[$k] }
     foreach ($k in $values.Keys) {
@@ -607,6 +675,8 @@ if ($didDeploy) {
     Check "verify lists the extra file separately" (@($verifyDiff.Json.verification.extra) -contains "extra.dat") ("extra=" + (@($verifyDiff.Json.verification.extra) -join ","))
     $rollbackOwn = Invoke-Case "rollback-ownership" "rollback" @{ TxId = $committedTx; Serial = "local-1"; Apply = $true } @{} $deployed.Device
     Assert-Result "rollback refuses bytes not owned by transaction" $rollbackOwn 5 "rollback-failed" | Out-Null
+    $rollbackOwnJournal = Get-DeviceJournal $deployed.Device $committedTx
+    Check "refused rollback reports the persisted journal state, not a rolled-back claim" ($null -ne $rollbackOwnJournal -and $rollbackOwn.Json.journal.state -eq $rollbackOwnJournal.state -and $rollbackOwn.Json.journal.state -ne "rolled-back") ("json=" + $(if ($rollbackOwn.Json) { $rollbackOwn.Json.journal.state } else { "no-json" }) + " device=" + $(if ($rollbackOwnJournal) { $rollbackOwnJournal.state } else { "none" }))
 } else {
     Check "apply reports mode=apply and deviceTouched=true" $false "apply did not commit"
     Check "second apply is a no-op (all SKIP)" $false "apply did not commit"
@@ -614,6 +684,7 @@ if ($didDeploy) {
     Check "verify reports modified and extra files" $false "apply did not commit"
     Check "verify lists the extra file separately" $false "apply did not commit"
     Check "rollback refuses bytes not owned by transaction" $false "apply did not commit"
+    Check "refused rollback reports the persisted journal state, not a rolled-back claim" $false "apply did not commit"
 }
 
 # Chinese + spaces AND the real-device /sdcard symlink shape in one apply: devices expose /sdcard
@@ -651,21 +722,134 @@ if ($owBaseOk) {
     Check "verify reports missing files" $false "baseline deploy failed"
 }
 
+# Phase 1.2.4: REPLACE round trip plus the rollback report contract. The tool used to copy the
+# journal state into the JSON *before* Invoke-Rollback ran, so a successful rollback still printed
+# "committed". These cases assert that stdout JSON, -JsonOut and the device journal agree, and that
+# a failed journal write is never reported as a successful transition.
+$rbV1 = Join-Path $fixtures "RollbackV1"
+$rbV2 = Join-Path $fixtures "RollbackV2"
+foreach ($rbSrc in @($rbV1, $rbV2)) {
+    [void][IO.Directory]::CreateDirectory((Join-Path $rbSrc "Roll Mod"))
+    [IO.File]::WriteAllText((Join-Path $rbSrc "ModFramework.Runtime.dll"), "runtime-v1", [Text.Encoding]::UTF8)
+    [IO.File]::WriteAllText((Join-Path $rbSrc "Roll Mod\manifest.json"), '{"schemaVersion":1,"id":"Example.Roll","name":"Roll","version":"1.0.0","entryAssembly":"Roll.Assembly.dll"}', [Text.Encoding]::UTF8)
+}
+[IO.File]::WriteAllText((Join-Path $rbV1 "Roll Mod\Roll.Assembly.dll"), "roll-v1", [Text.Encoding]::UTF8)
+[IO.File]::WriteAllText((Join-Path $rbV2 "Roll Mod\Roll.Assembly.dll"), "roll-v2", [Text.Encoding]::UTF8)
+$rbRel = "Roll Mod/Roll.Assembly.dll"
+$rbPrefix = "sdcard/Android/data/com.chucklefish.stardewvalley/files/"
+$rbNames = @(
+    "approved REPLACE plan names exactly the expected path",
+    "REPLACE target holds v2",
+    "REPLACE backup holds v1",
+    "REPLACE journal is committed",
+    "REPLACE verify matches the deployed bytes",
+    "rollback dry-run reports the pre-rollback state and writes nothing",
+    "rollback -Apply restores the pre-state",
+    "rollback stdout JSON reports the persisted rolled-back state",
+    "rollback -JsonOut agrees with stdout and the device journal",
+    "rollback restored v1",
+    "rollback of an already rolled-back transaction is idempotent"
+)
+
+$rbDevice = New-Device "rollback-state"
+$rbAdd = Invoke-Case "rollback-base-add" "deploy" @{ Source = $rbV1; Serial = "local-1"; Apply = $true } @{} $rbDevice
+$rbAddOk = Assert-Result "rollback fixture baseline ADD" $rbAdd 0
+if ($rbAddOk) {
+    $rbAddJournal = Get-DeviceJournal $rbDevice ([string]$rbAdd.Json.journal.txid)
+    Check "baseline ADD persists the committed journal" ($null -ne $rbAddJournal -and $rbAddJournal.state -eq "committed")
+    $rbUnapproved = Invoke-Case "rollback-replace-unapproved" "deploy" @{ Source = $rbV2; Serial = "local-1"; Apply = $true } @{} $rbDevice
+    Assert-Result "unapproved REPLACE is refused" $rbUnapproved 3 "target-conflict" | Out-Null
+    Check "refused REPLACE leaves the device tree unchanged" (Test-SnapshotEqual $rbUnapproved) "virtual device tree unchanged"
+    $rbReplace = Invoke-Case "rollback-replace-approved" "deploy" @{ Source = $rbV2; Serial = "local-1"; Apply = $true; Overwrite = $rbRel } @{} $rbDevice
+    $rbReplaceOk = Assert-Result "approved REPLACE commits" $rbReplace 0
+    if ($rbReplaceOk) {
+        $rbReplaceTx = [string]$rbReplace.Json.journal.txid
+        $rbActions = @(@($rbReplace.Json.plan.files | Where-Object { $_.action -eq "REPLACE" }) | ForEach-Object { $_.path })
+        Check "approved REPLACE plan names exactly the expected path" ($rbActions.Count -eq 1 -and $rbActions[0] -eq $rbRel) ("replace=" + ($rbActions -join ","))
+        Check "REPLACE target holds v2" ((Get-DeviceText $rbDevice ($rbPrefix + "Mods/" + $rbRel)) -eq "roll-v2")
+        Check "REPLACE backup holds v1" ((Get-DeviceText $rbDevice ($rbPrefix + ".mods-deploy/" + $rbReplaceTx + "/backup/" + $rbRel)) -eq "roll-v1")
+        $rbJournal = Get-DeviceJournal $rbDevice $rbReplaceTx
+        Check "REPLACE journal is committed" ($null -ne $rbJournal -and $rbJournal.state -eq "committed")
+        $rbVerify = Invoke-Case "rollback-replace-verify" "verify" @{ Source = $rbV2 } @{} $rbDevice
+        Assert-Result "REPLACE verify matches the deployed bytes" $rbVerify 0 | Out-Null
+        # Dry-run must still print the state it read, and must not write.
+        $rbDry = Invoke-Case "rollback-state-dry" "rollback" @{ TxId = $rbReplaceTx } @{} $rbDevice
+        Check "rollback dry-run reports the pre-rollback state and writes nothing" ($rbDry.ExitCode -eq 0 -and $rbDry.Json.journal.state -eq "committed" -and (Test-SnapshotEqual $rbDry)) ("state=" + $(if ($rbDry.Json) { $rbDry.Json.journal.state } else { "no-json" }))
+        $rbJsonOut = Join-Path $logDir "rollback-state-jsonout.json"
+        $rbApply = Invoke-Case "rollback-state-apply" "rollback" @{ TxId = $rbReplaceTx; Serial = "local-1"; Apply = $true; JsonOut = $rbJsonOut } @{} $rbDevice
+        $rbApplyOk = Assert-Result "rollback -Apply restores the pre-state" $rbApply 0
+        $rbOut = $null
+        if (Test-Path -LiteralPath $rbJsonOut) {
+            try { $rbOut = [IO.File]::ReadAllText($rbJsonOut) | ConvertFrom-Json -ErrorAction Stop } catch {}
+        }
+        Check "rollback stdout JSON reports the persisted rolled-back state" ($rbApplyOk -and $rbApply.Json.journal.state -eq "rolled-back") ("state=" + $(if ($rbApply.Json) { $rbApply.Json.journal.state } else { "no-json" }))
+        Check "rollback -JsonOut agrees with stdout and the device journal" ($null -ne $rbOut -and $rbOut.journal.state -eq "rolled-back" -and (Get-DeviceJournal $rbDevice $rbReplaceTx).state -eq "rolled-back") ("jsonout=" + $(if ($rbOut) { $rbOut.journal.state } else { "no-file" }))
+        Check "rollback restored v1" ((Get-DeviceText $rbDevice ($rbPrefix + "Mods/" + $rbRel)) -eq "roll-v1")
+        $rbAgain = Invoke-Case "rollback-state-again" "rollback" @{ TxId = $rbReplaceTx; Serial = "local-1"; Apply = $true } @{} $rbDevice
+        Check "rollback of an already rolled-back transaction is idempotent" ($rbAgain.ExitCode -eq 0 -and $rbAgain.Json.journal.state -eq "rolled-back" -and (Test-SnapshotEqual $rbAgain)) ("exit=" + $rbAgain.ExitCode)
+    } else {
+        foreach ($rbName in $rbNames) { Check $rbName $false "approved REPLACE did not commit" }
+    }
+} else {
+    Check "baseline ADD persists the committed journal" $false "baseline ADD failed"
+    Check "unapproved REPLACE is refused" $false "baseline ADD failed"
+    Check "refused REPLACE leaves the device tree unchanged" $false "baseline ADD failed"
+    Check "approved REPLACE commits" $false "baseline ADD failed"
+    foreach ($rbName in $rbNames) { Check $rbName $false "baseline ADD failed" }
+}
+
+# Persistence failures: the JSON must report what the device journal holds, never the in-memory
+# state the tool was about to write.
+$rbFirstDevice = New-Device "rollback-journal-first"
+$rbFirstAdd = Invoke-Case "rollback-journal-first-base" "deploy" @{ Source = $rbV1; Serial = "local-1"; Apply = $true } @{} $rbFirstDevice
+if (Assert-Result "journal-first baseline ADD" $rbFirstAdd 0) {
+    $rbFirstTx = [string]$rbFirstAdd.Json.journal.txid
+    $rbFirst = Invoke-Case "rollback-journal-first" "rollback" @{ TxId = $rbFirstTx; Serial = "local-1"; Apply = $true } @{ FAKE_MV_FAIL_MATCH = "journal.json"; FAKE_MV_FAIL_AFTER = "0" } $rbFirstDevice
+    Assert-Result "unpersistable rolling-back journal fails closed" $rbFirst 5 "rollback-failed" | Out-Null
+    Check "failed rolling-back write still reports the committed state" ($rbFirst.Json.journal.state -eq "committed" -and (Get-DeviceJournal $rbFirstDevice $rbFirstTx).state -eq "committed") ("state=" + $(if ($rbFirst.Json) { $rbFirst.Json.journal.state } else { "no-json" }))
+    Check "no file is restored when the rolling-back journal was not persisted" ((Get-DeviceText $rbFirstDevice ($rbPrefix + "Mods/" + $rbRel)) -eq "roll-v1")
+} else {
+    foreach ($rbName in @("unpersistable rolling-back journal fails closed", "failed rolling-back write still reports the committed state", "no file is restored when the rolling-back journal was not persisted")) { Check $rbName $false "baseline ADD failed" }
+}
+
+$rbLastDevice = New-Device "rollback-journal-last"
+$rbLastAdd = Invoke-Case "rollback-journal-last-base" "deploy" @{ Source = $rbV1; Serial = "local-1"; Apply = $true } @{} $rbLastDevice
+if (Assert-Result "journal-last baseline ADD" $rbLastAdd 0) {
+    $rbLastTx = [string]$rbLastAdd.Json.journal.txid
+    $rbLast = Invoke-Case "rollback-journal-last" "rollback" @{ TxId = $rbLastTx; Serial = "local-1"; Apply = $true } @{ FAKE_MV_FAIL_MATCH = "journal.json"; FAKE_MV_FAIL_AFTER = "1" } $rbLastDevice
+    Assert-Result "failed final journal write fails closed" $rbLast 5 "rollback-failed" | Out-Null
+    Check "failed final journal write does not claim rolled-back" ($rbLast.Json.journal.state -eq "rolling-back" -and (Get-DeviceJournal $rbLastDevice $rbLastTx).state -eq "rolling-back") ("state=" + $(if ($rbLast.Json) { $rbLast.Json.journal.state } else { "no-json" }))
+    Check "files are restored before the final journal update fails" ($null -eq (Get-DeviceText $rbLastDevice ($rbPrefix + "Mods/" + $rbRel)))
+} else {
+    foreach ($rbName in @("failed final journal write fails closed", "failed final journal write does not claim rolled-back", "files are restored before the final journal update fails")) { Check $rbName $false "baseline ADD failed" }
+}
+
 # Every fake invocation must remain under its local virtual device; verify sensitive paths are neither
-# mentioned in adb arguments nor accessed by the deployment tool. The virtual sentinel files remain unchanged.
+# mentioned in adb arguments nor accessed by the deployment tool. Each virtual device created in this
+# run is compared with the sentinel hashes captured at creation time (never with itself).
 $allLogs = @(Get-ChildItem -LiteralPath $work -Filter "adb-*.log" -File | ForEach-Object { [IO.File]::ReadAllText($_.FullName) })
 $joinedLogs = $allLogs -join "`n"
 $forbiddenLog = [regex]::IsMatch($joinedLogs, '(?i)\bsu\b|force-stop|pm clear|(^|\s)install(\s|$)|uninstall|Saves|shared_prefs|databases|/data/data|keystore|\.apk')
 Check "no su, install, stop, clear, or sensitive paths in adb trace" (-not $forbiddenLog)
-$unchangedSensitive = $true
-foreach ($d in Get-ChildItem -LiteralPath $work -Directory | Where-Object { $_.Name -match '^(game-running|android-11|staging-push-failure|staging-hash-failure|switch-failure|unicode-spaces|deploy-for-verify|journal-interrupt)-' }) {
-    $saves = Join-Path $d.FullName "sdcard\Android\data\com.chucklefish.stardewvalley\files\Saves\save1.dat"
-    $key = Join-Path $d.FullName "data\data\com.chucklefish.stardewvalley\test.keystore"
-    $apk = Join-Path $d.FullName "sdcard\Download\game.apk"
-    if ((Get-FileHash $saves -Algorithm SHA256).Hash -ne (Get-FileHash $saves -Algorithm SHA256).Hash) { $unchangedSensitive = $false }
-    if (-not (Test-Path -LiteralPath $key) -or -not (Test-Path -LiteralPath $apk)) { $unchangedSensitive = $false }
+$sentinelProblems = New-Object System.Collections.Generic.List[string]
+foreach ($d in $script:devices) {
+    $sentinelCheck = Test-SentinelSnapshot $d $script:sentinels[$d]
+    if (-not $sentinelCheck.Ok) {
+        foreach ($problem in $sentinelCheck.Bad) { $sentinelProblems.Add((Split-Path -Leaf $d) + " " + $problem) }
+    }
 }
-Check "Saves, keystore and APK sentinels remain present" $unchangedSensitive
+Check "Saves, keystore and APK sentinels unchanged in every fixture device" ($sentinelProblems.Count -eq 0) ("devices=" + $script:devices.Count + " problems=" + ($sentinelProblems -join "; "))
+
+# Negative control: the checker must actually be able to detect a change. This runs in its own
+# virtual device after the assertion above and is expected to report exactly one changed sentinel.
+$negDevice = New-Device "sentinel-negative-control"
+$negBaseline = $script:sentinels[$negDevice]
+$negBefore = Test-SentinelSnapshot $negDevice $negBaseline
+$negSaves = Join-Path $negDevice "sdcard\Android\data\com.chucklefish.stardewvalley\files\Saves\save1.dat"
+[IO.File]::WriteAllText($negSaves, "tampered-by-negative-control", [Text.Encoding]::UTF8)
+$negAfter = Test-SentinelSnapshot $negDevice $negBaseline
+$negExpected = "changed:sdcard/Android/data/com.chucklefish.stardewvalley/files/Saves/save1.dat"
+Check "sentinel checker detects a modified Saves byte (negative control)" ($negBefore.Ok -and -not $negAfter.Ok -and (@($negAfter.Bad) -contains $negExpected)) ("bad=" + (@($negAfter.Bad) -join ","))
 
 # Windows PowerShell 5.1 rejects `[ordered]@{ key = @($genericList) }` with "Argument types do not
 # match"; hand ConvertTo-Json the list object directly instead of an array-literal wrapper.
