@@ -68,16 +68,16 @@ apktool.yml         → decoded/apktool.yml
 | Mod Framework：Phase 1.1.1 预检正确性与安全加固 | ✅ **离线实现完成**：依赖失败不再误伤无关 mod · 内容相等改逐字节判定（去掉 FNV 回退）· 宿主匹配 Fail-Closed · PE/CLI 逐层边界 · 框架版本 Unknown/Invalid 分离 · 报告与日志脱敏（见 [`docs/audit/phase1.1.1-report.md`](docs/audit/phase1.1.1-report.md)） |
 | Mod Framework：Phase 1.1.2 程序集加载完整性 | ✅ **离线实现完成**：预检字节写入私有快照并只从快照 `LoadFrom` · 加载前二次校验 · 不动点显式收敛/耗尽（`MF0208`）· ECMA-335 公钥标志与 Blob 形状校验（见 [`docs/audit/phase1.1.2-report.md`](docs/audit/phase1.1.2-report.md)） |
 | Mod Framework：Phase 1.1.3 快照去重完整性与指纹抗碰撞 | ✅ **离线实现完成**：fingerprint 只做候选索引（完整字节比较才共享）· 一个键下可存多份不同内容 · 快照完整性用独立 SHA-256（无 SHA-256 → Fail-Closed）· `LoadFrom` 返回身份核对（`MF0210`）（见 [`docs/audit/phase1.1.3-report.md`](docs/audit/phase1.1.3-report.md)） |
-| Mod Framework：Phase 1.1.4 运行时表征与非破坏性部署 | ⚠️ **部分完成**：安全探针入口 `RunSafe`（T11/T12 移出默认编译）· P114 诊断 mod 走真实 Loader 链路 · 部署脚本改为默认只读 + 双批准 + 签名门禁 · 桌面证据齐备；**MonoVM 上运行仍待批准，ARM64 真机 BLOCKED**（见 [`docs/audit/phase1.1.4-report.md`](docs/audit/phase1.1.4-report.md)） |
-| Mod Framework：Phase 1.1.5–1.1.9（部署链路 / MonoVM 表征 / mod-enabled 构建 / CI 收尾） | ⚠️ **Emulator 已实测**：递归 Mods 部署门禁 · `assembleModdedDebug` 注入构建 · 长期密钥库 · CI 3/3 绿 · E0 与项目外备份完成；设备真实 MonoVM 运行 **11 PASS / 3 FAIL**（R-01/R-02/R-13 的探针引用编译缺陷已修，待重新推送复测）；**ARM64 真机仍 BLOCKED**（见 [`phase1.1.7`](docs/audit/phase1.1.7-report.md) / [`phase1.1.8`](docs/audit/phase1.1.8-report.md) / [`phase1.1.9`](docs/audit/phase1.1.9-device-acceptance-report.md)） |
-| Mod Framework：ARM64 真机验证 | ❌ **BLOCKED**（无物理设备；只有 x86_64 模拟器） |
-| Mod Framework：设备上验证 `AssemblyName` 元数据读取与 SHA-256 | ❌ **BLOCKED**（只有编译期证据，见 phase1.1 报告 §3） |
+| Mod Framework：Phase 1.1.4 运行时表征与非破坏性部署 | ⚠️ **safe-only MonoVM 运行验证已在一台 ARM64 真机通过**：P114 走真实 Loader 链路；无 Root 部署已实测；Harmony / detour 仍未实现（见 [Phase 1.2 报告](docs/audit/phase1.2-arm64-device-acceptance-report.md)） |
+| Mod Framework：Phase 1.1.5–1.1.9（部署链路 / MonoVM 表征 / mod-enabled 构建 / CI 收尾） | ⚠️ **Emulator 与一台 ARM64 真机均已实测**：递归 Mods 部署门禁 · assembleModdedDebug 注入构建 · 长期密钥库 · CI 历史 Run #10 为 3/3 绿 · Emulator 14/14、ARM64 14/14；ARM64 结果见 [Phase 1.2 报告](docs/audit/phase1.2-arm64-device-acceptance-report.md) |
+| Mod Framework：ARM64 真机验证 | ✅ **PASS（1 台 V1963A / Android 10 / arm64-v8a）**：Loader 1/1 初始化，P114 12/12 探针直接测试 + R-03/R-12 Loader 侧证据，合计 14/14；不代表跨设备兼容（见 [Phase 1.2 报告](docs/audit/phase1.2-arm64-device-acceptance-report.md)） |
+| Mod Framework：设备上验证 AssemblyName 元数据读取与 SHA-256 | ✅ **PASS（1 台 ARM64 真机）**：R-01/R-02 SHA-256、R-08 AssemblyName、R-13 DLL load/hash 均通过（见 [Phase 1.2 报告](docs/audit/phase1.2-arm64-device-acceptance-report.md)） |
 | Harmony / 方法补丁 / 事件钩子 / SMAPI 兼容 | ❌ **未实现**（Phase 2 及以后） |
 | 游戏内 Mod 管理器 / 配置 UI / 自动下载 | ❌ **未实现** |
 
-> 现在能保证的是"受信任的、符合规范的 mod 包会被发现、校验、按依赖顺序加载并调用其
+> 当前已在一台 ARM64 物理设备上完成 safe-only Loader 与运行时探针验收（合并口径 14/14）。这只证明 V1963A / Android 10 的测试结果，**不代表所有 ARM64 设备兼容**；也未验证实际存档写入、长时间游玩或第三方 SMAPI Mod。详见 [Phase 1.2 报告](docs/audit/phase1.2-arm64-device-acceptance-report.md)。
 > `IModEntry.Initialize`，失败被隔离"。**不能**保证在真机上跑过——那一步仍缺设备。
-> `.NET` mod dll 在游戏进程内以完整权限执行，manifest 校验**不是**安全沙箱。
+> .NET mod dll 在游戏进程内以完整权限执行，manifest 校验**不是**安全沙箱。
 
 ### Loader 的硬语义（Phase 1.1 / 1.1.1）
 
