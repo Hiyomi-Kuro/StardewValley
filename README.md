@@ -28,6 +28,7 @@ Tools/                                        构建期工具与测试
   AssemblyStore/                              assemblies.blob 的提取 / 原位替换 / 校验
   find-dotnet.ps1                             发现可用的 .NET SDK（不写死用户路径）
   deploy-apk-safe.ps1                         非破坏性部署门禁（默认只读；安装/推送需显式批准）
+  deploy-mods-safe.ps1                        无 Root Mods 部署（inspect/plan/deploy/verify/rollback；默认 dry-run）
   validate-test-backup.py                     只读复核设备备份（size + SHA-256 + 计数）
   tests/                                      离线测试套件（见下）
 final/                                        稳定交付副本（APK 本体被 .gitignore 忽略，只入库说明与校验和）
@@ -72,11 +73,12 @@ apktool.yml         → decoded/apktool.yml
 | Mod Framework：Phase 1.1.5–1.1.9（部署链路 / MonoVM 表征 / mod-enabled 构建 / CI 收尾） | ⚠️ **Emulator 与一台 ARM64 真机均已实测**：递归 Mods 部署门禁 · assembleModdedDebug 注入构建 · 长期密钥库 · CI 历史 Run #10 为 3/3 绿 · Emulator 14/14、ARM64 14/14；ARM64 结果见 [Phase 1.2 报告](docs/audit/phase1.2-arm64-device-acceptance-report.md) |
 | Mod Framework：ARM64 真机验证 | ✅ **PASS（1 台 V1963A / Android 10 / arm64-v8a）**：Loader 1/1 初始化，P114 12/12 探针直接测试 + R-03/R-12 Loader 侧证据，合计 14/14；不代表跨设备兼容（见 [Phase 1.2 报告](docs/audit/phase1.2-arm64-device-acceptance-report.md)） |
 | Mod Framework：设备上验证 AssemblyName 元数据读取与 SHA-256 | ✅ **PASS（1 台 ARM64 真机）**：R-01/R-02 SHA-256、R-08 AssemblyName、R-13 DLL load/hash 均通过（见 [Phase 1.2 报告](docs/audit/phase1.2-arm64-device-acceptance-report.md)） |
+| 部署工具：无 Root Mods（Phase 1.2.3） | ✅ **真机 PASS（限实际覆盖路径）**：工具 1.2.3 在 V1963A / API 29 上真实执行 inspect → plan → dry-run → apply → verify，并用验收夹具覆盖 ADD + rollback；生产集 11 文件全 SKIP，**REPLACE 与 Android 11+ 未覆盖**（[真机报告](docs/audit/phase1.2.3-device-acceptance-report.md) · [阶段报告](docs/audit/phase1.2.3-report.md)） |
 | Harmony / 方法补丁 / 事件钩子 / SMAPI 兼容 | ❌ **未实现**（Phase 2 及以后） |
 | 游戏内 Mod 管理器 / 配置 UI / 自动下载 | ❌ **未实现** |
 
-> 当前已在一台 ARM64 物理设备上完成 safe-only Loader 与运行时探针验收（合并口径 14/14）。这只证明 V1963A / Android 10 的测试结果，**不代表所有 ARM64 设备兼容**；也未验证实际存档写入、长时间游玩或第三方 SMAPI Mod。详见 [Phase 1.2 报告](docs/audit/phase1.2-arm64-device-acceptance-report.md)。
-> `IModEntry.Initialize`，失败被隔离"。**不能**保证在真机上跑过——那一步仍缺设备。
+> 当前已在一台 ARM64 物理设备上完成 safe-only Loader、运行时探针与无 Root 部署工具验收（探针合并口径 14/14；工具限实际执行的 SKIP/ADD/rollback 路径）。这只证明 V1963A / Android 10 的测试结果，**不代表所有 ARM64 设备兼容**；也未验证实际存档写入、长时间游玩或第三方 SMAPI Mod。详见 [Phase 1.2 报告](docs/audit/phase1.2-arm64-device-acceptance-report.md) 与 [Phase 1.2.3 真机报告](docs/audit/phase1.2.3-device-acceptance-report.md)。
+> `IModEntry.Initialize` 已在真机被 Loader 调用；部署工具的 REPLACE 切换、Android 11+ 与其它 OEM 仍未验证。
 > .NET mod dll 在游戏进程内以完整权限执行，manifest 校验**不是**安全沙箱。
 
 ### Loader 的硬语义（Phase 1.1 / 1.1.1）
@@ -180,6 +182,53 @@ pwsh -NoProfile -File Tools/deploy-apk-safe.ps1 -Serial <serial>         # 仍�
 > 旧的 `Tools/deploy-apk.ps1` 会先 `adb uninstall`（**删存档**）。它现在默认拒绝执行，
 > 必须显式传 `-LegacyDestructiveInstall` 才会走到卸载重装；新增改动不要再依赖它。
 
+### 无 Root Mods 部署（Phase 1.2.2 实现，Phase 1.2.3 真机验收）
+
+`Tools/deploy-mods-safe.ps1` 负责**把 `Mods/` 放到游戏的应用专属外部目录**，不装 APK、不用 Root。
+它和上面的 `deploy-apk-safe.ps1` 是两条独立链路：
+
+| | `deploy-apk-safe.ps1` | `deploy-mods-safe.ps1` |
+| --- | --- | --- |
+| 目标 | 安装/替换 APK；Mods 推送写 `/data/data/<pkg>/files/Mods` | 只写 `files/Mods` 与 `files/.mods-deploy/<txid>` |
+| 需要 Root | Mods 推送需要（`su -c` + chown） | **不需要** |
+| 是否会装 APK | 会（`-InstallApproved`） | **从不** |
+
+```powershell
+# 1) 只读：设备 / 包 / 进程 / Mods / 未完成事务
+pwsh -NoProfile -File Tools/deploy-mods-safe.ps1 -Action inspect -Serial <serial>
+
+# 2) 只读：校验源树并输出逐文件计划（ADD / REPLACE / SKIP + SHA-256）
+pwsh -NoProfile -File Tools/deploy-mods-safe.ps1 -Action plan -Serial <serial> -Source <完整 Mods 根>
+
+# 3) dry-run：与 plan 等价，不写设备
+pwsh -NoProfile -File Tools/deploy-mods-safe.ps1 -Action deploy -Serial <serial> -Source <完整 Mods 根>
+
+# 4) 实际写入：必须同时给 -Apply 与显式 -Serial；有冲突还要逐个 -Overwrite
+pwsh -NoProfile -File Tools/deploy-mods-safe.ps1 -Action deploy -Serial <serial> `
+    -Source <完整 Mods 根> -Apply [-Overwrite "<相对路径>"]
+
+# 5) 校验与回滚（回滚默认也是 dry-run）
+pwsh -NoProfile -File Tools/deploy-mods-safe.ps1 -Action verify -Serial <serial> -Source <完整 Mods 根>
+pwsh -NoProfile -File Tools/deploy-mods-safe.ps1 -Action rollback -Serial <serial> -TxId <txid> [-Apply]
+```
+
+| 行为 | 说明 |
+| --- | --- |
+| 写入白名单 | 只有 `.../files/Mods/**` 与 `.../files/.mods-deploy/<txid>/**`；不碰 `Saves`、`shared_prefs`、`databases`、`/data/data` |
+| 默认模式 | `inspect`/`plan`/`verify` 只读；`deploy`/`rollback` 默认 dry-run |
+| 写入授权 | `-Apply` **且** 显式 `-Serial`；单设备自动发现只用于只读命令 |
+| 冲突 | 目标存在但内容不同 → 默认拒绝；只有 `-Overwrite` 精确列出的相对路径才允许替换 |
+| 事务 | 先写 staging 并逐文件 SHA-256，再逐文件 `mv` 切换；journal 两阶段，**多文件不是原子事务** |
+| 失败处置 | 退出码 `2` BLOCKED / `3` REFUSED / `4` FAILED（尽力回滚）/ `5` RECOVERY-REQUIRED（人工处理） |
+| 不删除 | 旧版本进 `backup/`、回滚字节进 `rollback/`；工具不自动清理、不删除未知文件 |
+| Android 版本 | 只在 Android 10（API 29）有真机证据；**API 30+ 的 apply 直接 fail-closed**（退出码 2），本工具不实现 SAF |
+| 机器可读输出 | `-Json`（stdout）、`-JsonOut <file>`、`-ReportOut <file>`；设备端 journal 才是权威状态 |
+
+> **真机状态（Phase 1.2.3）**：在 `6d72…`（V1963A / Android 10 / API 29）上真实执行了 inspect、plan、
+> dry-run、`deploy -Apply`、verify，并用验收夹具覆盖 1 个 ADD 与同事务 rollback；生产集 11 文件全 SKIP。
+> `REPLACE` 切换、Android 11+、其它设备和断电故障注入仍未验证。证据与限制见
+> [`docs/audit/phase1.2.3-device-acceptance-report.md`](docs/audit/phase1.2.3-device-acceptance-report.md)。
+
 ### 测试
 
 本地全量（需要上面解出的 65 个程序集）：
@@ -197,13 +246,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Tools\tests\run-all.ps1 -Ref
 | 部署门禁 fake adb 自测（95 项，不连设备） | `powershell -File Tools/tests/test_deploy_safe.ps1` | ❌ |
 | Loader 单元 + 宿主 + P114 探针（45 项驱动 / 486 项内部） | `python Tools/tests/test_loader.py --refs .tmp/p113/refs` | 示例 mod 与 65 程序集差分需要（缺则 SKIP） |
 | 注入 / 容器 / Loader 契约（27 项） | `python Tools/tests/test_mod_pipeline.py --refs .tmp/p113/refs` | ✅ |
+| 无 Root Mods 部署 fake-adb 套件（50 项，不连设备、不用 Root） | `powershell -File Tools/tests/test_deploy_mods_safe.ps1` | ❌ |
 | E0 只读设备预检 | `powershell -File Tools/device-precheck.ps1` | ❌（需要设备） |
 | 备份复核（只读） | `python Tools/validate-test-backup.py --root <backup>` | ❌ |
 
 **CI（`.github/workflows/ci.yml`）只跑不需要游戏程序集的部分**：
 `test_ci_offline.py`、`test_p114_probe.py`、`privacy-scan.py`、ModInjector/Runtime/P114/FixtureMod 构建、
-`test_loader.py`（无 `--refs`），以及一个 Windows job 跑两个 PowerShell 门禁
-（`test_device_precheck.ps1`、`test_deploy_safe.ps1`）。
+`test_loader.py`（无 `--refs`），以及一个 Windows job 跑三个 PowerShell 门禁
+（`test_device_precheck.ps1`、`test_deploy_safe.ps1`、`test_deploy_mods_safe.ps1`）。
+三个门禁全部使用 fake adb，不需要真实设备、ADB server、Root 或任何凭据。
 依赖游戏程序集的套件（含 65 程序集的解析差分 `--diff-refs`）在 CI 里显式标 **SKIPPED**，不会伪装成通过。
 任何 E1/E2 设备证据都没有——那需要一台 ARM64 物理设备。
 

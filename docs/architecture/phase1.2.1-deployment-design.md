@@ -1,7 +1,9 @@
 # Phase 1.2.1：无 Root Mods 安全部署工具设计
 
 - 日期：2026-11-14
-- 状态：实现前设计（随后由 `Tools/deploy-mods-safe.ps1` 落实）
+- 状态：**设计已实现并在真机验收**（`Tools/deploy-mods-safe.ps1`，工具版本 `1.2.3`）。Phase 1.2.2 的逐项审计、
+  实现映射与偏差记录见本文 §9 与 [Phase 1.2.2 报告](../audit/phase1.2.2-report.md)；Phase 1.2.3 的
+  真机结果与两个 P0 修复见 [Phase 1.2.3 报告](../audit/phase1.2.3-report.md)
 - 关联：[Phase 1.2 ARM64 真机验收报告](../audit/phase1.2-arm64-device-acceptance-report.md)、
   [Manifest 规范](../modding/manifest-spec.md)、[Loader 设计](phase1-loader-design.md)
 
@@ -226,6 +228,14 @@ prepared
 - `rolling-back` / `rolled-back` / `rollback-failed`：回滚过程与结果。
 - `recovery-required`：journal 缺失/损坏/哈希无法证明归属，必须人工处理。
 
+**实现补充（Phase 1.2.2 审计记录）**：实现多了一个 `staging-failed` 状态，用于"staging 推送失败 /
+staging 哈希不符 / staging 权限不可读"。它代替了本文原先写的"停在 `prepared`"。两者的区别是：
+`prepared` 属于 active 状态会阻止下一次 `deploy`，而 `staging-failed` 不会。选择后者是因为这三条
+失败路径都发生在**第一次切换 Mods 之前**（本事务尚未把任何字节写进 `Mods`），强制先做一次
+"回滚一个从未写过 Mods 的事务"只是仪式。`inspect` 会把它列出来（`journalReadable=true`），
+操作者仍能看到遗留事务目录；真正的风险窗口（`prepared` / `staging-verified` / `applying` /
+`rolling-back` / `rollback-failed` / `recovery-required`）仍然 fail-closed。详见 §9.3 偏差 D-1。
+
 ### 4.4 每个文件的动作
 
 | 动作 | 条件 | 切换 | 回滚 |
@@ -249,13 +259,17 @@ prepared
 
 ```powershell
 pwsh -NoProfile -File Tools/deploy-mods-safe.ps1 `
-    -Command inspect|plan|deploy|verify|rollback `
+    -Action inspect|plan|deploy|verify|rollback `
     [-Serial <serial>] [-Adb <path>] `
-    [-ModsSource <complete Mods root>] `
+    [-Source <complete Mods root>] `
     [-TxId <txid>] [-Overwrite <rel>[,<rel>...]] `
     [-Apply] [-StrictExtras] `
-    [-JsonOut <path>] [-ReportOut <path>]
+    [-Json] [-JsonOut <path>] [-ReportOut <path>]
 ```
+
+（`-Action` 另接受别名 `-Command`，`-Source` 另接受别名 `-ModsSource`；两个别名来自
+Phase 1.2.1 的初始提交，保留以免破坏已有调用。`-JsonOut` / `-ReportOut` 是 Phase 1.2.2 补齐的：
+设计原文列出了它们，但初始实现只有 `-Json`。）
 
 | 命令 | 默认 | 写设备 | 说明 |
 | --- | --- | --- | --- |
@@ -356,15 +370,22 @@ pwsh -NoProfile -File Tools/deploy-mods-safe.ps1 `
 }
 ```
 
-`deviceTouched` 在 dry-run/只读命令中必须为 `false`；在 apply 中表示“本次进程是否执行过写操作”。
+`deviceTouched` 在 dry-run/只读命令中必须为 `false`；在 apply 中表示“本次进程是否执行过写操作”
+（Phase 1.2.2 修正：初始实现从未把它置为 `true`，属于自证字段失真；现在创建事务目录与进入
+rollback 写路径时会置 `true`）。
 `writesSaves` / `usesRoot` / `installsApk` / `forceStopsGame` / `deletesUnknownFiles` 是工具自证的
 常量 `false`，并由静态测试和 fake ADB 日志交叉验证。
+
+实现比本文多一个字段 `verification.unparseable`：`find … -exec sha256sum` 的输出若有无法解析、或
+不在 `Mods` 之下的行，会记到这里并让 `verify` fail-closed，而不是静默当作匹配。`-JsonOut` /
+`-ReportOut` 只是报告副本；权威 journal 始终在设备端（见 §8.6）。
 
 ---
 
 ## 7. 自动化验收（fake ADB）
 
-测试文件：`Tools/tests/test_deploy_mods.ps1`。它不调用真实 `adb`，不连接设备；每个用例在独立
+测试文件：`Tools/tests/test_deploy_mods_safe.ps1`（Phase 1.2.1 原文误写为 `test_deploy_mods.ps1`）。
+它不调用真实 `adb`，不连接设备；每个用例在独立
 子进程中运行工具，fake adb 模拟：
 
 - `devices -l`（device/offline/unauthorized 多设备）；
@@ -391,3 +412,83 @@ pwsh -NoProfile -File Tools/deploy-mods-safe.ps1 `
 5. **备份不自动清理**：`.mods-deploy` 会随部署次数增长；工具不自动删除，避免误删唯一回滚凭据。
 6. **journal 在设备端**：设备被清数据或目录被外部删除后无法恢复；主机侧 `-JsonOut` 只是报告，
    不是权威 journal。
+
+---
+
+## 9. Phase 1.2.2 审计结果（实现映射与偏差）
+
+本节由 Phase 1.2.2 的源码审计追加。§1–§8 是原始设计，**不修改**；实现与设计的差异集中记在这里，
+原始风险项也原样保留（只在 §9.4 标注当前状态）。
+
+### 9.1 设计要求 → 实现位置
+
+| 设计要求 | 实现位置（`Tools/deploy-mods-safe.ps1`） | 审计结论 |
+| --- | --- | --- |
+| 只写固定外部 `Mods` 与 `.mods-deploy/<txid>` 两棵树 | `Test-RemoteAllowed` / `Assert-RemoteAllowed` | 已实现（`files` 根的只读例外见 D-4） |
+| 默认只读；apply 需显式 `-Apply` + 显式 `-Serial` | `$script:SerialExplicit`、`Invoke-Deploy`、`Invoke-RollbackCommand` | 已实现 |
+| 多设备/离线/未授权/缺 serial/包不符/游戏运行 fail-closed | `Get-DeviceContext`、`Get-PackageState` | 已实现；`-PackageName` 覆盖检查在 1.2.2 修复（见 §9.2） |
+| `-Overwrite` 只授权指定相对路径 | `Get-RemotePlan`、`Get-ApprovedOverwrites` | 已实现（漏列/多列都拒绝） |
+| 稳定 JSON、稳定 `category`、可区分退出码 | `$script:Result`、`Exit-Tool` | 已实现；1.2.2 补齐 `-JsonOut`/`-ReportOut` |
+| 源目录规范化、reparse/symlink、大小写/Unicode 重复、保留名、边界与限额 | `Get-SourcePlan`、`Assert-RelativePath` | 已实现；1.2.2 改为显式栈遍历（原实现先递归枚举再检查） |
+| Manifest 结构校验与声明文件存在性 | `Get-SourcePlan` 内联校验 | 部分实现（D-2、D-3） |
+| 设备侧路径链 symlink 检查 | `Test-RemotePathChains` | 已实现；1.2.2 修正 `/sdcard` 前缀误判（见 §9.2） |
+| staging → 逐文件哈希 → 切换 → journal | `Invoke-Deploy` | 已实现 |
+| 失败/中断按 journal 恢复；回滚只恢复可证明归属的字节 | `Invoke-Rollback` | 已实现 |
+| 不使用 Root / `su` / `run-as`；不安装、不 `pm clear`、不 force-stop | 全文静态审计 + fake adb 命令日志断言 | 已实现 |
+| Android 11+ apply fail-closed | `Get-StorageState` | 已实现（`unverified-android-storage`，退出码 2） |
+| 不把多文件切换说成原子 | §4.1 与报告口径 | 保持 |
+
+### 9.2 Phase 1.2.2 修复的实现缺陷
+
+| 级别 | 缺陷 | 影响 | 修复 |
+| --- | --- | --- | --- |
+| P0 | `Get-PackageState` 给只读自动变量 `$PID` 赋值 | 所有命令在读包状态时抛异常 → 退出码 5 `unexpected-exception`，工具实际不可用 | 改用 `$processState` |
+| P0 | 用 `@($list)` 包装 `List[object]`（Windows PowerShell 5.1 会抛 "Argument types do not match"） | `plan`/`deploy` dry-run、事务列表、`-Overwrite` 列表构造失败 | 改用 `.ToArray()` |
+| P1 | 脚本用常量覆盖了 `-PackageName` 参数本身 | 传入其它包名被静默忽略，`package-name-mismatch` 永远不会触发 | 拆出 `$script:FixedPackage`，参数保持独立 |
+| P1 | 路径链检查把 `/sdcard`、`/sdcard/Android` 等 OS 前缀当普通路径做 `test -L` | Android 上 `/sdcard` 通常是符号链接 → 真机会拒绝**所有**部署 | 检查边界下移到应用专属 `files` 根；fake adb 增加该形状回归用例 |
+| P1 | 源目录用 `Get-ChildItem -Recurse` 一次性枚举后再逐项检查 | Windows PowerShell 5.1 的 `-Recurse` 会跟随 junction，链接环可能被遍历后才报错 | 改为显式栈遍历，下降前逐项检查 |
+| P1 | 设备输出按 OEM 代码页解码，而 `adb shell` 是 UTF-8 | 非 ASCII 设备路径变乱码 → 误报 `staging-hash-mismatch`（fail-closed 但错误原因） | 工具与测试宿主统一按 UTF-8 解码 |
+| P2 | `safety.deviceTouched` 在 apply 中始终为 `false` | 自证字段失真 | apply/rollback 写路径置 `true` |
+| P2 | 设计列出的 `-JsonOut` / `-ReportOut` 未实现 | 设计契约缺口 | 实现（报告副本，非权威 journal） |
+| P2 | 临时 journal 文件写进项目 `.tmp/phase1.2.1` | 仓库内临时产物 | 改到系统临时目录 |
+| P2 | 测试桩 `mv` 拒绝覆盖已存在文件 | fake adb 违背 POSIX 语义 → 第二次 journal 写入假失败 | 修正为 POSIX 语义；工具对 journal 替换显式用 `mv -f` |
+
+测试桩自身另有三个缺陷（`[ordered]@{ tests = @($list) }` 序列化崩溃、launcher 用 OEM 代码页解码子进程
+输出、reparse 场景依赖需要特权的 symlink）已在同一轮修复，详见
+[Phase 1.2.2 报告](../audit/phase1.2.2-report.md)。
+
+### 9.3 有意保留的偏差
+
+| 编号 | 偏差 | 理由 | 风险 |
+| --- | --- | --- | --- |
+| D-1 | 新增 `staging-failed` 状态，且**不**阻止下一次部署（设计原文是停在会阻止的 `prepared`） | 该状态只出现在首次切换 `Mods` 之前，重试安全；强制先回滚一个从未写过 `Mods` 的事务没有收益 | 遗留事务目录需要人工清理；`inspect` 会列出 |
+| D-2 | 工具不自行拒绝重复 JSON key（设计 §3.2 要求自写扫描器） | Loader 的 `Json.cs` 在加载前拒绝重复 key（`MF0106`），工具接受而 Loader 拒绝是 fail-closed 方向 | 纵深防御缺口，不构成绕过；不新增解析器以避免引入新风险 |
+| D-3 | Manifest 语义校验只覆盖 `id`/`entryAssembly`/`privateAssemblies`/未知字段/声明文件存在性；`version`/`name`/`schemaVersion` 取值与 id 字符集未校验 | 同上，Loader 是 manifest 语义的最终权威且 fail-closed | 工具可能把 Loader 会拒绝的包部署上去（Mod 不加载）。1.2.3 已把可选元数据字段加入白名单，见 §9.5 |
+| D-4 | 写白名单函数也接受 `files` 根本身 | 只用于 `test -d` 与 `df -k` 只读探测；没有任何写调用点传入它 | 需要将来拆分"读探测白名单"与"写白名单" |
+
+### 9.4 §8 风险项的当前状态
+
+| 原风险 | 当前状态（2026-11-14，Phase 1.2.2 / 1.2.3） |
+| --- | --- |
+| 8.1 应用可写性不可直接证明 | Phase 1.2.3 已由工具在 V1963A 上真实写入 staging/ADD 文件并用 Loader 加载佐证；**仍未**由第三方文件浏览器或 `run-as` 直接读取 |
+| 8.2 Android 11+ 未实测 | **仍成立**。API 30+ apply 继续 fail-closed；本阶段未引入 SAF / 权限 / Root 路径 |
+| 8.3 多文件非原子 | **仍成立**。逐文件 rename + journal 两阶段，不声称原子 |
+| 8.4 不删除旧文件 | **仍成立**（安全取舍） |
+| 8.5 备份不自动清理 | **仍成立**；Phase 1.2.3 保留了两个事务目录 |
+| 8.6 journal 在设备端 | **仍成立**；主机侧文件只是报告副本。1.2.3 的 rollback JSON 状态字段与设备 journal 不一致，见 §9.5 |
+| 新增：OS 前缀 `/sdcard` 是符号链接 | 代码已按该事实处理，但**只有真机证据能确认**；见手动验收计划第 3–5 步 |
+
+### 9.5 Phase 1.2.3 真机验收发现与修复
+
+Phase 1.2.3 在这台 V1963A 上第一次用**项目自己的完整 Mods 根**运行工具，暴露了两个会让真机 plan 直接失败、
+但 fake-adb 夹具没有覆盖的缺陷：
+
+| 级别 | 缺陷 | 真机表现 | 修复 |
+| --- | --- | --- | --- |
+| P0 | manifest 字段白名单漏掉 schemaVersion 1 的可选元数据 `author`/`description`/`website` | 项目真实 manifest 被 `manifest-unknown-field:author` 拒绝（exit 3 `manifest-invalid`），plan/deploy 无法执行 | 白名单对齐 `ModManifest.KnownFields` 与 `docs/modding/manifest-spec.md` |
+| P0 | `entryAssembly`/`privateAssemblies` 校验用 `^[^/\\:.]+\.dll$`，字符类把 `.` 也排除了 | `P114.RuntimeProbe.dll` 被 `unsafe-manifest-path` 拒绝（exit 3），几乎所有真实 .NET 程序集名都过不了 | 镜像 `ModManifest.IsValidEntryAssemblyName`：只拒绝分隔符、`:`、`..`、控制字符、非 `.dll` 后缀和超过 128 字符 |
+| P2 | `rollback -Apply` 的 JSON `journal.state` 保留回滚前读取的值 | 设备 journal 已是 `rolled-back`，JSON 仍显示 `committed`；退出码与 detail 正确 | 未改代码，记录为报告字段偏差；**设备端 journal 是权威** |
+
+工具版本 1.2.2 → **1.2.3**；fake-adb 套件新增两项回归（可选元数据接受、未知字段仍拒绝），并把夹具
+`entryAssembly` 改成带点号的 `Metadata.Assembly.dll`。Phase 1.2.3 的真机执行结果见
+[真机验收报告](../audit/phase1.2.3-device-acceptance-report.md)。

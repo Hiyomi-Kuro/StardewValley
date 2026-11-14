@@ -106,13 +106,14 @@ jobs:
           echo "SKIPPED: the example-mod build (Mod/ExampleMod.HelloWorld) needs AndroidRefsDir."
           echo "SKIPPED: the parser differential over the 65 reference assemblies needs \`--refs\`."
           echo "SKIPPED: any device/E1/E2 evidence needs an ARM64 physical device (BLOCKED, see docs/audit/phase0.5-device-checklist.md)."
-          echo "SKIPPED: test_deploy_safe.ps1 is Windows-only and runs in the powershell-gates job."
+          echo "SKIPPED: test_deploy_safe.ps1 and test_deploy_mods_safe.ps1 are Windows-only and run in the powershell-gates job."
+          echo "SKIPPED: any real-device Mods acceptance run needs the user to execute docs/audit/phase1.2.2-manual-device-acceptance-plan.md."
           echo "Nothing above was reported as passed."
 
   powershell-gates:
-    name: powershell gates (adb resolution, deploy safety, no device)
+    name: powershell gates (adb resolution, apk deploy safety, no-root mods deploy, no device)
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - name: checkout
         uses: actions/checkout@v4.2.2
@@ -127,3 +128,12 @@ jobs:
         # ever calls uninstall / pm clear / force-stop / am start.
         shell: pwsh
         run: ./Tools/tests/test_deploy_safe.ps1
+
+      - name: no-root mods deploy fake-adb suite
+        # Phase 1.2.2. Proves with a fake adb (no device, no real adb, no root) that inspect/plan are
+        # read-only, that apply and rollback need an explicit serial, that Android 11+ writes fail
+        # closed, that staging/journal/switch/rollback failures stay fail-closed, and that no remote
+        # command touches Saves, shared_prefs, databases, an APK or a keystore. Also validates the
+        # stable JSON contract and exit codes.
+        shell: pwsh
+        run: ./Tools/tests/test_deploy_mods_safe.ps1

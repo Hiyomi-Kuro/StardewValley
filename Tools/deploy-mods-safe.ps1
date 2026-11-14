@@ -12,12 +12,22 @@ param(
     [switch]$Apply,
     [switch]$StrictExtras,
     [switch]$Json,
+    [string]$JsonOut = "",
+    [string]$ReportOut = "",
     [switch]$Help
 )
 
 $ErrorActionPreference = "Stop"
-$script:ToolVersion = "1.2.1"
-$script:PackageName = "com.chucklefish.stardewvalley"
+
+# `adb shell` output is UTF-8 (Android file names are UTF-8 bytes passed through unchanged), while
+# Windows PowerShell 5.1 decodes native stdout with the console OEM code page. On a non-UTF-8 code
+# page that turns every non-ASCII device path into mojibake, so a perfectly good staged file looks
+# like a hash mismatch ("staging-hash-mismatch") and the tool fails closed for the wrong reason.
+# Decoding as UTF-8 here keeps the path round-trip byte-exact; a wrong guess still fails closed.
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
+
+$script:ToolVersion = "1.2.3"
+$script:FixedPackage = "com.chucklefish.stardewvalley"
 $script:FilesRoot = "/sdcard/Android/data/com.chucklefish.stardewvalley/files"
 $script:ModsRoot = "/sdcard/Android/data/com.chucklefish.stardewvalley/files/Mods"
 $script:TransactionRoot = "/sdcard/Android/data/com.chucklefish.stardewvalley/files/.mods-deploy"
@@ -27,12 +37,14 @@ $script:SerialExplicit = [bool]$Serial
 $script:Lines = New-Object System.Collections.Generic.List[string]
 $script:AdbBin = ""
 $script:SelectedSerial = ""
-$script:WorkDir = Join-Path (Split-Path -Parent $PSScriptRoot) ".tmp\phase1.2.1"
+# Scratch space for the transient journal.json.new upload. The authoritative journal lives on the
+# device, so this host copy is disposable and must never land inside the project tree.
+$script:WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) "deploy-mods-safe"
 $script:Result = [ordered]@{
     schemaVersion = 1; tool = "deploy-mods-safe"; command = ""; mode = "read-only"
     generatedAt = (Get-Date).ToUniversalTime().ToString("o"); exitCode = 0; status = "ok"
     category = ""; reason = ""; detail = ""; device = [ordered]@{ serial = ""; state = ""; apiLevel = 0; androidRelease = ""; model = ""; explicitSerial = [bool]$Serial }
-    package = [ordered]@{ name = $script:PackageName; installed = $false; versionCode = ""; versionName = ""; running = $false; pid = "" }
+    package = [ordered]@{ name = $script:FixedPackage; installed = $false; versionCode = ""; versionName = ""; running = $false; pid = "" }
     storage = [ordered]@{ modsRoot = $script:ModsRoot; transactionRoot = $script:TransactionRoot; scopedStorageRisk = ""; safSupported = $false; writeProbe = "not-run" }
     plan = [ordered]@{ fileCount = 0; totalBytes = 0; files = @(); directories = @(); conflicts = @(); overwriteApproved = @() }
     journal = [ordered]@{ txid = ""; path = ""; state = ""; createdAt = ""; committedAt = "" }
@@ -51,6 +63,8 @@ deploy-mods-safe.ps1 -Action inspect|plan|deploy|verify|rollback
   -Overwrite <relative path>    explicitly authorize replacement (repeat or comma-separate)
   -Adb <fake or installed adb path>
   -Json                         emit a machine-readable JSON result
+  -JsonOut <host file>          also write that JSON result to a host file (report copy only)
+  -ReportOut <host file>        also write the human-readable log to a host file
   -StrictExtras                 make extra files fail verify
 
 No arguments prints this help. Only the fixed external Mods path is writable.
@@ -62,17 +76,35 @@ function Say([string]$text) {
     if (-not $Json) { Write-Host $text }
 }
 
+function Write-HostTextFile([string]$path, [string]$text) {
+    # Evidence files only: the authoritative transaction journal stays on the device.
+    $dir = Split-Path -Parent $path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
+    $temp = $path + ".tmp-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
+    [System.IO.File]::WriteAllText($temp, $text, (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $temp -Destination $path -Force
+}
+
 function Exit-Tool([int]$code, [string]$status, [string]$category, [string]$reason, [string]$detail) {
     $script:Result.exitCode = $code
     $script:Result.status = $status
     $script:Result.category = $category
     $script:Result.reason = $reason
     $script:Result.detail = $detail
+    $jsonText = $script:Result | ConvertTo-Json -Depth 20 -Compress
     if ($Json) {
-        $script:Result | ConvertTo-Json -Depth 20 -Compress | Write-Output
+        $jsonText | Write-Output
     } else {
         Say ("result          : " + $status + $(if ($reason) { " reason=" + $reason } else { "" }))
         if ($detail) { Say ("detail          : " + $detail) }
+    }
+    if ($JsonOut) {
+        try { Write-HostTextFile $JsonOut $jsonText }
+        catch { Write-Warning ("json-out-failed: " + $_.Exception.Message + "; the device journal is unaffected") }
+    }
+    if ($ReportOut) {
+        try { Write-HostTextFile $ReportOut (($script:Lines -join "`r`n") + "`r`n") }
+        catch { Write-Warning ("report-out-failed: " + $_.Exception.Message) }
     }
     exit $code
 }
@@ -145,9 +177,11 @@ function Get-DeviceContext {
         }
     }
     if ($Serial) {
-        $matches = @($entries | Where-Object { $_.Serial -eq $Serial })
-        if ($matches.Count -ne 1) { Exit-Tool 2 "blocked" "EnvironmentBlocked" "serial-not-attached" "explicit serial is not uniquely attached" }
-        if ($matches[0].State -ne "device") { Exit-Tool 2 "blocked" "EnvironmentBlocked" "serial-not-online" ("device state is " + $matches[0].State) }
+        # $Matches is an automatic variable; shadowing it here would survive only until the next
+        # successful -match, so use a plain name instead.
+        $hits = @($entries | Where-Object { $_.Serial -eq $Serial })
+        if ($hits.Count -ne 1) { Exit-Tool 2 "blocked" "EnvironmentBlocked" "serial-not-attached" "explicit serial is not uniquely attached" }
+        if ($hits[0].State -ne "device") { Exit-Tool 2 "blocked" "EnvironmentBlocked" "serial-not-online" ("device state is " + $hits[0].State) }
         $script:SelectedSerial = $Serial
     } else {
         if ($entries.Count -eq 0) { Exit-Tool 2 "blocked" "EnvironmentBlocked" "no-device" "no attached device" }
@@ -171,30 +205,32 @@ function Get-DeviceContext {
 }
 
 function Get-PackageState([switch]$RequireInstalled) {
-    if ($PackageName -ne $script:PackageName) { Exit-Tool 3 "refused" "PolicyRefused" "package-name-mismatch" "PackageName is fixed to com.chucklefish.stardewvalley" }
-    $path = Adb-Shell ("pm path " + $script:PackageName)
+    if ($PackageName -ne $script:FixedPackage) { Exit-Tool 3 "refused" "PolicyRefused" "package-name-mismatch" "PackageName is fixed to com.chucklefish.stardewvalley" }
+    $path = Adb-Shell ("pm path " + $script:FixedPackage)
     if ($path.Exit -ne 0 -or $path.Text -notmatch '(?m)^package:\S+') {
         $script:Result.package.installed = $false
         if ($RequireInstalled) { Exit-Tool 3 "refused" "PolicyRefused" "package-not-installed" "the fixed game package is not installed" }
         return
     }
-    $dump = Adb-Shell ("dumpsys package " + $script:PackageName)
+    $dump = Adb-Shell ("dumpsys package " + $script:FixedPackage)
     if ($dump.Exit -ne 0) { Exit-Tool 2 "blocked" "EnvironmentBlocked" "package-state-unreadable" "dumpsys package failed" }
     $vc = [regex]::Match($dump.Text, '(?m)\bversionCode=(\d+)')
     $vn = [regex]::Match($dump.Text, '(?m)\bversionName=([^\s]+)')
     if (-not $vc.Success -or -not $vn.Success) { Exit-Tool 2 "blocked" "EnvironmentBlocked" "package-version-unreadable" "package version could not be verified" }
     $script:Result.package.installed = $true
-    $script:Result.package.name = $script:PackageName
+    $script:Result.package.name = $script:FixedPackage
     $script:Result.package.versionCode = $vc.Groups[1].Value
     $script:Result.package.versionName = $vn.Groups[1].Value
     if ($vc.Groups[1].Value -ne "239" -or $vn.Groups[1].Value -ne "1.6.15.0") {
         Exit-Tool 3 "refused" "PolicyRefused" "package-version-mismatch" "expected game version 239 / 1.6.15.0"
     }
-    $pid = Adb-Shell ("pidof " + $script:PackageName)
-    if ($pid.Exit -eq 0 -and $pid.Text -match '\d+') {
+    # $PID is a READ-ONLY automatic variable in Windows PowerShell 5.1 and PowerShell 7; assigning
+    # to it throws SessionStateUnauthorizedAccessException and used to abort every command here.
+    $processState = Adb-Shell ("pidof " + $script:FixedPackage)
+    if ($processState.Exit -eq 0 -and $processState.Text -match '\d+') {
         $script:Result.package.running = $true
         $script:Result.package.pid = $Matches[0]
-    } elseif ($pid.Exit -ne 0 -and $pid.Text -and $pid.Text -notmatch '(?i)(not found|no process|unknown command)') {
+    } elseif ($processState.Exit -ne 0 -and $processState.Text -and $processState.Text -notmatch '(?i)(not found|no process|unknown command)') {
         Exit-Tool 2 "blocked" "EnvironmentBlocked" "process-state-unreadable" "could not establish whether the game is running"
     }
     if ($RequireInstalled -and $Apply -and $script:Result.package.running) {
@@ -236,16 +272,31 @@ function Test-RemoteLink([string]$path) {
 }
 
 function Test-RemotePathChain([string]$path) {
-    Assert-RemoteAllowed $path
-    $parts = $path.Split('/')
-    $current = ""
-    foreach ($part in $parts) {
-        if (-not $part) { continue }
-        $current += "/" + $part
-        if (-not (Test-RemoteAllowed $current) -and $current -ne "/sdcard" -and $current -ne "/sdcard/Android" -and $current -ne "/sdcard/Android/data" -and $current -ne "/sdcard/Android/data/com.chucklefish.stardewvalley") {
-            throw "remote-path-outside-allowlist"
+    return (Test-RemotePathChains @($path))
+}
+
+# One batched, de-duplicated link check for one or more allowlisted paths.
+#
+# Two facts drive this shape:
+#   * On Android `/sdcard` is normally a SYMLINK to /storage/emulated/0 (and `/sdcard/Android/...`
+#     sits below it). Treating those OS-owned prefixes as an unsafe link would refuse every single
+#     deployment on a real device, so the trusted boundary starts at the app-specific files root.
+#     Everything at or below it is created by the app or by this tool and MUST NOT be a link.
+#   * `adb shell` is one process per call, so checking the shared prefix once per operation instead
+#     of once per path keeps a deploy from issuing hundreds of `test -L` round trips.
+function Test-RemotePathChains([string[]]$paths) {
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($path in $paths) {
+        if (-not $path) { continue }
+        Assert-RemoteAllowed $path
+        $current = ""
+        foreach ($part in $path.Split('/')) {
+            if (-not $part) { continue }
+            $current += "/" + $part
+            if (-not $current.StartsWith($script:FilesRoot, [StringComparison]::Ordinal)) { continue }
+            if (-not $seen.Add($current)) { continue }
+            if (Test-RemoteLink $current) { return $false }
         }
-        if (Test-RemoteLink $current) { return $false }
     }
     return $true
 }
@@ -261,9 +312,10 @@ function Get-RemoteTargetState([string]$path) {
 }
 
 function New-RemoteDirs([string[]]$paths) {
-    foreach ($p in @($paths | Where-Object { $_ } | Sort-Object Length)) {
+    $clean = @($paths | Where-Object { $_ } | Sort-Object Length)
+    if (-not (Test-RemotePathChains $clean)) { return $false }
+    foreach ($p in $clean) {
         Assert-RemoteAllowed $p
-        if (-not (Test-RemotePathChain $p)) { return $false }
         if (Test-RemotePath $p) {
             if (-not (Test-RemoteDir $p)) { return $false }
             continue
@@ -303,10 +355,13 @@ function Push-RemoteFile([string]$local, [string]$remote) {
     return Adb @("-s", $script:SelectedSerial, "push", $local, $remote)
 }
 
-function Move-Remote([string]$from, [string]$to) {
+function Move-Remote([string]$from, [string]$to, [switch]$Force) {
     Assert-RemoteAllowed $from; Assert-RemoteAllowed $to
-    if (-not (Test-RemotePathChain $from) -or -not (Test-RemotePathChain $to)) { return [pscustomobject]@{ Exit = 1; Text = "symlink in path" } }
-    return Invoke-Remote ("mv " + (Quote-Posix $from) + " " + (Quote-Posix $to))
+    if (-not (Test-RemotePathChains @($from, $to))) { return [pscustomobject]@{ Exit = 1; Text = "symlink in path" } }
+    # `-f` is explicit for the journal replacement (design §4.2); POSIX mv already replaces files,
+    # so it changes nothing on a real device but keeps the intent readable.
+    $verb = if ($Force) { "mv -f " } else { "mv " }
+    return Invoke-Remote ($verb + (Quote-Posix $from) + " " + (Quote-Posix $to))
 }
 
 function Set-RemoteJournalText([string]$path, [string]$text) {
@@ -319,7 +374,7 @@ function Set-RemoteJournalText([string]$path, [string]$text) {
         $check = Get-RemoteHashMap @($path + ".new")
         $expected = (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash.ToLower()
         if ($null -eq $check -or -not $check.ContainsKey($path + ".new") -or $check[$path + ".new"] -ne $expected) { return $false }
-        return ((Move-Remote ($path + ".new") $path).Exit -eq 0)
+        return ((Move-Remote ($path + ".new") $path -Force).Exit -eq 0)
     } finally {
         Remove-Item -LiteralPath $local -Force -ErrorAction SilentlyContinue
     }
@@ -360,7 +415,8 @@ function Get-Transactions {
         if ($read.Ok) { $out.Add([pscustomobject]@{ txid = $id; state = [string]$read.Journal.state; journalReadable = $true }) }
         else { $out.Add([pscustomobject]@{ txid = $id; state = "recovery-required"; journalReadable = $false }) }
     }
-    return @($out)
+    # Not `@($out)`: Windows PowerShell 5.1 throws "Argument types do not match" on List[object].
+    return $out.ToArray()
 }
 
 function Assert-NoActiveTransaction {
@@ -399,22 +455,24 @@ function Get-RemotePlan($sourcePlan, [string[]]$approved) {
             $action = "REPLACE"; $existing = $state.Hash
             $conflicts.Add([pscustomobject]@{ path = $f.Rel; existingSha256 = $state.Hash; newSha256 = $f.Sha256 })
         } else {
-            return [pscustomobject]@{ Ok = $false; Reason = "target-conflict"; Detail = $f.Rel + " is " + $state.Kind; Files = @(); Conflicts = @(); Directories = @($sourcePlan.Directories) }
+            return [pscustomobject]@{ Ok = $false; Reason = "target-conflict"; Detail = $f.Rel + " is " + $state.Kind; Files = @(); Conflicts = @(); Directories = $sourcePlan.Directories }
         }
-        if ($action -eq "REPLACE" -and $approved -notcontains $f.Rel) { }
         $files.Add([pscustomobject]@{ Path = $f.Rel; Full = $f.Full; Bytes = $f.Bytes; Sha256 = $f.Sha256; Action = $action; ExistingSha256 = $existing })
     }
+    # NOTE: never wrap a List[object] in `@(...)` here. Windows PowerShell 5.1 throws
+    # "Argument types do not match" for `@($genericListOfObject)`; List[string] and HashSet[string]
+    # are unaffected. ToArray() is the portable spelling.
     $conflictPaths = @($conflicts | ForEach-Object { $_.path })
     foreach ($p in $approved) {
         if ($conflictPaths -notcontains $p) {
-            return [pscustomobject]@{ Ok = $false; Reason = "overwrite-list-mismatch"; Detail = $p + " is not a conflict"; Files = @($files); Conflicts = @($conflicts); Directories = @($sourcePlan.Directories) }
+            return [pscustomobject]@{ Ok = $false; Reason = "overwrite-list-mismatch"; Detail = $p + " is not a conflict"; Files = $files.ToArray(); Conflicts = $conflicts.ToArray(); Directories = $sourcePlan.Directories }
         }
     }
     $notApproved = @($conflictPaths | Where-Object { $approved -notcontains $_ })
     if ($notApproved.Count -gt 0) {
-        return [pscustomobject]@{ Ok = $false; Reason = "target-conflict"; Detail = ($notApproved -join ", "); Files = @($files); Conflicts = @($conflicts); Directories = @($sourcePlan.Directories) }
+        return [pscustomobject]@{ Ok = $false; Reason = "target-conflict"; Detail = ($notApproved -join ", "); Files = $files.ToArray(); Conflicts = $conflicts.ToArray(); Directories = $sourcePlan.Directories }
     }
-    return [pscustomobject]@{ Ok = $true; Reason = ""; Detail = ""; Files = @($files); Conflicts = @($conflicts); Directories = @($sourcePlan.Directories) }
+    return [pscustomobject]@{ Ok = $true; Reason = ""; Detail = ""; Files = $files.ToArray(); Conflicts = $conflicts.ToArray(); Directories = $sourcePlan.Directories }
 }
 
 function Get-ApprovedOverwrites {
@@ -425,7 +483,7 @@ function Get-ApprovedOverwrites {
         }
     }
     if (@($out | Select-Object -Unique).Count -ne $out.Count) { Exit-Tool 3 "refused" "PolicyRefused" "overwrite-list-mismatch" "duplicate overwrite path" }
-    return @($out)
+    return $out.ToArray()
 }
 
 function Set-PlanResult($sourcePlan, $remotePlan) {
@@ -462,7 +520,22 @@ function Get-SourcePlan([string]$source) {
         $root = [System.IO.Path]::GetFullPath($source).TrimEnd('\', '/')
         $rootItem = Get-Item -LiteralPath $root -Force
         if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "source-root-is-reparse-point" }
-        $items = @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)
+        # Walk explicitly instead of `Get-ChildItem -Recurse`: Windows PowerShell 5.1 -Recurse
+        # follows directory junctions/symlinks while enumerating, so a link cycle inside the
+        # source tree could be traversed (or loop) before any per-item check ran. This stack walk
+        # inspects every child BEFORE descending, so a reparse point is rejected deterministically
+        # and the walk never leaves the source root.
+        $items = New-Object System.Collections.Generic.List[object]
+        $pending = New-Object System.Collections.Generic.Stack[string]
+        $pending.Push($root)
+        while ($pending.Count -gt 0) {
+            $dir = $pending.Pop()
+            foreach ($child in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop)) {
+                if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw ("source-reparse-point:" + $child.Name) }
+                $items.Add($child)
+                if ($child.PSIsContainer) { $pending.Push($child.FullName) }
+            }
+        }
         $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         $normalized = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
         $files = New-Object System.Collections.Generic.List[object]
@@ -501,7 +574,11 @@ function Get-SourcePlan([string]$source) {
             if ($manifestFile.Bytes -gt 262144) { throw ("manifest-too-large:" + $manifestRel) }
             $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
             $doc = [System.IO.File]::ReadAllText($manifestFile.Full, $utf8) | ConvertFrom-Json -ErrorAction Stop
-            $allowed = @("schemaVersion", "id", "name", "version", "entryAssembly", "entryType", "privateAssemblies", "dependencies", "gameVersion", "frameworkVersion")
+            # Known fields of manifest schemaVersion 1, matching Mod/ModFramework.Runtime/ModManifest.cs
+            # (KnownFields) and docs/modding/manifest-spec.md. The optional metadata fields used to be
+            # missing here, so the tool refused the project's own real manifest with
+            # "manifest-unknown-field:author" even though the Loader accepts it.
+            $allowed = @("schemaVersion", "id", "name", "version", "author", "description", "website", "entryAssembly", "entryType", "privateAssemblies", "dependencies", "gameVersion", "frameworkVersion")
             foreach ($prop in $doc.PSObject.Properties) { if ($allowed -notcontains $prop.Name) { throw ("manifest-unknown-field:" + $prop.Name) } }
             $id = [string]$doc.id
             if (-not $id -or -not $ids.Add($id)) { throw ("duplicate-mod-id:" + $id) }
@@ -509,7 +586,13 @@ function Get-SourcePlan([string]$source) {
             $declared = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
             foreach ($name in @($entry) + @($doc.privateAssemblies)) {
                 if (-not $name) { continue }
-                if ($name -notmatch '^[^/\\:.]+\.dll$' -or $name -match '\.\.') { throw ("unsafe-manifest-path:" + $name) }
+                # Mirror ModManifest.IsValidEntryAssemblyName instead of using a character-class
+                # regex: the previous pattern excluded every '.', so ordinary assembly names such
+                # as P114.RuntimeProbe.dll were refused as "unsafe-manifest-path" even though the
+                # Loader accepts them. Separators, ':', "..", control characters and a missing
+                # .dll suffix remain rejected.
+                if ($name.Length -gt 128 -or $name -match '[/\\:]' -or $name.Contains('..') -or
+                    $name -match '[\x00-\x1f\x7f]' -or $name -notmatch '(?i)\.dll$') { throw ("unsafe-manifest-path:" + $name) }
                 if (-not $declared.Add($name)) { throw ("duplicate-manifest-path:" + $name) }
                 if (-not (@($files | Where-Object { $_.Rel -ceq ($dir + "/" + $name) }).Count)) { throw ("manifest-assembly-missing:" + $dir + "/" + $name) }
             }
@@ -640,8 +723,8 @@ function Get-RemoteHashMap([string[]]$paths) {
     $map = @{}
     $clean = @($paths | Where-Object { $_ } | Sort-Object -Unique)
     if ($clean.Count -eq 0) { return $map }
-    $args = (($clean | ForEach-Object { Quote-Posix $_ }) -join " ")
-    $r = Invoke-Remote ("sha256sum " + $args)
+    $hashArgs = (($clean | ForEach-Object { Quote-Posix $_ }) -join " ")
+    $r = Invoke-Remote ("sha256sum " + $hashArgs)
     if ($r.Exit -ne 0) { return $null }
     foreach ($line in ($r.Text -split "`r?`n")) {
         $m = [regex]::Match($line, '^([0-9a-fA-F]{64})\s+\*?(.+)$')
@@ -670,8 +753,8 @@ function Test-StagingModes($journal) {
         if ($e.action -eq "ADD" -or $e.action -eq "REPLACE") { $paths.Add((Get-StagingPath ([string]$journal.txid) ([string]$e.path))) }
     }
     if ($paths.Count -eq 0) { return @() }
-    $args = (($paths | ForEach-Object { Quote-Posix $_ }) -join " ")
-    $r = Invoke-Remote ("stat -c " + (Quote-Posix "%a") + " " + $args)
+    $statArgs = (($paths | ForEach-Object { Quote-Posix $_ }) -join " ")
+    $r = Invoke-Remote ("stat -c " + (Quote-Posix "%a") + " " + $statArgs)
     if ($r.Exit -ne 0) { return @("stat failed for staged files") }
     $problems = New-Object System.Collections.Generic.List[string]
     $lines = @($r.Text -split "`r?`n" | Where-Object { $_.Trim() })
@@ -704,6 +787,8 @@ function Invoke-Deploy($sourcePlan, $remotePlan) {
         Exit-Tool 2 "blocked" "StorageUnavailable" "staging-create-failed" ($txDir + " could not be created; no Mods file was written")
     }
     $script:Result.storage.writeProbe = "ok"
+    # From here on this process writes to the device; the self-attested flag must say so.
+    $script:Result.safety.deviceTouched = $true
     [void](Set-RemoteMode $txDir "0755")
     [void](Set-RemoteMode $stagingRoot "0755")
     [void](Set-RemoteMode $backupRoot "0755")
@@ -764,7 +849,7 @@ function Invoke-Deploy($sourcePlan, $remotePlan) {
     if ($stagePaths.Count -gt 0) {
         $chmodArgs = (($stagePaths | ForEach-Object { Quote-Posix $_ }) -join " ")
         [void](Invoke-Remote ("chmod 0644 " + $chmodArgs))
-        $modeProblems = Test-StagingModes $journal
+        $modeProblems = @(Test-StagingModes $journal)
         if ($modeProblems.Count -gt 0) {
             $journal.state = "staging-failed"
             $journal.stateReason = "staging mode unreadable"
@@ -775,7 +860,7 @@ function Invoke-Deploy($sourcePlan, $remotePlan) {
 
     # The plan was made before staging. Re-read every target so an external change between plan
     # and switch aborts before the first Mods write.
-    $pre = Test-PreState $journal
+    $pre = @(Test-PreState $journal)
     if ($pre.Count -gt 0) {
         $journal.state = "staging-verified"
         $journal.stateReason = "target changed before switch"
@@ -849,7 +934,9 @@ function Invoke-Deploy($sourcePlan, $remotePlan) {
         $opIndex++
     }
 
-    $final = Test-FinalState $journal
+    # @(...) is REQUIRED: one failing file would otherwise arrive as a plain string with a $null
+    # Count and the failure would be treated as success.
+    $final = @(Test-FinalState $journal)
     if ($final.Count -gt 0) {
         $rb = Invoke-Rollback $journal -Automatic
         Exit-Tool $(if ($rb.Ok) { 4 } else { 5 }) $(if ($rb.Ok) { "failed" } else { "recovery-required" }) $(if ($rb.Ok) { "DeployFailed" } else { "RecoveryRequired" }) "final-verify-failed" (($final | Select-Object -First 6) -join "; ")
@@ -950,6 +1037,8 @@ function Invoke-RollbackCommand {
     if (-not $script:SerialExplicit) { Exit-Tool 3 "refused" "PolicyRefused" "serial-required" "rollback -Apply requires an explicit -Serial" }
     [void](Get-PackageState -RequireInstalled)
     [void](Get-StorageState)
+    # The rollback write path also mutates device state; report it truthfully.
+    $script:Result.safety.deviceTouched = $true
     $rb = Invoke-Rollback $journal
     if ($rb.Ok) { Exit-Tool 0 "ok" "" "" $rb.Detail }
     Exit-Tool 5 "recovery-required" "RecoveryRequired" "rollback-failed" $rb.Detail
@@ -960,7 +1049,10 @@ function Invoke-Inspect {
     [void](Get-PackageState)
     Get-RequiredCommands
     $storage = Get-StorageState
-    $txs = Get-Transactions
+    # @(...) is REQUIRED: a function that returns one element is unwrapped by PowerShell, and a
+    # scalar PSCustomObject has a $null Count, so `if ($txs.Count -gt 0)` would silently skip the
+    # whole transaction check.
+    $txs = @(Get-Transactions)
     $script:Result.transactions = @($txs)
     if ($storage.ModsExists) {
         $ls = Invoke-Remote ("ls -1 " + (Quote-Posix $script:ModsRoot))
@@ -1031,7 +1123,7 @@ $script:Result.command = $Action
 if ($Action -notin @("inspect", "plan", "deploy", "verify", "rollback")) {
     Exit-Tool 3 "refused" "PolicyRefused" "unknown-action" "supported actions: inspect, plan, deploy, verify, rollback"
 }
-if ($PackageName -ne $script:PackageName) {
+if ($PackageName -ne $script:FixedPackage) {
     Exit-Tool 3 "refused" "PolicyRefused" "package-name-mismatch" "PackageName is fixed to com.chucklefish.stardewvalley"
 }
 $adbInfo = Resolve-Adb $Adb
