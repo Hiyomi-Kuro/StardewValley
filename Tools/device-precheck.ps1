@@ -30,6 +30,14 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
+
+# -HashFiles is a [string[]]. When the script is launched with -File, PowerShell binds
+# "-HashFiles a.apk,b.dll" as ONE element, so honour comma-separated input as well as
+# repeated parameters. Without this, a comma list reaches Test-Path as a single path and
+# is reported MISSING even though both files exist (observed in Phase 1.1.9 E0).
+$HashFiles = @($HashFiles | ForEach-Object { "$_" -split ',' } |
+    ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+
 $lines = New-Object System.Collections.Generic.List[string]
 
 function Say([string]$text) {

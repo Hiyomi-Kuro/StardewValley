@@ -8,14 +8,15 @@
 | `AssemblyStore` | Python 3（无第三方依赖） | 读写 `assemblies.blob`（XABA v1 + XALZ/LZ4），把改好的程序集**原位替换**回去 |
 | `deploy-apk-safe.ps1` | PowerShell（ASCII） | **部署入口**：默认只读；安装需 `-InstallApproved`、推送需 `-PushModsApproved`；推送**递归**还原完整 Mods 目录树并逐文件校验远端 SHA-256；已存在相同内容跳过、不同内容 fail-closed（除非 `-OverwriteModsApproved`）；签名不一致/不可读时 fail-closed，**任何路径都不卸载、不清数据** |
 | `deploy-apk.ps1` | PowerShell（ASCII） | **已弃用/危险**：Phase 0 的"构建 → 卸载重装 → 用设备端 sha256 证明装的是这个包"。卸载会删存档；现在不传 `-LegacyDestructiveInstall` 就只构建、不碰设备 |
-| `device-precheck.ps1` | PowerShell（ASCII） | E0 只读设备预检（ABI/API/包信息/APK 哈希/残留文件），默认不改设备；`-ResolveAdbOnly` 只做 adb 定位自检 |
+| `device-precheck.ps1` | PowerShell（ASCII） | E0 只读设备预检（ABI/API/包信息/APK 哈希/残留文件），默认不改设备；`-ResolveAdbOnly` 只做 adb 定位自检；`-HashFiles` 接受重复参数或逗号分隔列表 |
 | `find-dotnet.ps1` | PowerShell（ASCII） | 发现可用的 .NET SDK（`-Dotnet` → `$env:STARDEW_DOTNET` → `.tmp/*/dotnet` → `PATH`），要求 `--list-sdks` 非空 |
+| `validate-test-backup.py` | Python 3 | **只读**复核设备备份：按 `MANIFEST.json` 重算 size + SHA-256、校验文件数与总字节；不连设备、不写备份 |
 | `tests/test_mod_pipeline.py` | Python 3 | 注入器 + 容器的离线回归（27 项，含负向用例；**需要游戏程序集**） |
 | `tests/LoaderContract/` | C# 桌面宿主 | 验证 `Loader.Start()` 返回契约（成功返回 null + 落盘报告） |
-| `tests/ModFramework.Tests/` | C# 控制台 | Loader 的单元 + 宿主 + P114 探针测试（473 项），不需要设备 |
+| `tests/ModFramework.Tests/` | C# 控制台 | Loader 的单元 + 宿主 + P114 探针测试（486 项），不需要设备 |
 | `tests/FixtureMods/` | C# | 测试用 mod 包（一个 dll 内含 8 种入口形态 + 一个私有依赖 dll） |
 | `tests/fixtures/manifests/` | JSON | 25 个 manifest 夹具 + `index.json` 期望表 |
-| `tests/test_loader.py` | Python 3 | 构建并运行 Loader 测试（含 P114 探针包）；`--refs` 时额外编示例 mod |
+| `tests/test_loader.py` | Python 3 | 构建并运行 Loader 测试（含 P114 探针包；`--refs` 时 P114 也强制用 `AndroidRefsDir` 构建） |
 | `tests/test_ci_offline.py` | Python 3 | CI 可跑的 13 项检查（语法/编码/夹具/schema/隐私/CI 结构） |
 | `tests/test_p114_probe.py` | Python 3 | P114 静态安全审计（46 项：默认探针路径无原生代码、T11/T12 已编译隔离、部署脚本无卸载路径） |
 | `tests/test_device_precheck.ps1` | PowerShell | adb 解析自测（10 项，不连设备） |
@@ -188,6 +189,13 @@ python Tools/verify_modded_apk.py `
 `verify_modded_apk.py` 的最后一项是**安装准入**判定：候选 signer 必须与 baseline（= 已安装包）完全一致，
 否则状态为 `UPDATE_INCOMPATIBLE_RISK`（退出码仍为 0——那是门禁 BLOCKED，不是构建失败）。
 signer 不一致时的合法路径只有"备份校验后卸载重装"，见 `docs/audit/phase1.1.8-report.md`。
+
+### 交付副本与备份复核
+
+- 验收过的候选包复制到 `final/`（稳定路径），并写 `final/SHA256SUMS.txt` 与 `final/DELIVERY.md`；
+  APK 本体被 `*.apk` 规则忽略，只入库说明与校验和。每次重建 MVID 都会变，所以**以校验和为准**。
+- 装机前的项目外备份用 `python Tools/validate-test-backup.py --root <备份根>` 复核：
+  只读、逐文件重算 size + SHA-256、校验文件数与总字节，不连设备。
 
 ## 离线回归
 

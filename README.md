@@ -28,7 +28,9 @@ Tools/                                        构建期工具与测试
   AssemblyStore/                              assemblies.blob 的提取 / 原位替换 / 校验
   find-dotnet.ps1                             发现可用的 .NET SDK（不写死用户路径）
   deploy-apk-safe.ps1                         非破坏性部署门禁（默认只读；安装/推送需显式批准）
+  validate-test-backup.py                     只读复核设备备份（size + SHA-256 + 计数）
   tests/                                      离线测试套件（见下）
+final/                                        稳定交付副本（APK 本体被 .gitignore 忽略，只入库说明与校验和）
 docs/
   modding/                                    Manifest 规范、写一个 mod
   architecture/                               Phase 1 运行时约束与 Loader 设计
@@ -61,12 +63,13 @@ apktool.yml         → decoded/apktool.yml
 | --- | --- |
 | 支持的游戏版本 | **1.6.15.0**（versionCode 239）。版本绑定：清单/资源/程序集都强相关，不做多版本兼容 |
 | 可构建的 APK | ✅ 直达标题界面，无更新/隐私/实名弹窗 |
-| Mod Framework：Manifest 发现 / 校验 / 依赖排序 / 加载 / 入口调用 | ✅ **离线实现完成**（宿主测试 283 项） |
+| Mod Framework：Manifest 发现 / 校验 / 依赖排序 / 加载 / 入口调用 | ✅ **离线实现完成**（宿主测试 486 项） |
 | Mod Framework：Phase 1.1 加固 | ✅ **离线实现完成**：裸 DLL 不执行 · 版本门禁 Fail-Closed · 加载前程序集身份预检 · 日志降级进报告（见 [`docs/audit/phase1.1-report.md`](docs/audit/phase1.1-report.md)） |
 | Mod Framework：Phase 1.1.1 预检正确性与安全加固 | ✅ **离线实现完成**：依赖失败不再误伤无关 mod · 内容相等改逐字节判定（去掉 FNV 回退）· 宿主匹配 Fail-Closed · PE/CLI 逐层边界 · 框架版本 Unknown/Invalid 分离 · 报告与日志脱敏（见 [`docs/audit/phase1.1.1-report.md`](docs/audit/phase1.1.1-report.md)） |
 | Mod Framework：Phase 1.1.2 程序集加载完整性 | ✅ **离线实现完成**：预检字节写入私有快照并只从快照 `LoadFrom` · 加载前二次校验 · 不动点显式收敛/耗尽（`MF0208`）· ECMA-335 公钥标志与 Blob 形状校验（见 [`docs/audit/phase1.1.2-report.md`](docs/audit/phase1.1.2-report.md)） |
 | Mod Framework：Phase 1.1.3 快照去重完整性与指纹抗碰撞 | ✅ **离线实现完成**：fingerprint 只做候选索引（完整字节比较才共享）· 一个键下可存多份不同内容 · 快照完整性用独立 SHA-256（无 SHA-256 → Fail-Closed）· `LoadFrom` 返回身份核对（`MF0210`）（见 [`docs/audit/phase1.1.3-report.md`](docs/audit/phase1.1.3-report.md)） |
 | Mod Framework：Phase 1.1.4 运行时表征与非破坏性部署 | ⚠️ **部分完成**：安全探针入口 `RunSafe`（T11/T12 移出默认编译）· P114 诊断 mod 走真实 Loader 链路 · 部署脚本改为默认只读 + 双批准 + 签名门禁 · 桌面证据齐备；**MonoVM 上运行仍待批准，ARM64 真机 BLOCKED**（见 [`docs/audit/phase1.1.4-report.md`](docs/audit/phase1.1.4-report.md)） |
+| Mod Framework：Phase 1.1.5–1.1.9（部署链路 / MonoVM 表征 / mod-enabled 构建 / CI 收尾） | ⚠️ **Emulator 已实测**：递归 Mods 部署门禁 · `assembleModdedDebug` 注入构建 · 长期密钥库 · CI 3/3 绿 · E0 与项目外备份完成；设备真实 MonoVM 运行 **11 PASS / 3 FAIL**（R-01/R-02/R-13 的探针引用编译缺陷已修，待重新推送复测）；**ARM64 真机仍 BLOCKED**（见 [`phase1.1.7`](docs/audit/phase1.1.7-report.md) / [`phase1.1.8`](docs/audit/phase1.1.8-report.md) / [`phase1.1.9`](docs/audit/phase1.1.9-device-acceptance-report.md)） |
 | Mod Framework：ARM64 真机验证 | ❌ **BLOCKED**（无物理设备；只有 x86_64 模拟器） |
 | Mod Framework：设备上验证 `AssemblyName` 元数据读取与 SHA-256 | ❌ **BLOCKED**（只有编译期证据，见 phase1.1 报告 §3） |
 | Harmony / 方法补丁 / 事件钩子 / SMAPI 兼容 | ❌ **未实现**（Phase 2 及以后） |
@@ -136,9 +139,13 @@ python Tools/build_modded_apk.py --dotnet <SDK 8.0.404> --work .tmp/build-modded
 `-Pkeystore` 必须指向**项目外长期密钥库**（`%USERPROFILE%\.android\keystores\StardewValley\`），
 不要指向 `.work/`、`.tmp/` 或 `app/build` 里的副本——那些目录会被清理。脚本不会自动生成新 key。
 
+最近一次验收过的交付副本放在 `final/`（`StardewValley-1.6.15.0-modded-test-debug.apk` +
+`SHA256SUMS.txt` + `DELIVERY.md`）。APK 本体被 `*.apk` 规则忽略，只入库说明与校验和；
+每次重新构建都会变（MVID 随机），所以**以 `final/SHA256SUMS.txt` 为准**。
+
 签名准入：signer 与已安装包**完全一致**才能 `adb install -r` 原位升级；不一致时只能在
 Saves/Mods 已备份并校验后，对指定测试机卸载重装（卸载本身会删应用数据）。详见
-`docs/audit/phase1.1.8-report.md`。
+`docs/audit/phase1.1.8-report.md` 与 `docs/audit/phase1.1.9-device-acceptance-report.md`。
 
 ### Mod Framework（C#）
 
@@ -187,10 +194,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Tools\tests\run-all.ps1 -Ref
 | P114 静态安全审计（46 项：探针无原生代码、T11/T12 已编译隔离、部署无卸载路径） | `python Tools/tests/test_p114_probe.py` | ❌ |
 | 隐私扫描 | `python Tools/privacy-scan.py` | ❌ |
 | adb 解析自测（10 项，不连设备） | `powershell -File Tools/tests/test_device_precheck.ps1` | ❌ |
-| 部署门禁 fake adb 自测（38 项，不连设备） | `powershell -File Tools/tests/test_deploy_safe.ps1` | ❌ |
-| Loader 单元 + 宿主 + P114 探针（45 项驱动 / 473 项内部） | `python Tools/tests/test_loader.py --refs .tmp/p113/refs` | 示例 mod 与 65 程序集差分需要（缺则 SKIP） |
+| 部署门禁 fake adb 自测（95 项，不连设备） | `powershell -File Tools/tests/test_deploy_safe.ps1` | ❌ |
+| Loader 单元 + 宿主 + P114 探针（45 项驱动 / 486 项内部） | `python Tools/tests/test_loader.py --refs .tmp/p113/refs` | 示例 mod 与 65 程序集差分需要（缺则 SKIP） |
 | 注入 / 容器 / Loader 契约（27 项） | `python Tools/tests/test_mod_pipeline.py --refs .tmp/p113/refs` | ✅ |
 | E0 只读设备预检 | `powershell -File Tools/device-precheck.ps1` | ❌（需要设备） |
+| 备份复核（只读） | `python Tools/validate-test-backup.py --root <backup>` | ❌ |
 
 **CI（`.github/workflows/ci.yml`）只跑不需要游戏程序集的部分**：
 `test_ci_offline.py`、`test_p114_probe.py`、`privacy-scan.py`、ModInjector/Runtime/P114/FixtureMod 构建、

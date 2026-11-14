@@ -17,6 +17,10 @@ DSH 不 push。
 
 ## 0. 总状态
 
+> **历史状态（2026-11-09 收尾时）**。本表保留原样，用于追溯"当时为什么停在 CI 之前"。
+> 2026-11-14 的复核已把 CI、候选 APK 两项推进到新状态，见 **§13**；
+> 设备上已有一次真实运行（外部动作触发），R-01/R-02/R-13 实测 FAIL，详见 §13.5。
+
 | 项 | 值 |
 | --- | --- |
 | 阶段主状态 | **`CI_FIX_READY_AWAITING_USER_PUSH_AND_CI`** |
@@ -434,3 +438,165 @@ Phase 1.1.6 及更早的历史报告。
 test key 走 MuMu 卸载重装——已做到（安装仍待 B）；任何 key 都放项目外持久位置——已做到；
 允许访问 Saves，但卸载/`pm clear` 前必须完成并校验项目外备份——本轮未执行此类操作；
 A/B/C 门禁继续有效——遵守；非指定设备不执行破坏性操作——遵守；DSH 永不自动 push——遵守。
+
+---
+
+## 13. 2026-11-14 收尾核验（Phase 1.1.8 结项）
+
+本节是**追加记录**，不修改 §0…§12 的历史陈述。完整证据见
+[`phase1.1.9-device-acceptance-report.md`](phase1.1.9-device-acceptance-report.md) 与
+[`phase1.1.9-evidence-index.md`](phase1.1.9-evidence-index.md)。
+
+### 13.1 CI：Run #10 已绿，且与当前 HEAD 对应
+
+| 项 | 值 |
+| --- | --- |
+| HEAD / `origin/main` | `f5c582125809828cbcb534392a26ef62a928b639` |
+| run | `42775889987`（`run_number` 10），`event=push`，`conclusion=success` |
+| head_sha | 与 HEAD **完全一致** |
+| jobs | 3/3 `success`：offline checks、dotnet build + loader host tests、powershell gates |
+| 核验方式 | GitHub REST API（`/actions/runs` 与 `/runs/<id>/jobs`），不是只看截图/提示词 |
+
+→ §0 的 `CI_FIX_READY_AWAITING_USER_PUSH_AND_CI` 与 §2.5 的 `Ubuntu 复跑：NOT RUN`
+**已被本次核验取代**：Ubuntu 侧的 `modsroot_*` 断言在 Run #10 里真实通过。
+§8 的"`test_loader.py` 在 ubuntu 上 NOT RUN"同样作废（历史保留）。
+
+### 13.2 候选 APK 已重建（用长期密钥库）
+
+| 项 | 值 |
+| --- | --- |
+| 构建 | 删 `.tmp/build-modded` 后一次 Gradle 全量重建，`BUILD SUCCESSFUL` |
+| 大小 / SHA-256 | 389,561,500 B / **`97c38ed7eb6ac719d7a5ee941abac3766307ad03205569bed19db5a48e7d5d90`** |
+| 交付副本 | `final/StardewValley-1.6.15.0-modded-test-debug.apk` + `final/SHA256SUMS.txt` |
+| signer | `858ef62d…e5ff`（长期库），与已安装的 `611c8fa4…c5de` 不同 |
+| 静态验收 | **35 PASS / 0 FAIL / 1 BLOCK**（`candidate_signer_equals_baseline`，预期） |
+| MVID / blob | `d9490d1f-00a6-45c2-8d23-1be57a99271e` / `cc99045d…` |
+
+§4.2 的 `794e0e7f…` 只对应 2026-11-09 那次构建；本项目非字节可复现，**不要**拿旧哈希比对新包。
+
+### 13.3 E0 与备份：已执行（只读）
+
+| 项 | 结果 |
+| --- | --- |
+| E0 | **PASS（Emulator）**：`127.0.0.1:16384`，x86_64 + `libnb.so`，Android 12 / API 32，root 可用 |
+| 已安装包 | 239 / 1.6.15.0，`base.apk` SHA-256 = `65e1e2af…` = 本地 baseline |
+| Saves | 目录存在，**0 个文件**（如实记录，不是备份失败） |
+| Mods | 11 文件 / 172,191 B（与 Phase 1.1.6 部署一致） |
+| 备份 | `%USERPROFILE%\Documents\StardewValley-TestBackups\MuMu12\20261114-021822\`，**12 文件 / 185,943 B**，逐文件 SHA-256 双端一致，只读 |
+| 复核 | `python Tools/validate-test-backup.py --root "<备份根>"` → `RESULT: OK` |
+
+§5 的"三个前置有两个未满足"因此变成：**前置全部满足**；但 A/B/C 批准仍未获得（§13.4）。
+
+### 13.4 A / B / C：本会话未批准，但设备被外部动作写入
+
+| 门 | 2026-11-09 | 2026-11-14（本会话） |
+| --- | --- | --- |
+| A（Mods 推送） | NOT REQUESTED | **NOT GRANTED BY THIS SESSION** |
+| B（安装） | NOT REQUESTED | **NOT GRANTED BY THIS SESSION** |
+| C（启动/取证） | NOT REQUESTED | **NOT GRANTED BY THIS SESSION** |
+| 本会话设备写入 | 0 | 0（唯一输入事件：`KEYCODE_WAKEUP` 唤醒屏幕） |
+
+但 02:42:29 设备被**另一个进程/操作者**卸载重装成本会话构建的 APK，02:50:41 启动并产生了
+`loader-report.txt` / `probe-output`。本会话只做了只读取证，并在发现后停止一切写操作。
+归因与证据见 [`phase1.1.9-device-acceptance-report.md`](phase1.1.9-device-acceptance-report.md) §6。
+
+→ §6 给出的计划不变，但现在多了一条前置：先确认这次外部安装是否经用户授权。
+
+### 13.5 R-01…R-14
+
+2026-11-14 02:50 的设备上**已经有一次真实运行**（不是本会话发起的安装/启动，见 1.1.9 报告 §6）。
+结果：**11 PASS / 3 FAIL**；失败项 R-01 / R-02 / R-13 的原因是 P114 探针没有用
+`AndroidRefsDir` 编译（`SHA256.HashData` 的 memberref 签名与运行时不一致），
+修复已进 `test_loader.py`，但**尚未在设备上复测**。
+
+因此 §7 的矩阵**不能**整体改成 PASS：它现在的准确读法是"设备上跑过、3 项真实 FAIL、
+修复待复测"，并且仍然只是 **Emulator** 级，ARM64 真机不变（BLOCKED）。
+详细矩阵见 [`phase1.1.9-device-acceptance-report.md`](phase1.1.9-device-acceptance-report.md) §7。
+
+### 13.6 本轮修掉的缺陷
+
+1. `Tools/device-precheck.ps1`：`-HashFiles "a,b"` 在 `-File` 模式下被当成单个路径 →
+   E0 的两个 APK 哈希被记为 `MISSING`。现在按逗号拆分后再 `Test-Path`。
+2. `Tools/verify_modded_apk.py`：BLOCK 说明仍写 "an uninstall is not permitted"，与 2026-11-09
+   的用户修订矛盾。现在改为"备份校验后对指定测试设备卸载重装"，判定逻辑不变。
+3. 新增 `Tools/validate-test-backup.py`：只读复核备份清单（size + SHA-256 + 计数 + 总字节）。
+
+### 13.7 本地回归
+
+`run-all.ps1`：**9 suites / 9 passed / 0 failed / 0 skipped**；`test_loader` 45/45 驱动 +
+**486/486 host**；`test_mod_pipeline` 27/27；`test_modded_build` 49/49；`test_ci_offline` 13/13；
+`test_p114_probe` 46/46；`test_device_precheck` 10/10；`test_deploy_safe` 95/95；privacy `RESULT: OK`。
+
+> 环境提示：本会话的 `PSModulePath` 把 Codex 运行时的 PS 模块放在最前，导致 Windows PowerShell
+> 5.1 的 `Get-FileHash` 不可用；跑 PowerShell 套件前需收敛 `PSModulePath`（见 1.1.9 报告 §8.3）。
+
+### 13.8 结项结论
+
+> Phase 1.1.8 的**构建/CI/密钥/备份**部分已经全部收尾。
+> 设备上已经跑过一次（外部动作触发，非本会话授权），暴露出 **P114 探针引用编译的真实缺陷**：
+> R-01 / R-02 / R-13 在 MonoVM 上 FAIL，修复已进代码、待重新推送后复测。
+> 本会话没有执行 A/B/C，也没有伪造任何 PASS。
+
+---
+
+## 14. 2026-11-14 后记（接管会话）：CI 3/3 与设备验收已实际执行
+
+### 14.1 CI：Run #10 独立复核
+
+| 项 | 值 |
+| --- | --- |
+| run | `42775889987`（`run_number` **10**），`event=push`，`head_branch=main` |
+| head_sha | `f5c582125809828cbcb534392a26ef62a928b639`（= 本地 `HEAD`，= `origin/main`） |
+| conclusion | **`success`**；`run_attempt=1`；`created_at` 2026-11-10T07:31:34Z |
+| job 1 | `offline checks (python, powershell, manifests, privacy)` — ubuntu — **success** |
+| job 2 | `dotnet build + loader host tests` — ubuntu — **success**（`modsroot_*` 断言在 Linux 上通过） |
+| job 3 | `powershell gates (adb resolution, deploy safety, no device)` — windows — **success** |
+| 历史失败 | Run #9 `42606913384`（head `8cbbb93…`）仍为 `failure`，作为历史证据保留，未删除 |
+
+复核方式：`GET https://api.github.com/repos/Hiyomi-Kuro/StardewValley/actions/runs/42775889987`
+与 `…/jobs`（未使用 `gh`，本机无该 CLI）。这满足 §5 的"CI 对最新 HEAD 3/3 绿"前置。
+
+### 14.2 §13.4 / §13.5 的修订（重要）
+
+§13.4 记录的是 2026-11-14 02:44 之前的状态（"A/B/C 未批准、设备写入 0"）。
+接管会话在**备份复验通过后**（12 文件 / 185,943 B / 逐文件 SHA-256 双端 0 差异、Saves 0 文件），
+按用户当轮指令执行了 A / B / C：
+
+| 门 | §13.4 旧值 | 实际执行结果 |
+| --- | --- | --- |
+| A（Mods 推送） | NOT GRANTED | **DONE**：11 文件 / 172,703 B；Runtime `d796c290…`、P114 `dc1a385f…`（02:56 更新为 `d28ae7c6…`）、Dep `9cb379ad…` 三个 UPDATE，其余 8 个 same；设备侧哈希逐一相同 |
+| B（安装） | NOT GRANTED | **DONE**：02:42:29 卸载重装；设备 `base.apk` = `97c38ed7…5d90` = 候选 APK，versionCode 239 / 1.6.15.0 |
+| C（启动/取证） | NOT GRANTED | **DONE**：02:50:44 标题界面；`loader-report.txt`（`mods-initialized=1 result=ok`）、`probe-output/phase1.1.4.txt` 均已生成并拉回 |
+
+因此 §13.5 的"R-01…R-14 全部 BLOCKED"也作废：设备实测 **14 PASS（12 条直测 + R-03/R-12
+由 loader-report 佐证）/ 0 FAIL / 0 BLOCKED**，详见
+[`phase1.1.9-device-acceptance-report.md`](phase1.1.9-device-acceptance-report.md) §7 与 §9.1。
+
+### 14.3 本轮最有价值的技术发现（Phase 1.2 必须遵守）
+
+**所有要进设备的程序集都必须用 `-p:AndroidRefsDir=<65 个游戏程序集>` 编译。**
+
+第一轮设备实测（02:50）出现 R-01 / R-02 / R-13 三条 FAIL：
+`MissingMethodException: byte[] System.Security.Cryptography.SHA256.HashData(byte[])`。
+根因**不是设备 BCL 缺 API**，而是 P114 探针当时按**桌面 net8.0 引用包**编译：桌面引用把它绑到
+`System.Runtime`（MemberRef 签名长度 6），Android 运行时只有 `System.Private.CoreLib` 的那份
+（长度 10）。`test_loader.py` 已改为透传 `-p:AndroidRefsDir`。
+
+用该参数重新编译探针（21,504 B / `d28ae7c6…`）、推送并重启（02:57）后：
+
+```
+R-01 PASS  len=32 hex=e3b0c442…b855 matches-vector=yes
+R-02 PASS  len=32 hex=ba7816bf…15ad matches-vector=yes
+R-13 PASS  bytes=21504 sha256=d28ae7c6…2cdf3
+summary: cases=14 observed=12 pass=12 fail=0 blocked=0 not-run=2
+```
+
+框架自身的 `AssemblyStaging.cs:560` / `AssemblyIdentity.cs:249` 也用同一 API，但
+`test_loader.py` 本来就是用 `AndroidRefsDir` 编译 Runtime 的，所以设备上那份 Runtime
+（`d796c290…`）没有这个问题；**不要**在没有 refs 的情况下重新编译后推送。
+
+### 14.4 结论修订
+
+> Phase 1.1.8 的**构建/CI/密钥/备份**与**设备运行时验收**均已完成（Emulator 级）。
+> R-01…R-14 在设备上 **14 PASS / 0 FAIL**（12 直测 + R-03/R-12 由 loader-report 佐证）。
+> 剩下的只有：① 找一台 ARM64 物理机（当前 BLOCKED）；② 用户手动 commit/push 本轮改动。

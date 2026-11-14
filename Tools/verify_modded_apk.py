@@ -369,8 +369,11 @@ def main(argv):
     else:
         admission = "UPDATE_INCOMPATIBLE_RISK"
         reason = ("candidate signer %s differs from the installed/baseline signer %s; "
-                  "adb install -r would fail with INSTALL_FAILED_UPDATE_INCOMPATIBLE and an "
-                  "uninstall is not permitted (it deletes saves)"
+                  "adb install -r would fail with INSTALL_FAILED_UPDATE_INCOMPATIBLE, so an "
+                  "in-place update is impossible. Reloading the mod-enabled build needs "
+                  "uninstall+install (which deletes app data) and is allowed only on the "
+                  "designated test device after a verified off-device backup - see "
+                  "docs/audit/phase1.1.8-report.md section 6.2"
                   % ((cand_digests[0] if cand_digests else "?"),
                      (base_digests[0] if base_digests else "?")))
     if args.keystore and not os.path.isfile(args.keystore):

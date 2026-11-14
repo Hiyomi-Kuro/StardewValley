@@ -197,10 +197,19 @@ P114_FIXTURE_LAYOUT = {
 }
 
 
-def build_p114_package(dotnet, artifacts, work):
-    """Build the P114 mod plus its fixture variants and stage a complete mod package."""
-    rc, out, secs = run([dotnet, "build", P114_PROBE_PROJECT, "-c", "Release",
-                         "--artifacts-path", artifacts, "-v", "q"])
+def build_p114_package(dotnet, artifacts, work, refs=""):
+    """Build the P114 mod plus its fixture variants and stage a complete mod package.
+
+    `refs` must be the game's own assemblies when they are available. Without them the probe
+    compiles against the desktop net8.0 reference pack and binds `SHA256.HashData` to a
+    different memberref than the Android runtime exposes; the failure only shows up on the
+    device (R-01/R-02/R-13 -> MissingMethodException, observed 2026-11-14 on MuMu 12).
+    """
+    cmd = [dotnet, "build", P114_PROBE_PROJECT, "-c", "Release",
+           "--artifacts-path", artifacts, "-v", "q"]
+    if refs:
+        cmd += ["-p:AndroidRefsDir=" + refs]
+    rc, out, secs = run(cmd)
     probe_out = os.path.join(artifacts, "bin", "P114.RuntimeProbe", "release")
     produced = os.path.join(probe_out, "P114.RuntimeProbe.dll")
     if rc != 0 or not os.path.exists(produced):
@@ -349,10 +358,12 @@ def main():
         return finish()
 
     # ------------------------------------------------- Phase 1.1.4 probe package
-    p114_dir = build_p114_package(dotnet, artifacts, work)
+    # Assign refs first: the probe must be built against the game's assemblies, not the
+    # desktop reference pack (see build_p114_package).
+    refs = os.path.abspath(args.refs) if args.refs else ""
+    p114_dir = build_p114_package(dotnet, artifacts, work, refs)
     # ---------------------------------------------------------------- example mod
     hello_world_dir = ""
-    refs = os.path.abspath(args.refs) if args.refs else ""
     if refs:
         if not os.path.isdir(refs) or len([f for f in os.listdir(refs) if f.endswith(".dll")]) < 58:
             check("hello_world_build", False, "no usable game assemblies in " + refs)

@@ -7,6 +7,14 @@
 - 与上一阶段的差异：本阶段**没有**任何设备操作（读或写），因此没有设备侧证据；
   Emulator 一级连 E0 都没有跑到（门禁要求 CI 先绿）。
 
+> **2026-11-14 追加**：本索引 §0 的 `AWAITING_USER_PUSH_AND_CI` 已被实际结果取代。
+> 用户手动 push 的 `f5c5821` 触发了 GitHub Actions **Run #10（`42775889987`）**，
+> 3/3 jobs SUCCESS（head_sha 与仓库 HEAD 完全一致，经 REST API 独立核验）。
+> 同日完成 E0（只读）、Saves/Mods 备份、mod-enabled APK 重建与静态验收；
+> A/B/C 仍未获批，R-01…R-14 仍为 BLOCKED。
+> 后续证据见 [`phase1.1.9-evidence-index.md`](phase1.1.9-evidence-index.md)，
+> 收尾记录见 [`phase1.1.8-report.md`](phase1.1.8-report.md) §13。
+
 ---
 
 ## 0. 证据等级与本阶段实际拿到的等级
@@ -153,3 +161,47 @@
 | 10 修改文件与证据路径 | 报告 §11、本文件 §4 |
 | 11 Saves 访问/备份/卸载范围 | 报告 §9（本阶段 0 次访问） |
 | 12 DSH 未 commit/push | 报告 §11 末尾 |
+
+---
+
+## 2026-11-14 新证据与历史状态修订
+
+- GitHub Actions Run #10（42775889987）：三个 Job 全部 SUCCESS；Run #9（42606913384）为历史失败。
+- .tmp/phase1.1.9/logs/run-all-console.log：9/9 suites PASS；run-all/test-loader.txt：486/486 Host PASS。
+- .tmp/phase1.1.9/logs/gradle-final.log：BUILD SUCCESSFUL，APK 位于 app/build/outputs/apk/modded/app-modded-debug.apk；SHA-256 为 97c38ed7eb6ac719d7a5ee941abac3766307ad03205569bed19db5a48e7d5d90。
+- .tmp/phase1.1.9/modded-apk-verify.json：35 PASS / 0 FAIL / 1 BLOCKED，签名不连续，UPDATE_INCOMPATIBLE_RISK。
+- 项目外备份 %USERPROFILE%\Documents\StardewValley-TestBackups\MuMu12\20261114-021822\MANIFEST.json：12 文件、185943 字节、逐文件 SHA-256 比对 0 差异；外部 Saves 0 文件，不能据此断言应用私有数据可恢复。
+- docs/audit/phase1.1.9-device-acceptance-report.md：设备 E0、签名阻断、A/B/C 门禁和 R-01～R-14 的真实状态。
+
+---
+
+## 2026-11-14 后记（接管会话）：设备实测证据（A/B/C 已执行）
+
+上面最后一条描述的是"批准前"的版本；接管会话在同一份报告里追加了执行记录
+（§7 两轮 R 矩阵、§9.1 写操作时间线），并已实际执行 A/B/C。
+本节只列"可复核的输入"，结论在 `phase1.1.9-device-acceptance-report.md` §7 与 §9.1。
+
+| # | 证据（仓库内路径，均在 `.tmp/` 下、不入库） | 内容 |
+| ---: | --- | --- |
+| 1 | `logs/e0/device-precheck-rerun.txt` | 接管后重跑的 E0：`E0: PASS (read-only)`，设备/包/APK sha |
+| 2 | 备份复核（python 重算） | `entries=12 mismatches=0`、`sums_lines=12 failures=0`、`saves_backup_files=0` |
+| 3 | 设备 `sha256sum`（卸载前 Mods） | 11 文件与 `MANIFEST.json` 逐一相同（`a35a0359…` 等） |
+| 4 | `logs/deploy-b.log` | `uninstall → Success`；`install -r → Success`；装后 `97c38ed7…` = 候选 sha |
+| 5 | `logs/deploy-a-pushmods.txt` | 11 文件推送 + 设备端哈希；`d796c290…` / `dc1a385f…` / `9cb379ad…` |
+| 6 | `.tmp/phase1.1.9/deploy-mods.sh` | 外部 Mods 根的 su 复制/chown/chmod 脚本（可复核） |
+| 7 | `logs/launch-c.log` | `am start`、`topResumedActivity`、pid |
+| 8 | `logs/logcat-c.txt`、`logs/logcat-c2.txt` | 启动窗口 logcat（MonoVM/MonoGame/包进程） |
+| 9 | `shots/c-final.png` | 1920×1080 标题界面（`NEW` / `LOAD`，无任何弹窗） |
+| 10 | `device-evidence/loader-report.txt` | `mods-initialized=1 result=ok`、`preflight-stage=complete`、`state=Initialized` |
+| 11 | `device-evidence/probe-output/phase1.1.4.txt` | 第 1 轮（修复前）：`cases=14 pass=9 fail=3`；R-01/R-02/R-13 `MissingMethodException` |
+| 12 | `device-evidence/logs/P114.RuntimeProbe.log` | 探针自身日志（`summary: cases=14 …`） |
+| 13 | `device-evidence-r2/{loader-report.txt,phase1.1.4.txt}` | **第 2 轮（`AndroidRefsDir` 重编译后）**：`pass=12 fail=0`，R-01/R-02/R-13 转 PASS |
+| 14 | `shots/c-final.png` | 标题界面截图（1920×1080） |
+
+**最有价值的技术结论**：设备 BCL **并不缺** `SHA256.HashData`；失败原因是探针按桌面引用包编译，
+MemberRef 绑到了 `System.Runtime` 而运行时只有 `System.Private.CoreLib` 那份。凡是进设备的程序集
+都必须用 `-p:AndroidRefsDir=<65 refs>` 编译（`test_loader.py` 已改）。详见
+`phase1.1.8-report.md` §14.3。
+
+**数据安全**：Saves 卸载前后均为 0 文件；Mods 已恢复为 11 文件；项目外备份未被修改；
+`startup_preferences` 由游戏重新生成（备份副本保留）。
