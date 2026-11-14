@@ -291,6 +291,65 @@ def build_variants(dotnet, variants_root, fixtures_dir):
     return ok
 
 
+EVENT_FIXTURE_PROJECT = os.path.join(
+    ROOT, "Tools", "tests", "FixtureMods", "EventFixtureMod", "EventFixtureMod.csproj")
+LEGACY_CONTRACT_PROJECT = os.path.join(ROOT, "Tools", "tests", "LegacyContract", "LegacyContract.csproj")
+LEGACY_MOD_PROJECT = os.path.join(ROOT, "Tools", "tests", "FixtureMods", "LegacyMod", "LegacyMod.csproj")
+
+# key -> (EventVariant property, assembly name)
+EVENT_VARIANTS = [
+    ("a", "A", "EventMod.A"),
+    ("z", "Z", "EventMod.Z"),
+    ("fault", "Fault", "EventMod.Fault"),
+]
+
+
+def build_phase20_fixtures(dotnet, work):
+    """Phase 2.0 fixtures: three event mods plus a mod built against the frozen 1.0.0 contract.
+
+    Returns (event_fixture_dir, legacy_mod_dir, ok). An empty directory means "not built", which
+    the host reports as a failure for the event fixtures and as SKIPPED for the legacy check.
+    """
+    fixture_dir = os.path.join(work, "event-fixtures")
+    os.makedirs(fixture_dir, exist_ok=True)
+    ok = True
+    for key, variant, assembly_name in EVENT_VARIANTS:
+        out_dir = os.path.join(work, "phase20-variants", key)
+        rc, out, secs = run([dotnet, "build", EVENT_FIXTURE_PROJECT, "-c", "Release",
+                             "--artifacts-path", out_dir, "-v", "q",
+                             "-p:EventVariant=" + variant, "-p:EventAssemblyName=" + assembly_name])
+        produced = find_artifact(out_dir, assembly_name + ".dll") if rc == 0 else ""
+        if rc != 0 or not produced:
+            ok = False
+            check("phase20_fixture_" + key, False,
+                  "rc=%d %.1fs %s" % (rc, secs, tail(out, 4) if rc != 0 else "no " + assembly_name + ".dll"))
+            continue
+        shutil.copy2(produced, os.path.join(fixture_dir, assembly_name + ".dll"))
+        check("phase20_fixture_" + key, True, assembly_name + ".dll")
+
+    # The legacy mod must be compiled against the frozen 1.0.0 contract, never against the new
+    # runtime: otherwise "binary compatibility" would only prove source compatibility.
+    rc_contract, out_contract, secs = run([dotnet, "build", LEGACY_CONTRACT_PROJECT, "-c", "Release",
+                                           "--artifacts-path", os.path.join(work, "legacy-contract"),
+                                           "-v", "q"])
+    check("phase20_legacy_contract_build", rc_contract == 0,
+          "rc=%d %.1fs %s" % (rc_contract, secs, "" if rc_contract == 0 else tail(out_contract, 4)))
+    if rc_contract != 0:
+        return fixture_dir, "", ok
+
+    legacy_artifacts = os.path.join(work, "legacy-mod")
+    rc, out, secs = run([dotnet, "build", LEGACY_MOD_PROJECT, "-c", "Release",
+                         "--artifacts-path", legacy_artifacts, "-v", "q"])
+    produced = find_artifact(legacy_artifacts, "LegacyFixtureMod.dll") if rc == 0 else ""
+    if rc != 0 or not produced:
+        ok = False
+        check("phase20_legacy_mod_build", False,
+              "rc=%d %.1fs %s" % (rc, secs, tail(out, 4) if rc != 0 else "no LegacyFixtureMod.dll"))
+        return fixture_dir, "", ok
+    check("phase20_legacy_mod_build", True, produced)
+    return fixture_dir, os.path.dirname(produced), ok
+
+
 def main():
     # The host prints assembly identities, and a malformed-input test can legitimately surface
     # a replacement character. Never let the console codec turn that into a crash.
@@ -357,6 +416,9 @@ def main():
     if not build_variants(dotnet, os.path.join(work, "variants"), fixtures):
         return finish()
 
+    # ------------------------------------------------- Phase 2.0 event fixtures
+    event_fixture_dir, legacy_mod_dir, _ = build_phase20_fixtures(dotnet, work)
+
     # ------------------------------------------------- Phase 1.1.4 probe package
     # Assign refs first: the probe must be built against the game's assemblies, not the
     # desktop reference pack (see build_p114_package).
@@ -394,6 +456,10 @@ def main():
         cmd += ["--hello-world-dir", hello_world_dir]
     if p114_dir:
         cmd += ["--p114-dir", p114_dir]
+    if event_fixture_dir:
+        cmd += ["--event-fixture-dir", event_fixture_dir]
+    if legacy_mod_dir:
+        cmd += ["--legacy-mod-dir", legacy_mod_dir]
 
     rc, out, secs = run(cmd, env=run_env)
     print(out.rstrip())
@@ -416,6 +482,20 @@ def main():
               "%d P114 checks failed %s" % (len(p114_failures), p114_failures[:2]))
     else:
         check("p114_suite_ran", False, "the P114 package could not be built")
+
+    # ------------------------------------------- Phase 2.0 event suite outcome
+    if event_fixture_dir:
+        phase20_failures = [line for line in out.splitlines()
+                            if line.startswith("FAIL ") and ("events_" in line or "phase20_" in line)]
+        check("phase20_suite_ran", "events_ready_gate_no_dispatch_before_commit" in out,
+              "dispatcher contract checks executed")
+        check("phase20_suite_no_failures", not phase20_failures,
+              "%d Phase 2.0 checks failed %s" % (len(phase20_failures), phase20_failures[:2]))
+        check("phase20_legacy_binary_compat_ran",
+              "phase20_legacy_mod_initialized" in out and "FAIL phase20_legacy" not in out,
+              "mod built against the frozen 1.0.0 contract loaded by the new runtime")
+    else:
+        check("phase20_suite_ran", False, "the Phase 2.0 event fixtures could not be built")
 
     # ------------------------------------------- Phase 1.1.1 parser differential
     # Read-only: the game's own reference assemblies are parsed and compared against the desktop

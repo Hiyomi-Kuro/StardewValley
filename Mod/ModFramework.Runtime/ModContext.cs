@@ -3,7 +3,12 @@ namespace ModFramework.Runtime;
 /// <summary>Read-only view of one mod, handed to its entry point.</summary>
 internal sealed class ModContext : IModContext
 {
-    internal ModContext(ModManifest manifest, string gameVersion, string frameworkVersion, IModLogger logger)
+    internal ModContext(
+        ModManifest manifest,
+        string gameVersion,
+        string frameworkVersion,
+        IModLogger logger,
+        IModEvents events)
     {
         ModId = manifest.Id;
         ModName = manifest.Name;
@@ -12,6 +17,7 @@ internal sealed class ModContext : IModContext
         GameVersion = gameVersion;
         FrameworkVersion = frameworkVersion;
         Log = logger;
+        Events = events;
     }
 
     public string ModId { get; }
@@ -27,4 +33,6 @@ internal sealed class ModContext : IModContext
     public string ModDirectory { get; }
 
     public IModLogger Log { get; }
+
+    public IModEvents Events { get; }
 }

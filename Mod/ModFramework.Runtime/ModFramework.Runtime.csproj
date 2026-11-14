@@ -14,7 +14,13 @@
     Do not use System.Linq, System.Text.Json, FileInfo/DirectoryInfo, Directory.GetFiles,
     Environment.CurrentDirectory or Version.TryParse here: they do not exist at runtime.
 
-    The assembly version is the framework API version that manifests compare against.
+    The assembly identity and the framework API version are separate on purpose:
+
+      AssemblyVersion stays 1.0.0.0 - it is the binding identity every existing mod was compiled
+      against, and the preflight compares it when a mod ships its own runtime copy. Bumping it
+      would change what old binaries bind to without adding any value.
+      Version / FileVersion move to 1.1.0 - the API version that manifests are gated against
+      (reported by Loader.FrameworkApiVersion).
   -->
 
   <PropertyGroup>
@@ -24,9 +30,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>ModFramework.Runtime</AssemblyName>
     <RootNamespace>ModFramework.Runtime</RootNamespace>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <FileVersion>1.0.0.0</FileVersion>
+    <FileVersion>1.1.0.0</FileVersion>
     <Deterministic>true</Deterministic>
     <DebugType>portable</DebugType>
   </PropertyGroup>

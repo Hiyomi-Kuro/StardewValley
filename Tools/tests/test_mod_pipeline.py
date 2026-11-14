@@ -187,6 +187,62 @@ def main():
     check("default_patch_instrumented", "present" in fields.get("bootstrap-start", ""),
           fields.get("bootstrap-start", "missing"))
 
+    # ------------------------------------------------------- Phase 2.0 event hooks
+    # The default build is now the C build (loader + GameLaunched/Tick). Both hooks are asserted
+    # from the patched assembly, not from the build manifest.
+    check("events_default_mode_enabled", fields.get("event-hooks") == "enabled",
+          fields.get("event-hooks", "(missing)"))
+    check("events_game_launched_hook_present",
+          fields.get("game-launched-hook", "").startswith("present"),
+          fields.get("game-launched-hook", "(missing)"))
+    check("events_tick_hook_present", fields.get("tick-hook", "").startswith("present"),
+          fields.get("tick-hook", "(missing)"))
+    check("events_tick_is_first_instruction", fields.get("tick-is-first") == "yes",
+          fields.get("tick-is-first", "(missing)"))
+    check("events_bridge_methods_present",
+          fields.get("bridge-game-launched") == "present" and fields.get("bridge-tick") == "present",
+          "bridge-game-launched=%r bridge-tick=%r"
+          % (fields.get("bridge-game-launched"), fields.get("bridge-tick")))
+
+    # A loader-only build must carry no event hook at all (the rollback artifact).
+    loader_only = os.path.join(work, "StardewValley.loader-only.dll")
+    rc, out_lo, _ = run([dotnet, injector, "patch", sv_orig, loader_only,
+                         "--refs-dir", refs, "--no-event-hooks"])
+    rc_v, vout_lo, _ = run([dotnet, injector, "verify", loader_only, "--no-event-hooks"])
+    f_lo = parse_verify(vout_lo)
+    check("events_loader_only_patch_ok", rc == 0 and rc_v == 0 and f_lo.get("RESULT") == "OK",
+          "patch rc=%d verify=%s" % (rc, f_lo.get("RESULT")))
+    check("events_loader_only_has_no_hooks",
+          f_lo.get("game-launched-hook", "").startswith("absent")
+          and f_lo.get("tick-hook", "").startswith("absent"),
+          "game-launched-hook=%r tick-hook=%r"
+          % (f_lo.get("game-launched-hook"), f_lo.get("tick-hook")))
+    check("events_loader_only_has_no_bridge",
+          f_lo.get("bridge-game-launched") == "absent" and f_lo.get("bridge-tick") == "absent",
+          "bridge-game-launched=%r" % f_lo.get("bridge-game-launched"))
+
+    # Positive verify of an event build against its own expectation still passes; a loader-only
+    # build verified with the event expectation must fail (the switch is really checked).
+    rc_v, _, _ = run([dotnet, injector, "verify", loader_only])
+    check("events_verify_expectation_is_enforced", rc_v != 0,
+          "verify without --no-event-hooks rejects a loader-only assembly (rc=%d)" % rc_v)
+
+    # Mixed state: patching a loader-only output with events enabled must be refused, not
+    # silently upgraded into a state nobody can reproduce.
+    rc_mixed, out_mixed, _ = run([dotnet, injector, "patch", loader_only,
+                                  os.path.join(work, "mixed.dll"), "--refs-dir", refs])
+    check("events_refuses_mixed_state_upgrade",
+          rc_mixed != 0 and "mixed state" in out_mixed,
+          "rc=%d %s" % (rc_mixed, out_mixed.strip().splitlines()[-1:] or ""))
+
+    # And the reverse direction: an event build cannot be turned into a loader-only one.
+    rc_mixed2, out_mixed2, _ = run([dotnet, injector, "patch", patched,
+                                    os.path.join(work, "mixed2.dll"), "--refs-dir", refs,
+                                    "--no-event-hooks"])
+    check("events_refuses_mixed_state_downgrade",
+          rc_mixed2 != 0 and "mixed state" in out_mixed2,
+          "rc=%d %s" % (rc_mixed2, out_mixed2.strip().splitlines()[-1:] or ""))
+
     # ---------------------------------------------------------------- patch: idempotent
     twice = os.path.join(work, "StardewValley.patched.twice.dll")
     rc, out2, _ = run([dotnet, injector, "patch", patched, twice, "--refs-dir", refs])
@@ -194,6 +250,13 @@ def main():
     f2 = parse_verify(vout2)
     check("patch_is_idempotent", rc == 0 and rc_v == 0 and f2.get("hook-is-first") == "yes",
           "rerun rc=%d verify=%s (idempotent mode expected)" % (rc, f2.get("RESULT")))
+    check("events_idempotent_keeps_exactly_one_hook",
+          f2.get("game-launched-hook", "").startswith("present")
+          and f2.get("tick-hook", "").startswith("present")
+          and "count=2" not in f2.get("game-launched-hook", "")
+          and "count=2" not in f2.get("tick-hook", ""),
+          "game-launched-hook=%r tick-hook=%r"
+          % (f2.get("game-launched-hook"), f2.get("tick-hook")))
 
     # ---------------------------------------------------------------- negative control
     legacy = os.path.join(work, "StardewValley.legacy-loadbytes.dll")

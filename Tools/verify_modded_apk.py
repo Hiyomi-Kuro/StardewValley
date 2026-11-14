@@ -119,6 +119,18 @@ def tool(build_tools, name):
     return ""
 
 
+def parse_kv(text, key):
+    """Reads ``key : value`` (or ``key = value``) from ModInjector output."""
+    for line in text.splitlines():
+        cuts = [p for p in (line.find(":"), line.find("=")) if p >= 0]
+        if not cuts:
+            continue
+        cut = min(cuts)
+        if line[:cut].strip() == key:
+            return line[cut + 1:].strip()
+    return ""
+
+
 def parse_certs(text):
     """Returns the SHA-256 digests apksigner printed for the signers."""
     digests = []
@@ -154,6 +166,8 @@ def main(argv):
                     help="device sha256 of the installed base.apk, if E0 measured it")
     ap.add_argument("--dotnet", default="dotnet",
                     help="SDK used to run ModInjector verify on the re-extracted assembly")
+    ap.add_argument("--expect-events", default="auto", choices=["auto", "enabled", "disabled"],
+                    help="Phase 2.0: expected event-hook state; auto reads it from the blob manifest")
     args = ap.parse_args(argv)
 
     for path in (args.candidate, args.baseline, args.blob_manifest):
@@ -167,6 +181,13 @@ def main(argv):
 
     with open(args.blob_manifest, "r", encoding="utf-8") as f:
         blob_manifest = json.load(f)
+
+    expect_events = args.expect_events
+    if expect_events == "auto":
+        expect_events = blob_manifest.get("event_hooks", "enabled")
+    event_flag = [] if expect_events == "enabled" else ["--no-event-hooks"]
+    report["expect_events"] = expect_events
+    report["blob_manifest_events"] = blob_manifest.get("event_hooks", "(none)")
 
     # -------------------------------------------------------------- file facts
     print("\n== 1. artifact facts ==")
@@ -300,8 +321,28 @@ def main(argv):
     if os.path.isfile(injector_dll):
         rc, out = run([args.dotnet, injector_dll, "verify",
                        os.path.join(os.path.dirname(tmp_blob), "apk-" + TARGET_ASSEMBLY + ".dll"),
-                       "--mods-dir", blob_manifest["injector"]["mods_dir"]])
+                       "--mods-dir", blob_manifest["injector"]["mods_dir"]] + event_flag)
         checks.check("modinjector_verify_from_apk", rc == 0 and "RESULT: OK" in out, "rc=%d" % rc)
+        # The APK's own assembly must carry exactly the hook set the build claimed. These are
+        # read from the re-extracted file, not from the build manifest.
+        checks.check("blob_manifest_event_mode",
+                     blob_manifest.get("event_hooks") == expect_events,
+                     "%s vs %s" % (blob_manifest.get("event_hooks"), expect_events))
+        reported = parse_kv(out, "event-hooks")
+        launched = parse_kv(out, "game-launched-hook")
+        tick = parse_kv(out, "tick-hook")
+        checks.check("apk_report_event_mode", reported == expect_events, reported)
+        if expect_events == "enabled":
+            checks.check("apk_has_game_launched_hook", launched.startswith("present"), launched)
+            checks.check("apk_has_tick_hook", tick.startswith("present"), tick)
+        else:
+            checks.check("apk_has_no_game_launched_hook", launched.startswith("absent"), launched)
+            checks.check("apk_has_no_tick_hook", tick.startswith("absent"), tick)
+        report["apk_injector_verify"] = {
+            "event_hooks": reported,
+            "game_launched_hook": launched,
+            "tick_hook": tick,
+        }
     else:
         checks.check("modinjector_verify_from_apk", False, "ModInjector.dll not found next to manifest")
 

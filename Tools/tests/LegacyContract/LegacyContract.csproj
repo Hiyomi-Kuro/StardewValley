@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Frozen Phase 1 contract stub - NOT a second runtime.
+
+    Purpose: the only honest way to prove that a mod compiled against the *old* framework still
+    loads is to compile it against the old contract surface. Recompiling a fixture against the
+    new interface and calling that "binary compatibility" would prove nothing.
+
+    This project therefore publishes assembly identity `ModFramework.Runtime, Version=1.0.0.0`
+    (the identity the new runtime deliberately keeps) containing exactly the Phase 1.0.0 public
+    surface: IModEntry, IModContext WITHOUT Events, IModLogger and ModLogLevel.
+
+    It is built only by Tools/tests/test_loader.py into its own artifacts directory and is never
+    shipped to a device. The legacy mod assembly it produces is loaded by the real (new) runtime.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>ModFramework.Runtime</AssemblyName>
+    <RootNamespace>ModFramework.Runtime</RootNamespace>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+</Project>

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    A mod compiled against the frozen 1.0.0 contract (no IModContext.Events). Loading it through
+    the new runtime is the binary-compatibility regression: its AssemblyRef points at
+    ModFramework.Runtime 1.0.0.0 and it only calls members that existed in 1.0.0.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName>LegacyFixtureMod</AssemblyName>
+    <RootNamespace>LegacyFixtureMod</RootNamespace>
+    <Version>1.0.0</Version>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\LegacyContract\LegacyContract.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

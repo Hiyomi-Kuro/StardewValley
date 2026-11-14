@@ -143,7 +143,17 @@ def main(argv):
     ap.add_argument("--manifest-json", required=True)
     ap.add_argument("--mods-dir", default=EXTERNAL_MODS_DIR)
     ap.add_argument("--loader-api", default="loadfrom", choices=["loadfrom"])
+    ap.add_argument("--event-hooks", default="enabled", choices=["enabled", "disabled"],
+                    help="enabled = Phase 2.0 C build (loader + GameLaunched/Tick); "
+                         "disabled = Phase 2.0 B build (loader only, the rollback artifact)")
+    ap.add_argument("--no-event-hooks", action="store_true",
+                    help="alias for --event-hooks disabled")
     args = ap.parse_args(argv)
+
+    if args.no_event_hooks:
+        args.event_hooks = "disabled"
+    event_hooks = args.event_hooks == "enabled"
+    event_flag = [] if event_hooks else ["--no-event-hooks"]
 
     for path in (args.blob, args.manifest, args.arch_blob):
         if not os.path.isfile(path):
@@ -161,7 +171,8 @@ def main(argv):
     checks = Checks()
     manifest = {
         "schema": 1,
-        "phase": "1.1.7",
+        "phase": "2.0",
+        "event_hooks": args.event_hooks,
         "generated_utc": datetime.datetime.now(datetime.timezone.utc)
                         .strftime("%Y-%m-%dT%H:%M:%SZ"),
         "host": platform.platform(),
@@ -304,7 +315,7 @@ def main(argv):
     patched_target = os.path.join(patched_dir, TARGET_ASSEMBLY + ".dll")
     patch_cmd = [args.dotnet, injector_dll, "patch", staged_target, patched_target,
                  "--refs-dir", refs_dir, "--mods-dir", args.mods_dir,
-                 "--loader-api", args.loader_api, "--hook-method", "OnCreatePartTwo"]
+                 "--loader-api", args.loader_api, "--hook-method", "OnCreatePartTwo"] + event_flag
     rc, out = run(patch_cmd)
     with open(os.path.join(logs_dir, "injector-patch.log"), "w", encoding="utf-8") as f:
         f.write(out)
@@ -320,7 +331,7 @@ def main(argv):
     # ------------------------------------------------------------ 6. verify IL
     print("\n== 6. verify patched %s ==" % TARGET_ASSEMBLY)
     verify_cmd = [args.dotnet, injector_dll, "verify", patched_target,
-                  "--hook-method", "OnCreatePartTwo", "--mods-dir", args.mods_dir]
+                  "--hook-method", "OnCreatePartTwo", "--mods-dir", args.mods_dir] + event_flag
     rc, verify_out = run(verify_cmd)
     with open(os.path.join(logs_dir, "injector-verify.log"), "w", encoding="utf-8") as f:
         f.write(verify_out)
@@ -342,6 +353,29 @@ def main(argv):
     checks.check("verify_mods_dir_external", baked_mods_dir == args.mods_dir, baked_mods_dir)
     checks.check("verify_not_private_mods_dir",
                  not baked_mods_dir.startswith("/data/data/"), baked_mods_dir)
+
+    # Phase 2.0: the event switch must be visible in the artifact, both positively and
+    # negatively - an event build has both hooks, a loader-only build has neither.
+    reported_events = parse_kv(verify_out, "event-hooks")
+    game_launched_hook = parse_kv(verify_out, "game-launched-hook")
+    tick_hook = parse_kv(verify_out, "tick-hook")
+    bridge_launched = parse_kv(verify_out, "bridge-game-launched")
+    bridge_tick = parse_kv(verify_out, "bridge-tick")
+    checks.check("verify_event_mode", reported_events == args.event_hooks, reported_events)
+    if event_hooks:
+        checks.check("verify_game_launched_hook", game_launched_hook.startswith("present"),
+                     game_launched_hook)
+        checks.check("verify_tick_hook", tick_hook.startswith("present"), tick_hook)
+        checks.check("verify_bridge_game_launched", bridge_launched == "present", bridge_launched)
+        checks.check("verify_bridge_tick", bridge_tick == "present", bridge_tick)
+        checks.check("verify_tick_is_first", parse_kv(verify_out, "tick-is-first") == "yes",
+                     parse_kv(verify_out, "tick-is-first"))
+    else:
+        checks.check("verify_no_game_launched_hook", game_launched_hook.startswith("absent"),
+                     game_launched_hook)
+        checks.check("verify_no_tick_hook", tick_hook.startswith("absent"), tick_hook)
+        checks.check("verify_no_bridge_game_launched", bridge_launched == "absent", bridge_launched)
+        checks.check("verify_no_bridge_tick", bridge_tick == "absent", bridge_tick)
 
     patched_sha = sha256_file(patched_target)
     patched_size = os.path.getsize(patched_target)
@@ -366,6 +400,11 @@ def main(argv):
         "mods_dir": baked_mods_dir,
         "bootstrap_type": bootstrap_type,
         "bootstrap_start": bootstrap_start,
+        "event_hooks": reported_events,
+        "game_launched_hook": game_launched_hook,
+        "tick_hook": tick_hook,
+        "bridge_game_launched": bridge_launched,
+        "bridge_tick": bridge_tick,
     }
 
     # ------------------------------------------------------- 7. store replace
@@ -420,7 +459,7 @@ def main(argv):
     # staging copy is not the same claim as verifying what actually landed in the container.
     reextracted = os.path.join(patched_dir, "from-blob-" + TARGET_ASSEMBLY + ".dll")
     rc, verify2 = run([args.dotnet, injector_dll, "verify", reextracted,
-                       "--hook-method", "OnCreatePartTwo", "--mods-dir", args.mods_dir])
+                       "--hook-method", "OnCreatePartTwo", "--mods-dir", args.mods_dir] + event_flag)
     with open(os.path.join(logs_dir, "injector-verify-from-blob.log"), "w", encoding="utf-8") as f:
         f.write(verify2)
     checks.check("verify_reextracted_from_blob", rc == 0 and "RESULT: OK" in verify2, "rc=%d" % rc)

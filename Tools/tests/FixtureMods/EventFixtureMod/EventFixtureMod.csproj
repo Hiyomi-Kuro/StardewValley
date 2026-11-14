@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Phase 2.0 event fixture, parameterised like ConflictLib: one source produces three mods.
+
+      -p:EventVariant=A      healthy subscriber (GameLaunched + Tick, duplicate Tick registration)
+      -p:EventVariant=Z      faulting Tick handler registered BEFORE the healthy one + snaplog
+      -p:EventVariant=Fault  subscribes and then throws from Initialize (rollback test)
+
+    The host reads the static state class through the already loaded assembly, so no test-only
+    API is added to the framework.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName Condition="'$(EventAssemblyName)' != ''">$(EventAssemblyName)</AssemblyName>
+    <RootNamespace>EventFixture</RootNamespace>
+    <Deterministic>true</Deterministic>
+    <EventVariant Condition="'$(EventVariant)' == ''">A</EventVariant>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(EventVariant)' == 'A'">
+    <DefineConstants>$(DefineConstants);EVENT_VARIANT_A</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(EventVariant)' == 'Z'">
+    <DefineConstants>$(DefineConstants);EVENT_VARIANT_Z</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(EventVariant)' == 'Fault'">
+    <DefineConstants>$(DefineConstants);EVENT_VARIANT_FAULT</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\..\Mod\ModFramework.Runtime\ModFramework.Runtime.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

@@ -41,68 +41,115 @@ tasks.named("assemble") {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1.1.7: mod-enabled build.
+// Phase 1.1.7 / Phase 2.0: mod-enabled builds.
 //
 // `assembleDebug` above stays a *baseline* build: it packages the untouched
 // app/src/main/apkroot/assemblies/assemblies.blob into app-debug.apk.
 //
-// `assembleModdedDebug` is the explicit opt-in that additionally injects
-// ModFramework.Bootstrap.Start() into StardewValley.dll and repacks the blob. It writes a
-// different output and a different work directory, so it can never overwrite the baseline APK
-// and never writes back into the source tree.
+// Phase 2.0 has three distinct artifacts and three distinct work directories:
 //
-//   ./gradlew :app:assembleModdedDebug -Pdotnet=<dotnet> -Pkeystore=<debug.keystore>
+//   A. assembleDebug             baseline game APK            .tmp/build
+//   B. assembleLoaderOnlyDebug   loader only, no event hooks  .tmp/build-loader-only
+//   C. assembleModdedDebug       loader + GameLaunched/Tick   .tmp/build-modded
 //
-// Local-only: it needs the real game assemblies, so CI runs the static checks in
+// B and C never share a work directory or an output path, so switching the event switch
+// cannot reuse a stale blob, build manifest or APK. The event switch is an explicit
+// `--event-hooks enabled|disabled` argument to Tools/build_modded_apk.py, recorded in
+// modded-build-manifest.json and re-verified from the final APK by verify_modded_apk.py.
+//
+//   ./gradlew :app:assembleModdedDebug -Pdotnet=<dotnet> -Ppython=<python>
+//   ./gradlew :app:assembleLoaderOnlyDebug -Pdotnet=<dotnet> -Ppython=<python>
+//
+// Local-only: they need the real game assemblies, so CI runs the static checks in
 // Tools/tests/test_modded_build.py instead.
 // ---------------------------------------------------------------------------
-val moddedOutputApk = layout.buildDirectory.file("outputs/apk/modded/app-modded-debug.apk")
-val moddedWorkDir = rootProject.layout.projectDirectory.dir(".tmp/build-modded")
-
-// Keystore: the baseline build generates <work>/debug.keystore on first use. The mod-enabled
-// build must NOT generate one, because a fresh key cannot replace the installed package.
-// Override with -Pkeystore=<path> to point at an existing key.
-val moddedKeystore = (findProperty("keystore") as String?)
-    ?.let { rootProject.file(it) }
-    ?: moddedWorkDir.file("debug.keystore").asFile
-
 val pythonExe = (findProperty("python") as String?) ?: "python"
 val dotnetExe = (findProperty("dotnet") as String?) ?: "dotnet"
 
-val prepareModdedAssemblies = tasks.register<Exec>("prepareModdedAssemblies") {
+// Both mod builds must be signed with the *baseline* key: a fresh key cannot replace the
+// installed package. Override with -Pkeystore=<path>.
+val sharedModKeystore = (findProperty("keystore") as String?)
+    ?.let { rootProject.file(it) }
+    ?: rootProject.layout.projectDirectory.file(".tmp/build/debug.keystore").asFile
+
+fun prepareAssembliesTask(
+    taskName: String,
+    work: Directory,
+    eventHooks: Boolean,
+): TaskProvider<Exec> = tasks.register<Exec>(taskName) {
     group = "build"
-    description = "提取 65 个程序集、注入 Bootstrap.Start() 并重建 assemblies.blob"
+    description = if (eventHooks) {
+        "提取 65 个程序集、注入 Bootstrap + 事件钩子并重建 assemblies.blob"
+    } else {
+        "提取 65 个程序集、仅注入 Bootstrap.Start() 并重建 assemblies.blob（事件回退构建）"
+    }
     workingDir = rootProject.projectDir
     commandLine(
         pythonExe,
         "Tools/build_modded_apk.py",
         "--dotnet", dotnetExe,
-        "--work", moddedWorkDir.asFile.absolutePath,
-        "--out-blob", moddedWorkDir.file("modded-assemblies.blob").asFile.absolutePath,
-        "--manifest-json", moddedWorkDir.file("modded-build-manifest.json").asFile.absolutePath,
+        "--work", work.asFile.absolutePath,
+        "--out-blob", work.file("modded-assemblies.blob").asFile.absolutePath,
+        "--manifest-json", work.file("modded-build-manifest.json").asFile.absolutePath,
+        "--event-hooks", if (eventHooks) "enabled" else "disabled",
     )
+    inputs.property("eventHooks", if (eventHooks) "enabled" else "disabled")
     inputs.file(rootProject.file("Tools/build_modded_apk.py"))
     inputs.file(rootProject.file("Tools/AssemblyStore/store.py"))
     inputs.file(rootProject.file("Tools/ModInjector/Program.cs"))
     inputs.file(rootProject.file("Tools/ModInjector/IlChecks.cs"))
+    inputs.file(rootProject.file("Tools/ModInjector/Injection.cs"))
     inputs.file(project.file("src/main/apkroot/assemblies/assemblies.blob"))
     inputs.file(project.file("src/main/apkroot/assemblies/assemblies.manifest"))
     inputs.file(project.file("src/main/apkroot/assemblies/assemblies.arm64_v8a.blob"))
-    outputs.file(moddedWorkDir.file("modded-assemblies.blob"))
+    outputs.file(work.file("modded-assemblies.blob"))
+    outputs.file(work.file("modded-build-manifest.json"))
 }
 
-tasks.register<JavaExec>("assembleModdedDebug") {
+val moddedOutputApk = layout.buildDirectory.file("outputs/apk/modded/app-modded-debug.apk")
+val moddedWorkDir = rootProject.layout.projectDirectory.dir(".tmp/build-modded")
+val loaderOnlyOutputApk = layout.buildDirectory.file("outputs/apk/loader-only/app-loader-only-debug.apk")
+val loaderOnlyWorkDir = rootProject.layout.projectDirectory.dir(".tmp/build-loader-only")
+
+val prepareModdedAssemblies = prepareAssembliesTask(
+    "prepareModdedAssemblies", moddedWorkDir, eventHooks = true)
+val prepareLoaderOnlyAssemblies = prepareAssembliesTask(
+    "prepareLoaderOnlyAssemblies", loaderOnlyWorkDir, eventHooks = false)
+
+fun modApkTask(
+    taskName: String,
+    output: Provider<RegularFile>,
+    work: Directory,
+    prepare: TaskProvider<Exec>,
+    descriptionText: String,
+): TaskProvider<JavaExec> = tasks.register<JavaExec>(taskName) {
     group = "build"
-    description = "mod-enabled APK：baseline 内容 + 注入 Bootstrap 的 StardewValley 程序集"
-    dependsOn(tasks.named("classes"), prepareModdedAssemblies)
+    description = descriptionText
+    dependsOn(tasks.named("classes"), prepare)
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.kaori.svpatch.MainKt")
     args(
         projectDir.absolutePath,
-        moddedOutputApk.get().asFile.absolutePath,
-        moddedWorkDir.asFile.absolutePath,
-        "--bootstrap-blob", moddedWorkDir.file("modded-assemblies.blob").asFile.absolutePath,
-        "--keystore", moddedKeystore.absolutePath,
+        output.get().asFile.absolutePath,
+        work.asFile.absolutePath,
+        "--bootstrap-blob", work.file("modded-assemblies.blob").asFile.absolutePath,
+        "--keystore", sharedModKeystore.absolutePath,
         "--require-existing-keystore",
     )
 }
+
+modApkTask(
+    "assembleModdedDebug",
+    moddedOutputApk,
+    moddedWorkDir,
+    prepareModdedAssemblies,
+    "C：mod-enabled APK（Loader + GameLaunched/Tick 事件钩子）",
+)
+
+modApkTask(
+    "assembleLoaderOnlyDebug",
+    loaderOnlyOutputApk,
+    loaderOnlyWorkDir,
+    prepareLoaderOnlyAssemblies,
+    "B：Loader-only 回退 APK（无事件钩子，用于 Phase 2.0 回退验收）",
+)

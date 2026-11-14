@@ -124,22 +124,41 @@ wrapper 的 `distributionUrl` 默认指向腾讯镜像（国内 services.gradle.
 
 产物 `app/build/outputs/apk/debug/app-debug.apk` 是 **baseline**：不含任何 Mod 支持代码。
 
-### mod-enabled APK（Phase 1.1.7 / 1.1.8）
+### mod-enabled APK（Phase 1.1.7 / Phase 2.0）
 
-要让装机后能加载 `Mods/`，必须显式构建注入版——默认构建**不会**注入：
+要让装机后能加载 `Mods/`，必须显式构建注入版——默认构建**不会**注入。Phase 2.0 起有两个模组构建：
 
 ```powershell
-python Tools/build_modded_apk.py --dotnet <SDK 8.0.404> --work .tmp/build-modded `
-    --out-blob .tmp/build-modded/modded-assemblies.blob `
-    --manifest-json .tmp/build-modded/modded-build-manifest.json
-
+# C：Loader + GameLaunched/Tick 事件钩子（事件版）
 .\gradlew.bat :app:assembleModdedDebug "-Pdotnet=<SDK 8.0.404>" `
-    "-Pkeystore=$env:USERPROFILE\.android\keystores\StardewValley\stardewvalley-test-signing.keystore"
+    "-Ppython=python" "-Pkeystore=<项目外长期密钥库>"
+
+# B：只有 Loader，没有任何事件钩子（事件回退版）
+.\gradlew.bat :app:assembleLoaderOnlyDebug "-Pdotnet=<SDK 8.0.404>" `
+    "-Ppython=python" "-Pkeystore=<项目外长期密钥库>"
 ```
 
-产物是 `app/build/outputs/apk/modded/app-modded-debug.apk`，与 baseline APK 完全分开。
+| 产物 | 路径 | 工作目录 | 事件钩子 |
+| --- | --- | --- | --- |
+| A 原始基线 | `app/build/outputs/apk/debug/app-debug.apk` | `.tmp/build` | 无 |
+| B Loader-only | `app/build/outputs/apk/loader-only/app-loader-only-debug.apk` | `.tmp/build-loader-only` | **无** |
+| C Loader + events | `app/build/outputs/apk/modded/app-modded-debug.apk` | `.tmp/build-modded` | 有 |
+
+Gradle 任务自己调用 `Tools/build_modded_apk.py`，**不要**先手工跑一遍再跑 Gradle（会得到两套 blob/manifest 哈希）。
+事件开关贯通 Gradle → `build_modded_apk.py --event-hooks enabled|disabled` → `ModInjector` → 构建 manifest →
+`verify_modded_apk.py`；A/B/C 的输出与工作目录互相隔离。
+
 `-Pkeystore` 必须指向**项目外长期密钥库**（`%USERPROFILE%\.android\keystores\StardewValley\`），
 不要指向 `.work/`、`.tmp/` 或 `app/build` 里的副本——那些目录会被清理。脚本不会自动生成新 key。
+
+最终校验（从**最终 APK 解出的程序集**验证“应有/应无”，不只相信构建 manifest）：
+
+```powershell
+python Tools/verify_modded_apk.py --candidate app/build/outputs/apk/modded/app-modded-debug.apk `
+    --baseline app/build/outputs/apk/debug/app-debug.apk `
+    --blob-manifest .tmp/build-modded/modded-build-manifest.json `
+    --report .tmp/verify-modded.json --dotnet <SDK>
+```
 
 最近一次验收过的交付副本放在 `final/`（`StardewValley-1.6.15.0-modded-test-debug.apk` +
 `SHA256SUMS.txt` + `DELIVERY.md`）。APK 本体被 `*.apk` 规则忽略，只入库说明与校验和；
@@ -148,6 +167,7 @@ python Tools/build_modded_apk.py --dotnet <SDK 8.0.404> --work .tmp/build-modded
 签名准入：signer 与已安装包**完全一致**才能 `adb install -r` 原位升级；不一致时只能在
 Saves/Mods 已备份并校验后，对指定测试机卸载重装（卸载本身会删应用数据）。详见
 `docs/audit/phase1.1.8-report.md` 与 `docs/audit/phase1.1.9-device-acceptance-report.md`。
+事件 API 的契约见 `docs/architecture/phase2-events.md`。
 
 ### Mod Framework（C#）
 

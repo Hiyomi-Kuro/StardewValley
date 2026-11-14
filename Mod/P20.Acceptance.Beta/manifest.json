@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "P20.Acceptance.Beta",
+  "name": "Phase 2.0 Acceptance Beta",
+  "version": "1.0.0",
+  "author": "Stardew Valley Android Mod Framework",
+  "description": "Phase 2.0 subscriber B: bounded fault injection, duplicate registration, dispose semantics and snapshot semantics. No game types.",
+  "entryAssembly": "P20.Acceptance.Beta.dll",
+  "entryType": "P20.Acceptance.Beta.BetaEntry",
+  "gameVersion": "*",
+  "frameworkVersion": ">=1.1.0"
+}

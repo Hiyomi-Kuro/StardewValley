@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "P20.Acceptance.Alpha",
+  "name": "Phase 2.0 Acceptance Alpha",
+  "version": "1.0.0",
+  "author": "Stardew Valley Android Mod Framework",
+  "description": "Phase 2.0 subscriber A: records GameLaunched/Tick order, threads and bounded diagnostics snapshots. No game types, no P/Invoke.",
+  "entryAssembly": "P20.Acceptance.Alpha.dll",
+  "entryType": "P20.Acceptance.Alpha.AlphaEntry",
+  "gameVersion": "*",
+  "frameworkVersion": ">=1.1.0",
+  "dependencies": [
+    {
+      "id": "P20.Acceptance.Beta",
+      "version": ">=1.0.0"
+    }
+  ]
+}

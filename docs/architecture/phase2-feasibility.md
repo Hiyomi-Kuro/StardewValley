@@ -3,10 +3,15 @@
 | 项 | 值 |
 | --- | --- |
 | 日期 | 2026-11-14（+08:00） |
-| 状态 | **可行性研究完成；Phase 2 未实现**（本阶段不引入正式事件框架、不引入 Harmony/NDK 依赖） |
-| 基线 | `4221283ee73e7a1bc26408fc7709431a9c004d40`（用户已 push；工作区另有本阶段未提交修改） |
+| 状态 | **可行性研究完成；Phase 2.0 已按本文件路线 B 实现并完成真机验收**（见 §12 与 [Phase 2.0 报告](../audit/phase2.0-report.md)、[事件 API](phase2-events.md)） |
+| 基线 | 2026-11-14 推进为 `53f8171b9eb8faaee430ec8530d1eb942e5ade09`（Phase 2.0 开工基线）；本文件原始研究基线为 `4221283ee73e7a1bc26408fc7709431a9c004d40` |
 | 游戏程序集 | `StardewValley.dll` 1.6.15.24354，SHA-256 `587ff5ff9c258679004977bbeec359aba86649bd3e4860ddcaa428df8f07e047`，MVID `573bf1e5-3245-46d6-925a-1c3713afb677` |
-| 关联 | [Phase 1.2.4 报告](phase1.2.4-report.md) · [Loader 设计](../architecture/phase1-loader-design.md) · [部署设计](../architecture/phase1.2.1-deployment-design.md) · [Phase 0 运行时可行性](runtime-feasibility.md) |
+| 关联 | [Phase 1.2.4 报告](../audit/phase1.2.4-report.md) · [Loader 设计](../architecture/phase1-loader-design.md) · [部署设计](../architecture/phase1.2.1-deployment-design.md) · [Phase 0 运行时可行性](runtime-feasibility.md) |
+
+> **阅读顺序提示（2026-11-14 修订）**：本文件是**可行性研究**，不是实现说明。
+> §0–§11 保留提出时的判断与推测；**§12 逐条列出 Phase 2.0 实测对它们的修订**（哪些被证实、哪些被推翻、
+> 哪些仍然未知）。当前实现契约以 [phase2-events.md](phase2-events.md) 为准。
+>
 
 > 证据分级沿用本项目惯例：**【观测】** 直接来自程序集元数据/IL 或真机输出；**【推断】** 由观测按已知运行时语义推导；
 > **【未知】** 本阶段无证据。桌面与 ARM64 真机分开标注。
@@ -389,3 +394,30 @@ public interface IModEvents {
 - **准入缺项**：本阶段对 `Tools/` 与测试的修改**尚未 commit/push**，因此没有对应的远端 CI；
   用户提交后必须先确认 `powershell-gates` 三步真实通过（见 [Phase 1.2.4 报告](phase1.2.4-report.md) §4）。
 - **不得**把本文件写成“事件框架已实现”或“Harmony 可行”。本阶段只做了可行性研究。
+
+---
+
+## 12. Phase 2.0 实测修订（2026-11-14）
+
+> 本节由 Phase 2.0 实施/验收补写。它**不改写**上文的历史判断，只逐条标注实测结果。
+> 证据来源：真实 `StardewValley.dll` 的 IL 审计、合成 Cecil 夹具执行、主机测试、A/B/C 构建校验、
+> V1963A 真机运行（详见 [Phase 2.0 报告](../audit/phase2.0-report.md) 与
+> [真机验收](../audit/phase2.0-device-acceptance-report.md)）。
+
+| # | 上文表述 | 原状态 | Phase 2.0 证据 | 现在 |
+| --- | --- | --- | --- | --- |
+| R-1 | `GameRunner.Initialize()` 无参数、返回 `void`、末尾可插钩子 | 【观测】§5.1 | 真实程序集：`Family Virtual void Initialize()`，15 条指令、**0 个异常处理器**、**1 个 `ret`**、无分支 | **证实**；注入在唯一正常 `ret` 前 |
+| R-2 | `GameRunner.Update(GameTime)` 可在方法头插钩子 | 【推断】§5.2 | 真实程序集：319 条指令、**3 个 finally**、2 个 `ret`、无 `catch`；方法头插入合法且不改栈 | **证实**；`Tick` 是第一条指令 |
+| R-3 | `GameLaunched` 每进程一次 | 【推断】§5.1 | 调度器状态机 + 主机测试 `events_game_launched_exactly_once`；真机 `GameLaunched=1` | **证实**（框架保证，不依赖 MonoGame 只调一次） |
+| R-4 | “主线程 / Android UI 线程” | 【推断】§5.1/§5.2 | 真机记录 Loader、`GameLaunched`、`Tick` 的 `ManagedThreadId` | **已按实测改写**：见真机报告；契约只承诺“进入游戏方法的线程”，不承诺 UI 线程 |
+| R-5 | “每帧一次” | 【推断】§5.2 | `Update` 每次进入计数；真机计数随停留时间增长 | **改写**：每进入一次 `Update` 一次，**不**等于渲染帧/60 Hz |
+| R-6 | `Initialize` 若含 `try` 需要精确处理 | 【未知】R-3 | 实测**不含**任何异常处理器；注入器已实现边界搬移与拒绝规则，并用合成夹具覆盖 `catch` 内 `ret` / handler 边界 | **本目标证实**；通用形状已实现并测试 |
+| R-7 | 旧 Mod 二进制兼容 | 【推断】R-6 | 冻结 1.0.0 契约桩编译的 `LegacyFixtureMod`（不引用 `Events`）由新 Runtime 初始化成功 | **证实**；`AssemblyVersion` 保持 1.0.0.0 |
+| R-8 | 注入后 MVID 变化、AOT 回退 JIT | 【观测】§7.4 | 每次 patch 新 MVID；`IlChecks` 强制 MVID 变化 | **证实**（沿用） |
+| R-9 | `Bootstrap.Tick()` 只判断委托非空、每 Tick 一次静态调用 | 【推断】§3.2 | 生成 IL：`ldsfld; brtrue; ldsfld; callvirt Action::Invoke; leave; ret`（+catch） | **证实**；无反射、无文件 IO |
+| R-10 | `--no-event-hooks` 生成基线 | 【设计】§7.5 | 已实现为 B 构建（`assembleLoaderOnlyDebug`）；verify 从最终 APK 反向确认“无钩子” | **证实** |
+| R-11 | `Delegate.CreateDelegate` 在裁剪后 BCL 可用 | 【未知】 | 静态扫描 65 个游戏程序集：`System.Delegate::CreateDelegate(Type,MethodInfo)` 被 Java.Interop 等引用 | **证实**（静态）；真机运行进一步佐证 |
+| R-12 | Harmony / 运行时 detour | 不可行 §3.3 | 本阶段未重新评估，未引入 NDK/Harmony | **维持不可行结论** |
+
+**仍未验证**（与本阶段边界一致）：低端机帧率影响、Android 11+、其它 OEM、非空存档场景、
+`Tick` 与渲染帧的精确关系、`GameLaunched` 之后内容资源何时全部就绪。

@@ -24,8 +24,14 @@ public interface IModEntry
 /// <summary>
 /// Per-mod context handed to <see cref="IModEntry.Initialize"/>.
 ///
-/// Deliberately small: no game objects, no events, no content pipeline. Exposing
-/// unverified <c>Game1</c> members as a stable API is out of scope for this phase.
+/// Deliberately small: no game objects, no content pipeline. Exposing unverified
+/// <c>Game1</c> members as a stable API is out of scope for this phase.
+///
+/// Phase 2.0 adds exactly one member, <see cref="Events"/>. That is an additive change to an
+/// interface the framework implements and mods only consume, so a mod compiled against the
+/// previous framework (which never reads <c>Events</c>) keeps loading unchanged. The fixture
+/// <c>Tools/tests/FixtureMods/LegacyFixtureMod</c> is compiled against the frozen 1.0.0 contract
+/// stub and proves that claim without recompiling it against this interface.
 /// </summary>
 public interface IModContext
 {
@@ -49,6 +55,15 @@ public interface IModContext
 
     /// <summary>Logger that prefixes every line with this mod's id.</summary>
     IModLogger Log { get; }
+
+    /// <summary>
+    /// Game lifecycle events this mod may subscribe to.
+    ///
+    /// Subscriptions are per mod and only become active when <see cref="IModEntry.Initialize"/>
+    /// returns normally: if it throws, every subscription it made is discarded and the mod never
+    /// receives an event. See <see cref="IModEvents"/> for the dispatch contract.
+    /// </summary>
+    IModEvents Events { get; }
 }
 
 /// <summary>

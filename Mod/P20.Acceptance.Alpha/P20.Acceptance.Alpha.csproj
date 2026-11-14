@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Phase 2.0 device acceptance, subscriber A.
+
+    Compiled against ModFramework.Runtime 1.1.0 (the events API) and against the game's own
+    trimmed assemblies when AndroidRefsDir is supplied, exactly like every other assembly that
+    is pushed to the device.
+
+    Build:
+      dotnet build Mod/P20.Acceptance.Alpha -c Release -p:AndroidRefsDir=<65 refs>
+
+    The build output directory is a complete mod package (manifest.json is copied next to the
+    assembly). It deliberately declares a dependency on P20.Acceptance.Beta so the loader
+    initializes Beta *first*; dispatch order must still be Alpha -> Beta because the framework
+    sorts by ordinal mod id, not by load or registration order.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName>P20.Acceptance.Alpha</AssemblyName>
+    <RootNamespace>P20.Acceptance.Alpha</RootNamespace>
+    <Version>1.0.0</Version>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ModFramework.Runtime\ModFramework.Runtime.csproj" Private="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="manifest.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

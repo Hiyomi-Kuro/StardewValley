@@ -29,6 +29,14 @@ public static class Program
     private const string BootNamespace = "ModFramework";
     private const string BootType = "Bootstrap";
 
+    // ------------------------------------------------------------------ Phase 2.0 event bridge
+    private const string EventDispatchType = "ModFramework.Runtime.EventDispatcher";
+    private const string EventLaunchedMethod = "DispatchGameLaunched";
+    private const string EventTickMethod = "DispatchTick";
+    private const string BridgeGameLaunched = "GameLaunched";
+    private const string BridgeTick = "Tick";
+    private const string BridgeDiagnosticMethod = "WriteEventsDisabled";
+
     public static int Main(string[] args)
     {
         if (args.Length == 0)
@@ -96,6 +104,11 @@ public static class Program
         Console.WriteLine("                           (needed when <in.dll> is not next to the other 64 assemblies)");
         Console.WriteLine("    --mode append          diagnostic build: append marker + throw, no loader call");
         Console.WriteLine("    --no-catch             keep try/catch IL valid but rethrow (diagnosis builds)");
+        Console.WriteLine("    --no-event-hooks       loader-only build: no GameRunner hooks and no event bridge");
+        Console.WriteLine("                           (this is the Phase 2.0 B build / rollback artifact)");
+        Console.WriteLine();
+        Console.WriteLine("  verify options (in addition to the patch ones):");
+        Console.WriteLine("    --no-event-hooks       require the assembly to have NO event hooks at all");
         Console.WriteLine();
         Console.WriteLine("  defaults: --mods-dir " + DefaultModsDir);
         Console.WriteLine("            --runtime-dll " + DefaultRuntimeDll);
@@ -124,6 +137,14 @@ public static class Program
             throw new ArgumentException("--loader-api must be loadfrom or load, got: " + la);
         }
         var useLoadFrom = loaderApi == "loadfrom";
+        var eventHooks = opts.ContainsKey("event-hooks")
+            ? ParseSwitch("event-hooks", opts["event-hooks"])
+            : !opts.ContainsKey("no-event-hooks");
+        if (minimal && eventHooks)
+        {
+            throw new ArgumentException(
+                "--mode append is a diagnosis build of Bootstrap.Start() only; it cannot carry event hooks");
+        }
 
         Console.WriteLine("[1/4] read    " + input);
         var resolver = new DefaultAssemblyResolver();
@@ -139,6 +160,7 @@ public static class Program
             }
         }
         Console.WriteLine("      loader-api = " + (useLoadFrom ? "loadfrom (Assembly.LoadFrom)" : "load (Assembly.Load(byte[]))"));
+        Console.WriteLine("      event-hooks = " + (eventHooks ? "enabled (GameLaunched + Tick)" : "disabled (loader-only build)"));
 
         using var module = ModuleDefinition.ReadModule(input, new ReaderParameters
         {
@@ -174,19 +196,16 @@ public static class Program
         if (existing is not null)
         {
             Console.WriteLine("      bootstrap type already present (idempotent mode)");
-            var already = target.Body.Instructions.Any(x => x.OpCode == OpCodes.Call
-                && x.Operand is MethodReference mr
-                && mr.DeclaringType.FullName == BootNamespace + "." + BootType);
-            Console.WriteLine(already ? "      hook call already present" : "      hook call missing, inserting");
-            if (!already)
-            {
-                InsertCall(target, existing.Methods.First(x => x.Name == LoaderMethod));
-            }
+            ApplyToExistingBootstrap(module, existing, target, hookMethodName, eventHooks, minimal);
         }
         else
         {
-        var bootstrap = EmitBootstrap(module, modsDir, runtimeDll, loaderType, minimal, noCatch, useLoadFrom);
-            InsertCall(target, bootstrap);
+            var bootstrap = EmitBootstrap(module, modsDir, runtimeDll, loaderType, minimal, noCatch, useLoadFrom, eventHooks);
+            InsertCall(target, bootstrap, LoaderMethod);
+            if (eventHooks)
+            {
+                InsertEventHooks(module);
+            }
         }
 
         // a modified assembly must carry a new MVID, otherwise the stale AOT image is reused
@@ -213,7 +232,7 @@ public static class Program
                               ?? throw new InvalidOperationException("bootstrap Start() missing after write");
             var hooked = written.GetType(TargetType)?.Methods.FirstOrDefault(x => x.Name == hookMethodName && !x.IsStatic)
                          ?? throw new InvalidOperationException("hook method missing after write");
-            IlChecks.Validate(written, startMethod, hooked, originalMvid);
+            IlChecks.Validate(written, startMethod, hooked, originalMvid, eventHooks);
         }
 
         var addedRefs = module.AssemblyReferences
@@ -234,11 +253,186 @@ public static class Program
             ["mods-dir"] = modsDir,
             ["runtime-dll"] = runtimeDll,
         };
+        if (!eventHooks)
+        {
+            finalCheck["no-event-hooks"] = "true";
+        }
         if (!useLoadFrom)
         {
             finalCheck["allow-bytes-api"] = "true";
         }
         return Verify(finalCheck);
+    }
+
+    private static bool ParseSwitch(string name, string value)
+    {
+        switch (value.Trim().ToLowerInvariant())
+        {
+            case "enabled":
+            case "on":
+            case "true":
+            case "1":
+                return true;
+            case "disabled":
+            case "off":
+            case "false":
+            case "0":
+                return false;
+            default:
+                throw new ArgumentException("--" + name + " must be enabled or disabled, got: " + value);
+        }
+    }
+
+    /// <summary>
+    /// Inserts the two event hooks into the real game methods.
+    ///
+    /// Both targets are resolved by exact signature (type, name, return type and parameter list),
+    /// never by "the first method with that name", and both insertions go through
+    /// <see cref="GameMethodInjector"/> so branch, switch, leave and handler boundaries are
+    /// re-targeted instead of being skipped.
+    /// </summary>
+    private static void InsertEventHooks(ModuleDefinition module)
+    {
+        var boot = module.GetType(BootNamespace, BootType)
+                   ?? throw new InvalidOperationException("bootstrap type missing before event injection");
+        var launched = boot.Methods.FirstOrDefault(m => m.Name == BridgeGameLaunched && m.IsStatic && m.Parameters.Count == 0)
+                       ?? throw new InvalidOperationException("bridge method missing: " + BridgeGameLaunched);
+        var tick = boot.Methods.FirstOrDefault(m => m.Name == BridgeTick && m.IsStatic && m.Parameters.Count == 0)
+                   ?? throw new InvalidOperationException("bridge method missing: " + BridgeTick);
+
+        var initialize = GameMethodInjector.RequireMethod(
+            module, GameMethodInjector.GameRunnerType, GameMethodInjector.InitializeMethod, "System.Void");
+        var update = GameMethodInjector.RequireMethod(
+            module, GameMethodInjector.GameRunnerType, GameMethodInjector.UpdateMethod,
+            "System.Void", GameMethodInjector.GameTimeType);
+
+        Console.WriteLine("      event target (completion) = " + initialize.FullName);
+        var launches = GameMethodInjector.InjectCompletionHook(initialize, launched);
+        Console.WriteLine("      GameLaunched call sites    = " + launches + " (every normal ret)");
+
+        Console.WriteLine("      event target (entry)      = " + update.FullName);
+        var ticks = GameMethodInjector.InjectEntryHook(update, tick);
+        Console.WriteLine("      Tick call sites           = " + ticks + " (method entry)");
+    }
+
+    /// <summary>
+    /// Idempotency / migration handling for an input that already contains
+    /// <c>ModFramework.Bootstrap</c>.
+    ///
+    /// The rule is "same shape or refuse": a loader-only bootstrap cannot silently gain event
+    /// hooks, an event-capable bootstrap cannot silently lose them, a duplicate or misplaced hook
+    /// is a build failure, and a partially hooked method is refused instead of being completed.
+    /// That is what keeps a re-patched assembly from becoming a mixed state nobody can reason
+    /// about.
+    /// </summary>
+    private static void ApplyToExistingBootstrap(
+        ModuleDefinition module,
+        TypeDefinition existing,
+        MethodDefinition target,
+        string hookMethodName,
+        bool eventHooks,
+        bool minimal)
+    {
+        if (minimal)
+        {
+            throw new InvalidOperationException(
+                "--mode append cannot be applied to an assembly that already contains ModFramework.Bootstrap");
+        }
+
+        var start = existing.Methods.FirstOrDefault(m => m.Name == LoaderMethod)
+                    ?? throw new InvalidOperationException("existing ModFramework.Bootstrap has no Start()");
+
+        var hasLaunched = existing.Methods.Any(m => m.Name == BridgeGameLaunched);
+        var hasTick = existing.Methods.Any(m => m.Name == BridgeTick);
+        if (eventHooks && (!hasLaunched || !hasTick))
+        {
+            throw new InvalidOperationException(
+                "existing ModFramework.Bootstrap is a loader-only build (no event bridge); refusing to " +
+                "produce a mixed state. Rebuild from the pristine StardewValley.dll instead of patching " +
+                "an already-patched assembly.");
+        }
+
+        if (!eventHooks && (hasLaunched || hasTick))
+        {
+            throw new InvalidOperationException(
+                "existing ModFramework.Bootstrap carries the event bridge but --no-event-hooks was " +
+                "requested; refusing to produce a mixed state. Rebuild from the pristine " +
+                "StardewValley.dll instead of patching an already-patched assembly.");
+        }
+
+        var startCalls = GameMethodInjector.CountCalls(target, BootNamespace + "." + BootType, LoaderMethod);
+        if (startCalls > 1)
+        {
+            throw new InvalidOperationException(
+                "duplicate Bootstrap.Start() hook calls in " + target.FullName + " (count=" + startCalls + ")");
+        }
+
+        if (startCalls == 0)
+        {
+            InsertCall(target, start, LoaderMethod);
+        }
+        else
+        {
+            Console.WriteLine("      Start hook call already present (" + hookMethodName + ")");
+        }
+
+        if (!eventHooks)
+        {
+            return;
+        }
+
+        var launched = existing.Methods.First(m => m.Name == BridgeGameLaunched);
+        var tick = existing.Methods.First(m => m.Name == BridgeTick);
+        var initialize = GameMethodInjector.RequireMethod(
+            module, GameMethodInjector.GameRunnerType, GameMethodInjector.InitializeMethod, "System.Void");
+        var update = GameMethodInjector.RequireMethod(
+            module, GameMethodInjector.GameRunnerType, GameMethodInjector.UpdateMethod,
+            "System.Void", GameMethodInjector.GameTimeType);
+
+        EnsureSingleHook(initialize, launched, BridgeGameLaunched, completion: true);
+        EnsureSingleHook(update, tick, BridgeTick, completion: false);
+    }
+
+    private static void EnsureSingleHook(
+        MethodDefinition method,
+        MethodDefinition bridge,
+        string name,
+        bool completion)
+    {
+        var typeName = BootNamespace + "." + BootType;
+        var count = GameMethodInjector.CountCalls(method, typeName, name);
+        if (count > 1)
+        {
+            throw new InvalidOperationException(
+                "duplicate " + name + " hook calls in " + method.FullName + " (count=" + count + ")");
+        }
+
+        if (count == 1)
+        {
+            var complete = completion
+                ? GameMethodInjector.HasCompleteCompletionHook(method, typeName, name)
+                : GameMethodInjector.HasEntryHook(method, typeName, name);
+            if (!complete)
+            {
+                throw new InvalidOperationException(
+                    "partial or misplaced " + name + " hook in " + method.FullName +
+                    "; refusing to complete a partially patched method");
+            }
+
+            Console.WriteLine("      " + name + " hook already present and complete");
+            return;
+        }
+
+        if (completion)
+        {
+            GameMethodInjector.InjectCompletionHook(method, bridge);
+        }
+        else
+        {
+            GameMethodInjector.InjectEntryHook(method, bridge);
+        }
+
+        Console.WriteLine("      inserted missing " + name + " hook");
     }
 
     /// <summary>
@@ -321,7 +515,7 @@ public static class Program
     /// Returns void; every failure is either thrown (with a stage tag) or swallowed by the
     /// method's own catch handler, so a broken mod setup can never stop the game from starting.
     /// </summary>
-    private static MethodDefinition EmitBootstrap(ModuleDefinition module, string modsDir, string runtimeDll, string loaderType, bool minimal, bool noCatch, bool useLoadFrom)
+    private static MethodDefinition EmitBootstrap(ModuleDefinition module, string modsDir, string runtimeDll, string loaderType, bool minimal, bool noCatch, bool useLoadFrom, bool eventHooks)
     {
         var attrs = TypeAttributes.Public | TypeAttributes.Abstract | TypeAttributes.Sealed
                     | TypeAttributes.Class | TypeAttributes.BeforeFieldInit;
@@ -394,7 +588,7 @@ public static class Program
         var ret = il.Create(OpCodes.Ret);
         var asmLocal = new VariableDefinition(ImportCoreType(module, typeof(System.Reflection.Assembly), scope));
         var typeLocal = new VariableDefinition(ImportCoreType(module, typeof(Type), scope));
-        var methodLocal = new VariableDefinition(ImportCoreType(module, typeof(System.Reflection.MethodBase), scope));
+        var methodLocal = new VariableDefinition(ImportCoreType(module, typeof(System.Reflection.MethodInfo), scope));
         start.Body.Variables.Add(asmLocal);
         start.Body.Variables.Add(typeLocal);
         start.Body.Variables.Add(methodLocal);
@@ -450,6 +644,14 @@ public static class Program
         il.Append(afterInvoke);
         il.Emit(OpCodes.Pop);
 
+        // stage-6 (Phase 2.0): bind the event dispatcher delegates once. This runs after the
+        // loader call, inside the same try block, so a missing dispatcher (older Runtime) or a
+        // failed binding leaves the game startable and writes one bounded diagnostic line.
+        if (eventHooks)
+        {
+            EmitEventBridge(module, bootstrap, il, scope, asmLocal, typeLocal, methodLocal, ret, modsDir);
+        }
+
         il.Emit(OpCodes.Leave, ret);
 
         // catch (Exception) { pop; leave ret; }  -- normal mode: swallow
@@ -475,6 +677,218 @@ public static class Program
     }
 
     /// <summary>
+    /// Emits the event side of <c>ModFramework.Bootstrap</c>:
+    ///
+    ///   1. two private static <c>System.Action</c> fields that hold the dispatcher delegates;
+    ///   2. <c>GameLaunched()</c> and <c>Tick()</c> - a null check plus one cached virtual call,
+    ///      each wrapped in its own catch so the game loop can never be broken by the bridge;
+    ///   3. <c>WriteEventsDisabled(reason)</c> - a one-line, best-effort diagnostic file writer;
+    ///   4. the binding IL appended to <c>Start()</c> that resolves
+    ///      <c>ModFramework.Runtime.EventDispatcher</c> by name, turns its two static methods into
+    ///      delegates via <c>Delegate.CreateDelegate</c>, and caches them.
+    ///
+    /// There is deliberately <b>no</b> static AssemblyRef to <c>ModFramework.Runtime</c>: every
+    /// external type used here (<c>Action</c>, <c>Delegate</c>, <c>Type</c>, <c>Assembly</c>,
+    /// <c>File</c>, <c>String</c>) comes from the module's existing corelib reference, so the game
+    /// assembly still resolves when the runtime assembly is missing.
+    /// </summary>
+    private static void EmitEventBridge(
+        ModuleDefinition module,
+        TypeDefinition bootstrap,
+        ILProcessor il,
+        IMetadataScope scope,
+        VariableDefinition asmLocal,
+        VariableDefinition typeLocal,
+        VariableDefinition methodLocal,
+        Instruction ret,
+        string modsDir)
+    {
+        var actionType = ImportCoreType(module, typeof(Action), scope);
+        var launchedField = new FieldDefinition("s_onGameLaunched",
+            FieldAttributes.Private | FieldAttributes.Static, actionType);
+        var tickField = new FieldDefinition("s_onTick",
+            FieldAttributes.Private | FieldAttributes.Static, actionType);
+        bootstrap.Fields.Add(launchedField);
+        bootstrap.Fields.Add(tickField);
+
+        var diagnostic = EmitEventsDisabledWriter(module, bootstrap, scope, modsDir);
+        EmitBridgeMethod(module, bootstrap, BridgeGameLaunched, launchedField, scope);
+        EmitBridgeMethod(module, bootstrap, BridgeTick, tickField, scope);
+
+        var delegateCreate = ImportCoreMethod(module, typeof(Delegate)
+            .GetMethod("CreateDelegate", new[] { typeof(Type), typeof(System.Reflection.MethodInfo) })!, scope);
+        var typeFromHandle = ImportCoreMethod(module, typeof(Type)
+            .GetMethod(nameof(Type.GetTypeFromHandle), new[] { typeof(RuntimeTypeHandle) })!, scope);
+        var getType = ImportCoreMethod(module, typeof(System.Reflection.Assembly)
+            .GetMethod(nameof(System.Reflection.Assembly.GetType), new[] { typeof(string) })!, scope);
+        var getMethod = ImportCoreMethod(module, typeof(Type)
+            .GetMethod(nameof(Type.GetMethod), new[] { typeof(string) })!, scope);
+
+        var afterDispatcher = il.Create(OpCodes.Nop);
+        var afterLaunched = il.Create(OpCodes.Nop);
+        var afterTick = il.Create(OpCodes.Nop);
+
+        // Dispatcher type: asm.GetType("ModFramework.Runtime.EventDispatcher")
+        il.Emit(OpCodes.Ldloc, asmLocal);
+        il.Emit(OpCodes.Ldstr, EventDispatchType);
+        il.Emit(OpCodes.Callvirt, getType);
+        il.Emit(OpCodes.Stloc, typeLocal);
+        il.Emit(OpCodes.Ldloc, typeLocal);
+        il.Emit(OpCodes.Brtrue, afterDispatcher);
+        EmitDisabledExit(il, diagnostic, ret, "events-disabled:dispatcher-type-missing");
+        il.Append(afterDispatcher);
+
+        // GameLaunched entry point
+        EmitBindField(module, il, typeLocal, methodLocal, actionType, delegateCreate,
+            typeFromHandle, getMethod, launchedField, EventLaunchedMethod,
+            "events-disabled:game-launched-entry-missing", diagnostic, ret, afterLaunched);
+
+        // Tick entry point
+        EmitBindField(module, il, typeLocal, methodLocal, actionType, delegateCreate,
+            typeFromHandle, getMethod, tickField, EventTickMethod,
+            "events-disabled:tick-entry-missing", diagnostic, ret, afterTick);
+    }
+
+    private static void EmitBindField(
+        ModuleDefinition module,
+        ILProcessor il,
+        VariableDefinition typeLocal,
+        VariableDefinition methodLocal,
+        TypeReference actionType,
+        MethodReference delegateCreate,
+        MethodReference typeFromHandle,
+        MethodReference getMethod,
+        FieldDefinition field,
+        string entryName,
+        string diagnosticReason,
+        MethodDefinition diagnostic,
+        Instruction ret,
+        Instruction okTarget)
+    {
+        il.Emit(OpCodes.Ldloc, typeLocal);
+        il.Emit(OpCodes.Ldstr, entryName);
+        il.Emit(OpCodes.Callvirt, getMethod);
+        il.Emit(OpCodes.Stloc, methodLocal);
+        il.Emit(OpCodes.Ldloc, methodLocal);
+        il.Emit(OpCodes.Brtrue, okTarget);
+        EmitDisabledExit(il, diagnostic, ret, diagnosticReason);
+        il.Append(okTarget);
+
+        il.Emit(OpCodes.Ldtoken, actionType);
+        il.Emit(OpCodes.Call, typeFromHandle);
+        il.Emit(OpCodes.Ldloc, methodLocal);
+        il.Emit(OpCodes.Call, delegateCreate);
+        il.Emit(OpCodes.Castclass, actionType);
+        il.Emit(OpCodes.Stsfld, field);
+    }
+
+    private static void EmitDisabledExit(
+        ILProcessor il,
+        MethodDefinition diagnostic,
+        Instruction ret,
+        string reason)
+    {
+        il.Emit(OpCodes.Ldstr, reason);
+        il.Emit(OpCodes.Call, diagnostic);
+        il.Emit(OpCodes.Leave, ret);
+    }
+
+    /// <summary>Emits <c>private static void WriteEventsDisabled(string reason)</c>.</summary>
+    private static MethodDefinition EmitEventsDisabledWriter(
+        ModuleDefinition module,
+        TypeDefinition bootstrap,
+        IMetadataScope scope,
+        string modsDir)
+    {
+        var method = new MethodDefinition(BridgeDiagnosticMethod,
+            MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig,
+            module.TypeSystem.Void);
+        method.Parameters.Add(new ParameterDefinition("reason", ParameterAttributes.None,
+            module.TypeSystem.String));
+        bootstrap.Methods.Add(method);
+
+        var append = ImportCoreMethod(module, typeof(File)
+            .GetMethod(nameof(File.AppendAllText), new[] { typeof(string), typeof(string) })!, scope);
+        var concat = ImportCoreMethod(module, typeof(string)
+            .GetMethod(nameof(string.Concat), new[] { typeof(string), typeof(string) })!, scope);
+
+        var path = Path.Combine(modsDir, "bootstrap-events.txt").Replace('\\', '/');
+        var il = method.Body.GetILProcessor();
+        var ret = il.Create(OpCodes.Ret);
+        var handler = il.Create(OpCodes.Pop);
+
+        il.Emit(OpCodes.Ldstr, path);
+        il.Emit(OpCodes.Ldstr, "events-disabled: ");
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Call, concat);
+        il.Emit(OpCodes.Ldstr, " (see loader-report.txt)\n");
+        il.Emit(OpCodes.Call, concat);
+        il.Emit(OpCodes.Call, append);
+        il.Emit(OpCodes.Leave, ret);
+        il.Append(handler);
+        il.Emit(OpCodes.Leave, ret);
+        il.Append(ret);
+
+        method.Body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+        {
+            TryStart = method.Body.Instructions[0],
+            TryEnd = handler,
+            HandlerStart = handler,
+            HandlerEnd = ret,
+            CatchType = ImportCoreType(module, typeof(Exception), scope),
+        });
+        return method;
+    }
+
+    /// <summary>
+    /// Emits one bridge entry point:
+    /// <code>
+    /// if (field == null) return;
+    /// try { field(); } catch (Exception) { }
+    /// </code>
+    /// Cheap enough for a per-tick call (one static field read and one cached delegate call) and
+    /// still safe when the dispatcher itself throws.
+    /// </summary>
+    private static MethodDefinition EmitBridgeMethod(
+        ModuleDefinition module,
+        TypeDefinition bootstrap,
+        string name,
+        FieldDefinition field,
+        IMetadataScope scope)
+    {
+        var method = new MethodDefinition(name,
+            MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig,
+            module.TypeSystem.Void);
+        bootstrap.Methods.Add(method);
+
+        var invoke = ImportCoreMethod(module, typeof(Action).GetMethod(nameof(Action.Invoke))!, scope);
+        var il = method.Body.GetILProcessor();
+        var ret = il.Create(OpCodes.Ret);
+        var call = il.Create(OpCodes.Ldsfld, field);
+        var handler = il.Create(OpCodes.Pop);
+
+        il.Emit(OpCodes.Ldsfld, field);
+        il.Emit(OpCodes.Brtrue, call);
+        il.Emit(OpCodes.Ret);
+        il.Append(call);
+        il.Emit(OpCodes.Callvirt, invoke);
+        il.Emit(OpCodes.Leave, ret);
+        il.Append(handler);
+        il.Emit(OpCodes.Leave, ret);
+        il.Append(ret);
+
+        method.Body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+        {
+            TryStart = call,
+            TryEnd = handler,
+            HandlerStart = handler,
+            HandlerEnd = ret,
+            CatchType = ImportCoreType(module, typeof(Exception), scope),
+        });
+        return method;
+    }
+
+    /// <summary>
     /// 消费栈顶的 bool：为 true 继续执行，否则抛 <paramref name="message"/>。
     /// 用于把"静默 return"改成"带阶段号的异常"，让一次部署就能定位卡点。
     /// </summary>
@@ -488,12 +902,15 @@ public static class Program
         il.Append(ok);
     }
 
-    private static void InsertCall(MethodDefinition target, MethodDefinition start)
+    private static void InsertCall(MethodDefinition target, MethodDefinition start, string name)
     {
         var il = target.Body.GetILProcessor();
         var first = target.Body.Instructions[0];
         il.InsertBefore(first, il.Create(OpCodes.Call, start));
-        Console.WriteLine("      inserted call at IL_" + first.Offset.ToString("x4") + " -> " + start.DeclaringType.FullName + "::" + start.Name + "()");
+        // Inserting five bytes moves every instruction after the insertion point; short branches
+        // are widened so no displacement can silently overflow the signed byte they encode.
+        GameMethodInjector.WidenShortBranches(target);
+        Console.WriteLine("      inserted call at head -> " + start.DeclaringType.FullName + "::" + name + "()");
     }
 
     // ----------------------------------------------------------------- verify
@@ -599,6 +1016,72 @@ public static class Program
         }
 
         Console.WriteLine("mvid           : " + module.Mvid);
+
+        // ---------------------------------------------------------------- Phase 2.0 event hooks
+        //
+        // "Should be there" and "should not be there" are both verified: a loader-only build must
+        // not carry a single event hook, and an event build must carry exactly one GameLaunched
+        // call per normal return of GameRunner.Initialize plus exactly one Tick call at the head of
+        // GameRunner.Update(GameTime).
+        var eventHooks = opts.ContainsKey("event-hooks")
+            ? ParseSwitch("event-hooks", opts["event-hooks"])
+            : !opts.ContainsKey("no-event-hooks");
+
+        var bridgeLaunched = bootstrap?.Methods.FirstOrDefault(x => x.Name == BridgeGameLaunched);
+        var bridgeTick = bootstrap?.Methods.FirstOrDefault(x => x.Name == BridgeTick);
+
+        MethodDefinition? initialize = null;
+        MethodDefinition? update = null;
+        try
+        {
+            initialize = GameMethodInjector.RequireMethod(module, GameMethodInjector.GameRunnerType,
+                GameMethodInjector.InitializeMethod, "System.Void");
+            update = GameMethodInjector.RequireMethod(module, GameMethodInjector.GameRunnerType,
+                GameMethodInjector.UpdateMethod, "System.Void", GameMethodInjector.GameTimeType);
+        }
+        catch (InvalidOperationException)
+        {
+            // Reported below as missing hooks; a pristine game assembly has both methods.
+        }
+
+        var launchedCalls = initialize is null ? -1 : GameMethodInjector.CountCalls(initialize,
+            BootNamespace + "." + BootType, BridgeGameLaunched);
+        var tickCalls = update is null ? -1 : GameMethodInjector.CountCalls(update,
+            BootNamespace + "." + BootType, BridgeTick);
+        var updateHead = update?.Body.Instructions.FirstOrDefault(i => i.OpCode != OpCodes.Nop);
+
+        Console.WriteLine("event-hooks    : " + (eventHooks ? "enabled" : "disabled"));
+        Console.WriteLine("bridge-game-launched: " + (bridgeLaunched is null ? "absent" : "present"));
+        Console.WriteLine("bridge-tick    : " + (bridgeTick is null ? "absent" : "present"));
+        Console.WriteLine("game-launched-hook: " + (launchedCalls == 1
+            ? "present (1 normal-completion call)"
+            : launchedCalls == 0 ? "absent (0 calls)"
+            : launchedCalls < 0 ? "MISSING (GameRunner.Initialize not found)"
+            : "WRONG count=" + launchedCalls));
+        Console.WriteLine("tick-hook      : " + (tickCalls == 1
+            ? "present (entry call)"
+            : tickCalls == 0 ? "absent (0 calls)"
+            : tickCalls < 0 ? "MISSING (GameRunner.Update(GameTime) not found)"
+            : "WRONG count=" + tickCalls));
+        if (updateHead is not null)
+        {
+            Console.WriteLine("tick-is-first  : " + (updateHead.OpCode == OpCodes.Call &&
+                updateHead.Operand is MethodReference tr &&
+                tr.DeclaringType.FullName == BootNamespace + "." + BootType &&
+                tr.Name == BridgeTick ? "yes" : "no"));
+        }
+
+        if (eventHooks)
+        {
+            ok &= bridgeLaunched is not null && bridgeTick is not null;
+            ok &= launchedCalls == 1 && tickCalls == 1;
+        }
+        else
+        {
+            ok &= bridgeLaunched is null && bridgeTick is null;
+            ok &= launchedCalls == 0 && tickCalls == 0;
+        }
+
         Console.WriteLine(ok ? "RESULT: OK" : "RESULT: FAILED");
         return ok ? 0 : 1;
     }

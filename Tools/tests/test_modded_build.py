@@ -91,21 +91,42 @@ def gradle_checks():
     check("gradle_baseline_output_path", "outputs/apk/debug/app-debug.apk" in gradle,
           "app-debug.apk")
 
-    modded = block_after(gradle, 'tasks.register<JavaExec>("assembleModdedDebug")')
-    check("gradle_modded_task_present", bool(modded), "assembleModdedDebug")
-    check("gradle_modded_not_dependent_on_baseline", 'dependsOn("assembleDebug")' not in modded,
-          "no assembleDebug dependency")
+    # Phase 2.0: two mod builds share one helper, so the assertions below target the helper plus
+    # the two explicit task registrations and their distinct output/work directories.
+    mod_apk_helper = block_after(gradle, 'fun modApkTask(')
+    prepare_helper = block_after(gradle, 'fun prepareAssembliesTask(')
+    check("gradle_modded_task_present", "modApkTask(" in gradle and "assembleModdedDebug" in gradle,
+          "assembleModdedDebug")
+    check("gradle_modded_not_dependent_on_baseline",
+          'dependsOn("assembleDebug")' not in mod_apk_helper, "no assembleDebug dependency")
     check("gradle_modded_depends_on_blob_prep",
-          'prepareModdedAssemblies' in modded, "prepareModdedAssemblies")
+          "prepareModdedAssemblies" in gradle and "dependsOn(tasks.named(\"classes\"), prepare)" in mod_apk_helper,
+          "prepareModdedAssemblies is a task dependency")
     check("gradle_modded_output_separate",
           "outputs/apk/modded/app-modded-debug.apk" in gradle, "app-modded-debug.apk")
     check("gradle_modded_workdir_separate", ".tmp/build-modded" in gradle, ".tmp/build-modded")
-    check("gradle_modded_passes_bootstrap_blob", "--bootstrap-blob" in modded, "--bootstrap-blob")
+    check("gradle_modded_passes_bootstrap_blob", "--bootstrap-blob" in mod_apk_helper,
+          "--bootstrap-blob")
     check("gradle_modded_requires_existing_keystore",
-          "--require-existing-keystore" in modded, "--require-existing-keystore")
+          "--require-existing-keystore" in mod_apk_helper, "--require-existing-keystore")
     check("gradle_modded_not_in_assemble",
           'dependsOn("assembleModdedDebug")' not in gradle,
           "assemble stays baseline-only")
+
+    # Phase 2.0 rollback artifact: loader only, no event hooks, isolated directories.
+    check("gradle_loader_only_task_present", "assembleLoaderOnlyDebug" in gradle,
+          "assembleLoaderOnlyDebug")
+    check("gradle_loader_only_output_separate",
+          "outputs/apk/loader-only/app-loader-only-debug.apk" in gradle, "app-loader-only-debug.apk")
+    check("gradle_loader_only_workdir_separate", ".tmp/build-loader-only" in gradle,
+          ".tmp/build-loader-only")
+    check("gradle_event_switch_wired", '--event-hooks' in prepare_helper,
+          "--event-hooks passed to build_modded_apk.py")
+    check("gradle_event_switch_declared_as_input", 'inputs.property("eventHooks"' in prepare_helper,
+          "the switch is a declared Gradle input")
+    check("gradle_loader_only_disables_events",
+          'prepareLoaderOnlyAssemblies' in gradle and "eventHooks = false" in gradle,
+          "loader-only build passes --event-hooks disabled")
 
 
 def main_kt_checks():

@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Phase 2.0 device acceptance, subscriber B.
+
+    Deliberately does NOT depend on anything, so the loader initializes it before
+    P20.Acceptance.Alpha (which depends on this mod). Dispatch order must still put Alpha first.
+
+    Build:
+      dotnet build Mod/P20.Acceptance.Beta -c Release -p:AndroidRefsDir=<65 refs>
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName>P20.Acceptance.Beta</AssemblyName>
+    <RootNamespace>P20.Acceptance.Beta</RootNamespace>
+    <Version>1.0.0</Version>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ModFramework.Runtime\ModFramework.Runtime.csproj" Private="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="manifest.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

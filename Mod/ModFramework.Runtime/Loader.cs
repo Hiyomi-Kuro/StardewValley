@@ -43,6 +43,22 @@ public static class Loader
     /// </summary>
     private const string ProbeStatus = "not-run-by-loader";
 
+    /// <summary>
+    /// The framework <b>API</b> version that manifests are gated against.
+    ///
+    /// Phase 2.0 decision: this is deliberately decoupled from <c>AssemblyVersion</c>. The
+    /// assembly identity stays <c>1.0.0.0</c> so that every mod compiled against the previous
+    /// framework keeps the exact AssemblyRef identity it was built with (and the preflight keeps
+    /// treating a shipped runtime copy as the same identity); only the API version moves, from
+    /// 1.0.0 to 1.1.0, because one additive interface member and two events were added.
+    /// A mod that declares <c>"frameworkVersion": "^1.0.0"</c> still matches, and a mod that
+    /// needs the events API declares <c>"&gt;=1.1.0"</c>.
+    /// </summary>
+    internal const string FrameworkApiVersion = "1.1.0";
+
+    /// <summary>How the report points at the later, event-time counters.</summary>
+    private const string EventDiagnosticsHint = "ModFramework.Runtime.EventDiagnostics.Capture()";
+
     private static bool s_running;
     private static string? s_completedRoot;
 
@@ -127,12 +143,21 @@ public static class Loader
         }
 
         s_running = true;
+        // Phase 2.0: a loader run is one event session. Dispatch stays disabled until the run
+        // succeeds, and a run that fails or crashes drops every subscription it created.
+        var session = EventDispatcher.BeginSession();
         try
         {
-            return RunCore(root);
+            var result = RunCore(root, session);
+            if (result != null)
+            {
+                EventDispatcher.AbortSession(session);
+            }
+            return result;
         }
         catch (Exception ex)
         {
+            EventDispatcher.AbortSession(session);
             var text = BuildFatalReport(root, ex);
             var reportWritten = TryWrite(Path.Combine(root, ReportFileName), text);
             var logWritten = TryWrite(Path.Combine(root, LogFileName), text);
@@ -161,7 +186,7 @@ public static class Loader
         TryWrite(Path.Combine(root, LogFileName), text);
     }
 
-    private static string? RunCore(string modsRoot)
+    private static string? RunCore(string modsRoot, int sessionId)
     {
         GameVersionState versionState;
         string versionSource;
@@ -534,12 +559,23 @@ public static class Loader
                 continue;
             }
 
-            LoadAndInitialize(record, manifest, report, logDirectory, logsReady, initialized, preflight);
+            LoadAndInitialize(record, manifest, report, logDirectory, logsReady, initialized, preflight, sessionId);
         }
 
         report.Result = "ok";
         report.AddLine("result=ok");
         report.AddLine("probe=" + ProbeStatus);
+        // Phase 2.0: the event session becomes usable only now, i.e. strictly after every mod's
+        // Initialize returned. The counts below are what the loader produced; the later event
+        // counters are not known yet and are read through ModFramework.Runtime.EventDiagnostics.
+        EventDispatcher.CommitSession(sessionId, gameVersion, framework.Text);
+        var eventState = EventDiagnostics.Capture();
+        report.AddLine("events=" + (eventState.Ready ? "ready" : "disabled"));
+        report.AddLine("event-session=" + eventState.SessionId);
+        report.AddLine("event-subscriptions=" + eventState.SubscriptionCount);
+        report.AddLine("event-mods=" + eventState.ModCount);
+        report.AddLine("event-loader-thread-id=" + eventState.LoaderThreadId);
+        report.AddLine("event-diagnostics=" + EventDiagnosticsHint);
         // Marked before the write: the mods have already initialized, so a second call must not
         // run them again even when the report could not be persisted.
         s_completedRoot = PathRules.Normalize(modsRoot);
@@ -892,10 +928,14 @@ public static class Loader
         string logDirectory,
         bool logsReady,
         Dictionary<string, bool> initialized,
-        AssemblyPreflightResult preflight)
+        AssemblyPreflightResult preflight,
+        int sessionId)
     {
         var logger = new ModLogger(manifest.Id, logsReady ? logDirectory : record.Directory);
-        var context = new ModContext(manifest, report.GameVersion, FrameworkVersion(), logger);
+        // Subscriptions are staged in this per-mod scope and only become live when Initialize
+        // returns normally; a throwing Initialize rolls them all back below.
+        var events = EventDispatcher.CreateModEvents(manifest.Id, logger, sessionId);
+        var context = new ModContext(manifest, report.GameVersion, FrameworkVersion(), logger, events);
 
         try
         {
@@ -1022,10 +1062,19 @@ public static class Loader
             }
             catch (Exception ex)
             {
+                // A mod that subscribes and then throws must not keep any subscription: the
+                // staging scope is discarded, so it can never observe an event.
+                events.Rollback();
                 record.Fail(ErrorCodes.EntryInitializeFailed, DescribeException(Unwrap(ex)));
                 logger.Error("Initialize threw; the mod is marked as failed", Unwrap(ex));
                 initialized[manifest.Id] = false;
                 return;
+            }
+
+            events.Commit();
+            if (events.CommittedCount > 0)
+            {
+                report.AddLine("events-subscribed=" + manifest.Id + " count=" + events.CommittedCount);
             }
 
             record.Advance(ModState.Initialized);
@@ -1034,6 +1083,7 @@ public static class Loader
         }
         catch (Exception ex)
         {
+            events.Rollback();
             record.Fail(ErrorCodes.EntryInitializeFailed, DescribeException(ex));
             initialized[manifest.Id] = false;
         }
@@ -1476,14 +1526,11 @@ public static class Loader
         {
             try
             {
-                var name = typeof(Loader).Assembly.GetName();
-                var version = name.Version;
-                if (version != null && version.Major >= 0 && version.Minor >= 0 && version.Build >= 0)
-                {
-                    info.Text = version.Major + "." + version.Minor + "." + version.Build;
-                    ClassifyFrameworkVersion(info);
-                    return info;
-                }
+                // Phase 2.0: the API version is a contract constant, not the assembly version, so
+                // adding interface surface does not change the assembly identity old mods bound to.
+                info.Text = FrameworkApiVersion;
+                ClassifyFrameworkVersion(info);
+                return info;
             }
             catch (Exception)
             {
