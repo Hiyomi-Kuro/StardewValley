@@ -2,12 +2,12 @@
 
 | 项 | 值 |
 | --- | --- |
-| 状态 | **已实现并真机验收**（`GameLaunched` + `Tick`，构建期注入，无 Harmony/NDK） |
-| 基线 | `53f8171b9eb8faaee430ec8530d1eb942e5ade09` |
+| 状态 | **已实现并真机验收**（`GameLaunched` + `Tick`，构建期注入，无 Harmony/NDK）；**Phase 2.0.1 修正了会话/重入/首次顺序契约** |
+| 基线 | `97fdfa74a024784995922b1e4a3e3646f0da3933`（Phase 2.0 已 commit/push；Phase 2.0.1 工作区改动未提交） |
 | Framework API 版本 | **1.1.0**（`Loader.FrameworkApiVersion`，manifest 门禁使用） |
 | Framework AssemblyVersion | **1.0.0.0**（保持不变，见 §6） |
 | 游戏程序集 | `StardewValley.dll` 1.6.15.24354，MVID `573bf1e5-3245-46d6-925a-1c3713afb677` |
-| 关联 | [可行性](phase2-feasibility.md) · [Phase 2.0 报告](../audit/phase2.0-report.md) · [真机验收](../audit/phase2.0-device-acceptance-report.md) |
+| 关联 | [可行性](phase2-feasibility.md) · [Phase 2.0 报告](../audit/phase2.0-report.md) · [Phase 2.0.1 报告](../audit/phase2.0.1-report.md) · [构建/安装验证](phase2.0.1-build-install.md) · [2.0.1 真机验收](../audit/phase2.0.1-device-acceptance-report.md) |
 
 > 证据分级沿用项目惯例：**【观测】** 直接来自程序集/IL、主机测试或真机输出；**【决定】** 本阶段明确选择的契约；
 > **【未知】** 本阶段没有证据。
@@ -56,7 +56,7 @@ public interface IModContext
 | 项 | 契约 |
 | --- | --- |
 | 触发点 | `StardewValley.GameRunner.Initialize()` 的**每一个正常 `ret` 之前** |
-| 次数 | 每进程**至多一次**（调度器状态机保证；重复钩子调用直接返回） |
+| 次数 | 每进程**至多一次**（调度器状态机保证；重复钩子调用直接返回）。新 Loader 会话**不会**重新武装它：会话只重置 Tick/故障/dispatch 计数。 |
 | 含义 | “`GameRunner.Initialize` 正常返回”。**不**表示内容资源全部加载完成，**不**等于标题界面已显示 |
 | 异常退出 | 方法抛出异常时没有任何 `ret` 被执行，因此不会派发；`catch` 处理器内的 `ret` 被视为错误路径，不插入钩子 |
 | 顺序 | 严格早于第一次 `Tick`（`EventDiagnostics.GameLaunchedBeforeFirstTick` 记录该事实） |
@@ -81,6 +81,11 @@ Loader 初始化、`GameLaunched`、`Tick` 的实际 `ManagedThreadId` 已写入
 调度器的互斥只保护极短的记账区段（订阅表、计数、快照引用），**不会**在处理器运行期间持锁，
 因此处理器内部可以安全地注册/退订。处理器**不得阻塞**。
 
+**重入【决定】**：派发不是可重入的。handler 内调用公开的 `DispatchTick` / `DispatchGameLaunched`
+会**立即返回**：不增加 Tick/Launch/dispatch 计数、不排队、不递归；被拒绝的次数记录在
+`EventDiagnosticsSnapshot.ReentrantDispatchRejections`。并发（另一个线程在派发进行中进入）同样被拒绝，
+不并行执行 handler。这不是错误吞噬：它是“一次游戏方法进入只对应一次事件”的显式边界。
+
 ---
 
 ## 3. 顺序
@@ -91,6 +96,9 @@ Loader 初始化、`GameLaunched`、`Tick` 的实际 `ManagedThreadId` 已写入
 - 快照使用**稳定插入排序**（订阅数量很小）：稳定排序保证同一 Mod 的多个订阅保持注册顺序。
 - 跨 Mod 验证：`EventMod.A`/`EventMod.Z`、`Zeta`/`alpha`（Ordinal 与常见文化排序相反）以及真机上的
   `P20.Acceptance.Alpha` → `P20.Acceptance.Beta`（Alpha 依赖 Beta，因此 Beta **先**初始化，顺序仍为 Alpha 在前）。
+- **首次顺序只记录一次【决定】**：每种事件的第一次派发时记录一个 mod id 字符串（每个 Mod 一条、按派发顺序）。
+  首次没有订阅时记录**空字符串**并置“已记录”标志；之后才注册的订阅不会改写这个首次事实。
+  完成条件不是“字符串非空”，而是显式的已记录标志（Phase 2.0.1 修正）。
 
 ---
 
@@ -104,8 +112,24 @@ Loader 初始化、`GameLaunched`、`Tick` 的实际 `ManagedThreadId` 已写入
 | Dispose 幂等 | 令牌内部有 `Disposed` 标志，重复 Dispose 是 no-op |
 | 初始化失败回滚 | 订阅先进入 per-mod staging 区；`Initialize` 抛异常则整体丢弃，失败 Mod 永远收不到事件 |
 | 初始化成功才激活 | `Initialize` 正常返回后才并入 active 集合 |
-| 会话隔离 | Loader 每次运行一个 session；运行失败/崩溃会移除本 session 的全部订阅（无幽灵订阅） |
-| 重复启动 | 同一 Mods 根第二次 `Loader.Run` 直接返回 `already-initialized`，不会重复初始化或重复派发 |
+| 会话隔离 | Loader 每次运行一个 session；每个 `IModContext`/staging scope/token 携带自己的 SessionId |
+| 新会话替换 | 新 session **提交**时原子替换旧 session 的全部订阅（旧 token 变成 no-op）；不同根的订阅永不混用 |
+| 失败回退 | 新 session 失败/崩溃只丢弃自己的订阅；之前已在服务的 session 恢复 `ready`，计数保持原值 |
+| 旧对象隔离 | 旧 context 再注册、旧 scope 再 `Commit()` 都是 no-op；旧 token `Dispose()` 不会移除新会话订阅 |
+| 重复启动 | 同一 Mods 根第二次 `Loader.Run` 直接返回 `already-initialized`，不建新 session、不重复初始化/派发 |
+
+### 4.1 多根 Loader 语义【决定】
+
+一个进程里**同一时刻只有一个事件会话在服务**（`SessionId` 单调递增，`Ready` 表示当前是否有会话可派发）。
+
+- **替换**：`Loader.Run` 成功后提交的会话成为唯一活跃集合；旧根残留的订阅全部失效。
+- **失败回退**：`Loader.Run` 返回错误 → 只移除该候选会话的订阅；如果之前有会话在服务，它恢复派发。
+- **同根幂等**：同一个规范化根目录的第二次 `Loader.Run` 直接 `already-initialized`，不建会话。
+- 因此“不同根目录静默混用订阅”是不可能的；这是有意选择的语义，而不是靠调用者自律。
+
+主机测试的 `EventDispatcher.ResetForTests()` 是 `internal` 测试 seam（把整个静态路由器恢复到“新进程”状态），
+产品代码从不调用。它不等于产品的会话生命周期：产品里没有“重新开始首次启动”的入口，
+`GameLaunched` 的进程事实也不会因为新会话而复位。
 
 ---
 
@@ -117,6 +141,9 @@ Loader 初始化、`GameLaunched`、`Tick` 的实际 `ManagedThreadId` 已写入
   连续异常不会每 Tick 写一条日志。
 - 日志写入本身失败 → `LogFaults++`，不影响游戏。
 - **桥接层自身故障**（例如调度器内部异常）：`BridgeFaults++`，最多向 `stderr`（logcat）写一行，绝不抛出。
+- **重入**：handler 内再次调用派发入口会被拒绝并计入 `ReentrantDispatchRejections`；
+  它不产生异常、不增加事件计数，也不会让某个 handler 看到“自己触发的第二轮 Tick”。
+- 处理器内**注册/退订**仍是合法的，并且遵守快照语义（下一轮生效）。
 
 ---
 
@@ -203,7 +230,11 @@ Runtime 缺失、旧 Runtime 没有 `EventDispatcher`、绑定失败时：`Start
 | `HandlerFaults` / `LogFaults` / `BridgeFaults` | 三类故障计数 |
 | `FirstGameLaunchedThreadId` / `FirstTickThreadId` / `LoaderThreadId` | 线程归属 |
 | `GameLaunchedBeforeFirstTick` | 顺序事实 |
-| `FirstGameLaunchedOrder` / `FirstTickOrder` | 首次派发的 mod id 顺序（每个 Mod 一条） |
+| `FirstGameLaunchedOrder` / `FirstTickOrder` | 首次派发的 mod id 顺序（每个 Mod 一条）；首次无人订阅时为空字符串，并被标记为“已记录” |
+| `ReentrantDispatchRejections` | handler 内重复调用派发入口而被拒绝的次数（跨会话累计） |
+
+`ModCount` 是**不同 mod id** 的数量（ordinal-ignore-case，与 Loader 身份规则一致），
+不是相邻项去重，也不等于订阅数；交错注册 A→B→A 仍为 2。
 
 Loader 报告只写“初始化时刻”的事实（`events=ready`、`event-subscriptions=N`、`event-mods=N`、
 `event-loader-thread-id=`），**不**假装知道之后的事件计数；事件计数由探针在运行期按低频读取并写盘。
@@ -229,5 +260,10 @@ A/B/C 使用独立输出与工作目录；事件的“应有/应无”都从**�
 - 只覆盖 `StardewValley` 1.6.15.24354（versionCode 239）与 V1963A / Android 10 / API 29 这一台设备。
 - 事件只覆盖 `GameLaunched` 与 `Tick`；没有 `DayStarted` / `SaveLoaded` / 内容管线。
 - 注入的 `GameRunner.Update` 每 Tick 增加一次静态字段读取 + 一次委托调用；没有量化低端机帧率影响。
+- **性能声明**：桌面 .NET 8 上，稳定 Tick（固定 4 个订阅、空 handler、排除 `Capture()` 与日志）
+  实测 **0 B/tick**（200,000 Tick，`GC.GetAllocatedBytesForCurrentThread`）。
+  这是桌面分配事实，**不是** Android 帧率/CPU 结论；设备端只验证了计数与线程。
 - Android 11+ 的 Mods `apply` 继续 fail-closed。
 - 事件线程由游戏循环决定；本阶段只在真机**记录**，不做保证。
+- 多根 Loader 的替换/回退是进程内语义；跨进程、并发 Loader 调用不在覆盖范围。
+- `HasCompleteCompletionHook` 的边检查针对本项目支持的 IL 形状，不是通用控制流验证器。

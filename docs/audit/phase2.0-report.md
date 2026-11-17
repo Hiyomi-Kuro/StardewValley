@@ -11,6 +11,11 @@
 
 ---
 
+> **后续修正**：Phase 2.0.1 修复了本报告涉及的调度器缺陷（每 Tick 重建首次顺序字符串、ModCount 相邻去重、
+> 会话未隔离、GameLaunched 被会话重置、派发可重入）与 APK 签入门禁（把 baseline 当 installed）。
+> 另外，本报告“本阶段新代码远端 CI = NOT_RUN”的状态已被用户后续的 commit/push 改变：`97fdfa7`
+> 的真实 CI 为 Run **43596477121**、3/3 success。以 [Phase 2.0.1 报告](phase2.0.1-report.md) 为准。
+
 ## 0. 结论
 
 - 事件契约按 `phase2-feasibility.md` 的路线 B 实现：`GameLaunched` 注入 `GameRunner.Initialize()` 的**每个正常 `ret` 前**，

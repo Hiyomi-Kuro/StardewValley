@@ -171,7 +171,20 @@ internal sealed class ModEventsApi : IModEvents
 /// which Phase 2.0 measures instead of assuming it is the Android UI thread.</para>
 ///
 /// <para><b>Order.</b> Ordinal mod id, then registration order inside a mod. A stable snapshot is
-/// reused until the subscription set changes, so a quiet tick neither sorts nor allocates.</para>
+/// reused until the subscription set changes, so a quiet tick neither sorts, formats a diagnostic
+/// string nor allocates.</para>
+///
+/// <para><b>Sessions.</b> One loader run is one session. A committed new session <i>replaces</i>
+/// the previous session's subscriptions; a run that fails is discarded and the session that was
+/// already serving keeps dispatching, with its counters intact. Every context and staging scope
+/// carries its session id, so an older context cannot register or commit into a newer session,
+/// and disposing an older token cannot remove a newer subscription.</para>
+///
+/// <para><b>Re-entrancy.</b> A handler that calls <see cref="DispatchTick"/> or
+/// <see cref="DispatchGameLaunched"/> is refused: the nested call returns immediately, moves no
+/// counter and increments <see cref="EventDiagnosticsSnapshot.ReentrantDispatchRejections"/>.
+/// Nothing is queued, so there is no recursion and no reordering. Registering or disposing a
+/// subscription from inside a handler still applies to the next dispatch only (frozen snapshot).</para>
 /// </summary>
 public static class EventDispatcher
 {
@@ -183,6 +196,20 @@ public static class EventDispatcher
 
     private static bool s_ready;
     private static int s_sessionId;
+
+    /// <summary>Session that currently owns dispatch (0 = none).</summary>
+    private static int s_activeSessionId;
+
+    /// <summary>Session that owned dispatch when the current candidate run began.</summary>
+    private static int s_previousActiveSessionId;
+
+    /// <summary>True once the current candidate session was aborted; its contexts stay inert.</summary>
+    private static bool s_sessionAborted;
+
+    /// <summary>True while handlers of one dispatch are running; nested bridge calls are refused.</summary>
+    private static bool s_dispatching;
+
+    private static int s_reentrantDispatchRejections;
     private static string s_gameVersion = "unknown";
     private static string s_frameworkVersion = "unknown";
 
@@ -198,6 +225,15 @@ public static class EventDispatcher
     private static bool s_gameLaunchedBeforeFirstTick = true;
     private static string s_firstGameLaunchedOrder = "";
     private static string s_firstTickOrder = "";
+
+    /// <summary>
+    /// Explicit "the first dispatch was recorded" flags. The order strings are evidence, and an
+    /// empty string is a legitimate first result (nobody had subscribed yet); using the string's
+    /// length as the completion flag would rewrite that first fact as soon as a late subscription
+    /// appeared.
+    /// </summary>
+    private static bool s_firstGameLaunchedOrderRecorded;
+    private static bool s_firstTickOrderRecorded;
     private static bool s_bridgeFaultReported;
 
     // ------------------------------------------------------------------ bridge entry points
@@ -211,6 +247,7 @@ public static class EventDispatcher
         try
         {
             ModEventSubscription[] snapshot;
+            bool recordOrder;
             int threadId = Environment.CurrentManagedThreadId;
             lock (Gate)
             {
@@ -219,18 +256,44 @@ public static class EventDispatcher
                     return;
                 }
 
+                // Re-entrancy is refused, not queued: a handler that calls this entry point would
+                // otherwise observe a second "launch" in the middle of the first one (or recurse
+                // without bound). The dispatch already in progress keeps its snapshot and order.
+                if (s_dispatching)
+                {
+                    s_reentrantDispatchRejections++;
+                    return;
+                }
+
+                s_dispatching = true;
                 s_gameLaunchedCount = 1;
                 s_firstGameLaunchedThreadId = threadId;
                 s_gameLaunchedBeforeFirstTick = s_tickCount == 0;
                 s_dispatchCount++;
+                recordOrder = !s_firstGameLaunchedOrderRecorded;
                 snapshot = GetSnapshotLocked();
             }
 
             var args = new GameLaunchedEventArgs(s_gameVersion, s_frameworkVersion, threadId);
-            DispatchTo(snapshot, ModEventKind.GameLaunched, args, default, true);
+            try
+            {
+                DispatchTo(snapshot, ModEventKind.GameLaunched, args, default, recordOrder);
+            }
+            finally
+            {
+                lock (Gate)
+                {
+                    s_dispatching = false;
+                }
+            }
         }
         catch (Exception ex)
         {
+            lock (Gate)
+            {
+                s_dispatching = false;
+            }
+
             BridgeFault(ex, "GameLaunched");
         }
     }
@@ -245,6 +308,7 @@ public static class EventDispatcher
         {
             ModEventSubscription[] snapshot;
             long tick;
+            bool recordOrder;
             int threadId = Environment.CurrentManagedThreadId;
             lock (Gate)
             {
@@ -252,6 +316,17 @@ public static class EventDispatcher
                 {
                     return;
                 }
+
+                // A nested dispatch from a handler is refused before the counter moves: counting
+                // it would make a handler's own call look like a game tick and desynchronise the
+                // 1-based, exactly-once-per-entry contract.
+                if (s_dispatching)
+                {
+                    s_reentrantDispatchRejections++;
+                    return;
+                }
+
+                s_dispatching = true;
 
                 // Saturation, never wraparound: a wrapped counter would look like a young session.
                 tick = s_tickCount == long.MaxValue ? long.MaxValue : s_tickCount + 1;
@@ -261,48 +336,74 @@ public static class EventDispatcher
                     s_firstTickThreadId = threadId;
                 }
                 s_dispatchCount++;
+                recordOrder = !s_firstTickOrderRecorded;
                 snapshot = GetSnapshotLocked();
             }
 
             var args = new TickEventArgs(tick, threadId);
-            DispatchTo(snapshot, ModEventKind.Tick, default, args, true);
+            try
+            {
+                DispatchTo(snapshot, ModEventKind.Tick, default, args, recordOrder);
+            }
+            finally
+            {
+                lock (Gate)
+                {
+                    s_dispatching = false;
+                }
+            }
         }
         catch (Exception ex)
         {
+            lock (Gate)
+            {
+                s_dispatching = false;
+            }
+
             BridgeFault(ex, "Tick");
         }
     }
 
     // ------------------------------------------------------------------ session lifecycle
 
-    /// <summary>Starts a loader session. Dispatch stays disabled until <see cref="CommitSession"/>.</summary>
+    /// <summary>
+    /// Starts a candidate loader session. Dispatch is disabled until <see cref="CommitSession"/>,
+    /// and the session that was serving until now is only replaced when the candidate commits.
+    ///
+    /// <para><b>Why the previous session survives BeginSession.</b> A second loader run can fail
+    /// (missing root, staging failure, mod crash). Destroying the working session at "begin"
+    /// would make a failed attempt silently deafen mods that are still loaded and initialized.
+    /// The candidate is therefore staged next to the serving session; committing replaces it,
+    /// aborting restores it. The two sets are never mixed: only one session owns dispatch.</para>
+    ///
+    /// <para><b>What BeginSession does NOT reset.</b> <c>GameLaunched</c> is at most once per
+    /// process; its count, first thread and order are process facts and stay. Session counters
+    /// (tick count, faults, dispatch count, first-tick thread/order) move to the new session only
+    /// when it commits, so an aborted run cannot make the live session's counters look young.</para>
+    /// </summary>
     internal static int BeginSession()
     {
         lock (Gate)
         {
+            s_previousActiveSessionId = s_activeSessionId;
             s_sessionId++;
+            s_sessionAborted = false;
             s_ready = false;
-            s_gameLaunchedCount = 0;
-            s_tickCount = 0;
-            s_handlerFaults = 0;
-            s_logFaults = 0;
-            s_bridgeFaults = 0;
-            s_dispatchCount = 0;
-            s_firstGameLaunchedThreadId = 0;
-            s_firstTickThreadId = 0;
-            s_gameLaunchedBeforeFirstTick = true;
-            s_firstGameLaunchedOrder = "";
-            s_firstTickOrder = "";
+            s_activeSessionId = 0;
             return s_sessionId;
         }
     }
 
-    /// <summary>Marks the session usable and records what the loader detected.</summary>
+    /// <summary>
+    /// Commits the candidate session: its subscriptions become the only active set (the previous
+    /// session's subscriptions are revoked, not left to fire), session counters start at zero,
+    /// and dispatch is enabled. Process-wide <c>GameLaunched</c> facts are deliberately untouched.
+    /// </summary>
     internal static void CommitSession(int sessionId, string gameVersion, string frameworkVersion)
     {
         lock (Gate)
         {
-            if (sessionId != s_sessionId)
+            if (sessionId != s_sessionId || s_sessionAborted)
             {
                 return;
             }
@@ -310,13 +411,30 @@ public static class EventDispatcher
             s_gameVersion = string.IsNullOrEmpty(gameVersion) ? "unknown" : gameVersion;
             s_frameworkVersion = string.IsNullOrEmpty(frameworkVersion) ? "unknown" : frameworkVersion;
             s_loaderThreadId = Environment.CurrentManagedThreadId;
+
+            // Replacement: a new committed session owns the dispatcher. Anything from an older
+            // session is disposed first, so no handler from a different root can observe events.
+            RemoveOtherSessionsLocked(sessionId);
+
+            s_tickCount = 0;
+            s_handlerFaults = 0;
+            s_logFaults = 0;
+            s_bridgeFaults = 0;
+            s_dispatchCount = 0;
+            s_firstTickThreadId = 0;
+            s_firstTickOrder = "";
+            s_firstTickOrderRecorded = false;
+
+            s_activeSessionId = sessionId;
+            s_previousActiveSessionId = 0;
             s_ready = true;
         }
     }
 
     /// <summary>
-    /// Fails the session closed: nothing dispatched afterwards and every subscription created
-    /// inside this session is dropped, so a crashed loader cannot leave ghost subscriptions.
+    /// Fails the candidate session closed: every subscription created inside it is dropped (so a
+    /// crashed loader cannot leave ghost subscriptions) and the session that was serving before
+    /// the candidate run, if any, becomes dispatchable again with its counters intact.
     /// </summary>
     internal static void AbortSession(int sessionId)
     {
@@ -327,8 +445,18 @@ public static class EventDispatcher
                 return;
             }
 
+            s_sessionAborted = true;
             s_ready = false;
             RemoveSessionLocked(sessionId);
+            s_activeSessionId = 0;
+
+            if (s_previousActiveSessionId != 0)
+            {
+                s_activeSessionId = s_previousActiveSessionId;
+                s_ready = true;
+            }
+
+            s_previousActiveSessionId = 0;
         }
     }
 
@@ -358,9 +486,12 @@ public static class EventDispatcher
     {
         lock (Gate)
         {
-            if (owner.IsRolledBack)
+            if (owner.IsRolledBack || s_sessionAborted || owner.SessionId != s_sessionId)
             {
-                // The mod already failed: it must never run, so the token is inert.
+                // The mod already failed, or it belongs to a session that was replaced/aborted:
+                // it must never observe an event of the current session, so the token is inert.
+                // This is what keeps an old IModContext (and its staging scope) from injecting
+                // subscriptions into a newer session.
                 return DetachedSubscription.Instance;
             }
 
@@ -421,7 +552,9 @@ public static class EventDispatcher
     {
         lock (Gate)
         {
-            if (!owner.IsOpen)
+            // Only the current, non-aborted session may commit a scope. A late Commit() from an
+            // older session must be a no-op, not a way into the active subscription set.
+            if (!owner.IsOpen || s_sessionAborted || owner.SessionId != s_sessionId)
             {
                 return;
             }
@@ -455,7 +588,7 @@ public static class EventDispatcher
     {
         lock (Gate)
         {
-            if (!owner.IsOpen)
+            if (!owner.IsOpen || s_sessionAborted || owner.SessionId != s_sessionId)
             {
                 return;
             }
@@ -473,6 +606,33 @@ public static class EventDispatcher
             }
 
             owner.MarkRolledBack();
+        }
+    }
+
+    /// <summary>
+    /// Disposes and removes every subscription that does not belong to <paramref name="sessionId"/>.
+    /// Used when a new session commits: the previous session's handlers are revoked, never mixed
+    /// with the new one.
+    /// </summary>
+    private static void RemoveOtherSessionsLocked(int sessionId)
+    {
+        var removed = false;
+        for (var i = Active.Count - 1; i >= 0; i--)
+        {
+            if (Active[i].SessionId == sessionId)
+            {
+                continue;
+            }
+
+            Active[i].Active = false;
+            Active[i].Disposed = true;
+            Active.RemoveAt(i);
+            removed = true;
+        }
+
+        if (removed)
+        {
+            s_snapshotDirty = true;
         }
     }
 
@@ -594,11 +754,24 @@ public static class EventDispatcher
         }
     }
 
+    /// <summary>
+    /// Records the mod-id order of the FIRST dispatch of <paramref name="kind"/>.
+    ///
+    /// Called only when the caller observed the matching "not recorded yet" flag, so a stable
+    /// tick neither allocates a <see cref="StringBuilder"/> nor formats a string. The flags are
+    /// set even when the first dispatch had no subscriptions: an empty order is a fact
+    /// ("nobody was subscribed"), and a later registration must not rewrite it.
+    /// </summary>
     private static void RecordOrderLocked(ModEventKind kind, ModEventSubscription[] snapshot)
     {
-        var builder = new StringBuilder();
         lock (Gate)
         {
+            if (kind == ModEventKind.GameLaunched ? s_firstGameLaunchedOrderRecorded : s_firstTickOrderRecorded)
+            {
+                return;
+            }
+
+            var builder = new StringBuilder();
             var previous = "";
             for (var i = 0; i < snapshot.Length; i++)
             {
@@ -628,14 +801,13 @@ public static class EventDispatcher
             var text = builder.ToString();
             if (kind == ModEventKind.GameLaunched)
             {
-                if (s_firstGameLaunchedOrder.Length == 0)
-                {
-                    s_firstGameLaunchedOrder = text;
-                }
+                s_firstGameLaunchedOrder = text;
+                s_firstGameLaunchedOrderRecorded = true;
             }
-            else if (s_firstTickOrder.Length == 0)
+            else
             {
                 s_firstTickOrder = text;
+                s_firstTickOrderRecorded = true;
             }
         }
     }
@@ -736,19 +908,17 @@ public static class EventDispatcher
     {
         lock (Gate)
         {
-            var mods = 0;
-            var previousModId = "";
-            var seen = false;
+            // Active is append-ordered, NOT sorted, so adjacent-identity deduplication would count
+            // A -> B -> A as three mods. Identity follows the loader's mod-id rule
+            // (ordinal-ignore-case); the hash set is allocated only when diagnostics are captured,
+            // never on a dispatch.
+            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             for (var i = 0; i < Active.Count; i++)
             {
-                var id = Active[i].ModId;
-                if (!seen || string.CompareOrdinal(id, previousModId) != 0)
-                {
-                    mods++;
-                    previousModId = id;
-                    seen = true;
-                }
+                ids.Add(Active[i].ModId);
             }
+
+            var mods = ids.Count;
 
             return new EventDiagnosticsSnapshot(
                 s_ready,
@@ -766,7 +936,8 @@ public static class EventDispatcher
                 s_loaderThreadId,
                 s_gameLaunchedBeforeFirstTick,
                 s_firstGameLaunchedOrder,
-                s_firstTickOrder);
+                s_firstTickOrder,
+                s_reentrantDispatchRejections);
         }
     }
 
@@ -781,6 +952,11 @@ public static class EventDispatcher
             s_sequence = 0;
             s_ready = false;
             s_sessionId = 0;
+            s_activeSessionId = 0;
+            s_previousActiveSessionId = 0;
+            s_sessionAborted = false;
+            s_dispatching = false;
+            s_reentrantDispatchRejections = 0;
             s_gameVersion = "unknown";
             s_frameworkVersion = "unknown";
             s_gameLaunchedCount = 0;
@@ -795,6 +971,8 @@ public static class EventDispatcher
             s_gameLaunchedBeforeFirstTick = true;
             s_firstGameLaunchedOrder = "";
             s_firstTickOrder = "";
+            s_firstGameLaunchedOrderRecorded = false;
+            s_firstTickOrderRecorded = false;
             s_bridgeFaultReported = false;
         }
     }

@@ -733,7 +733,10 @@ internal static class HostTests
             "history=ManifestValidated>DependenciesResolved>AssemblyLoaded>EntryValidated>Instantiated>Initialized");
         t.Contains("hello_world_game_version_applied", report, "game-version-state=known");
         t.Contains("hello_world_log_message", log, "Hello World from \"Hello World\" 1.0.0");
-        t.Contains("hello_world_log_versions", log, "framework=1.0.0");
+        // Phase 2.0 raised the framework API version to 1.1.0 while keeping AssemblyVersion
+        // 1.0.0.0. The example mod logs the API version, so the expected value is 1.1.0; this
+        // assertion was stale (only the --refs run builds the example mod, which CI does not).
+        t.Contains("hello_world_log_versions", log, "framework=1.1.0");
     }
     // ---------------------------------------------------------------- helpers
 

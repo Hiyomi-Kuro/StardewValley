@@ -1,28 +1,38 @@
 #!/usr/bin/env python3
-"""Static acceptance for the mod-enabled APK (Phase 1.1.7).
+"""Static acceptance for the mod-enabled APK, plus a separate install-admission decision.
 
-Proves, without a device and without running the app:
+Proves, without running the app:
 
   * the candidate really carries the injected StardewValley assembly (re-extracted from the
     APK and re-verified with ModInjector);
   * every other container entry is byte-identical to the source blob, and the architecture
-    blob / manifest / native libraries / DEX / game resources are unchanged from the
-    baseline APK (zip CRC + size comparison, entry by entry);
+    blob / manifest / native libraries / DEX / game resources are unchanged from the CONTENT
+    BASELINE APK (zip CRC + size comparison, entry by entry);
   * package id and version are still com.chucklefish.stardewvalley / 239 / 1.6.15.0;
-  * zipalign and apksigner accept the file;
-  * the candidate signer is compared with the baseline signer, and the result is classified
-    as an install-admission status. A mismatch is reported as UPDATE_INCOMPATIBLE_RISK, never
-    smoothed over: a different key cannot replace an installed package.
+  * zipalign and apksigner accept the file.
+
+Three artifacts are kept separate (Phase 2.0.1):
+
+    baseline  = content reference (the unmodified debug build)
+    candidate = the APK built now
+    installed = the APK actually on the device, with its own signer
+
+Install admission is decided by ``Tools/apk_admission.py`` from candidate + installed evidence;
+the baseline signer is recorded but never treated as the device's signer. With no installed
+evidence the verdict is NOT_VERIFIED (UNKNOWN), not PASS and not BLOCKED. Use ``--installed-apk``
+(a pulled base.apk) or ``--installed-signer-sha256``; ``--installed-absent`` states a first
+install explicitly. ``--installed-unreadable`` records why evidence could not be read.
 
 Usage (repo root):
     python Tools/verify_modded_apk.py \
         --candidate app/build/outputs/apk/modded/app-modded-debug.apk \
         --baseline  app/build/outputs/apk/debug/app-debug.apk \
         --blob-manifest .tmp/build-modded/modded-build-manifest.json \
+        --installed-apk .tmp/device/installed-base.apk \
         --report .tmp/build-modded/modded-apk-verify.json
 
-Exit codes: 0 = every check passed (an install-admission BLOCKED is *not* a check failure),
-3 = missing input, 4 = a check failed.
+Exit codes: 0 = every check passed (BLOCKED/UNKNOWN admission statuses are *not* check
+failures), 3 = missing input, 4 = a check failed.
 """
 
 import argparse
@@ -36,6 +46,8 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import apk_admission  # noqa: E402
 sys.path.insert(0, os.path.join(HERE, "AssemblyStore"))
 import store as store_mod  # noqa: E402
 
@@ -67,11 +79,27 @@ class Checks(object):
     def __init__(self):
         self.items = []
 
-    def check(self, name, ok, detail="", blocked_if_false=False):
-        status = "PASS" if ok else ("BLOCKED" if blocked_if_false else "FAIL")
+    def check(self, name, ok, detail="", blocked_if_false=False, unknown_if_false=False):
+        if ok:
+            status = "PASS"
+        elif unknown_if_false:
+            # "The evidence is missing" is not the same as "the artifact is wrong": it must be
+            # reported as UNKNOWN, never as PASS and never as a check failure.
+            status = "UNKNOWN"
+        elif blocked_if_false:
+            status = "BLOCKED"
+        else:
+            status = "FAIL"
         self.items.append({"name": name, "status": status, "ok": bool(ok), "detail": str(detail)})
-        print("%s %-44s %s" % ("ok   " if ok else ("BLOCK " if blocked_if_false else "FAIL  "),
-                               name, detail))
+        if status == "PASS":
+            tag = "ok   "
+        elif status == "UNKNOWN":
+            tag = "UNKWN"
+        elif status == "BLOCKED":
+            tag = "BLOCK"
+        else:
+            tag = "FAIL "
+        print("%s %-44s %s" % (tag, name, detail))
         return ok
 
     @property
@@ -81,6 +109,10 @@ class Checks(object):
     @property
     def blocked(self):
         return [c for c in self.items if c["status"] == "BLOCKED"]
+
+    @property
+    def unknown(self):
+        return [c for c in self.items if c["status"] == "UNKNOWN"]
 
 
 def run(cmd):
@@ -162,8 +194,20 @@ def main(argv):
         ROOT, "app", "src", "main", "apkroot", "assemblies"))
     ap.add_argument("--build-tools", default="")
     ap.add_argument("--keystore", default="")
+    ap.add_argument("--installed-apk", default="",
+                    help="local copy of the INSTALLED base.apk pulled from the device; the only "
+                         "evidence that can decide signature admission")
+    ap.add_argument("--installed-signer-sha256", default="",
+                    help="installed signer digest measured another way (comma separated); used "
+                         "instead of --installed-apk when the APK itself was not pulled")
     ap.add_argument("--installed-apk-sha256", default="",
-                    help="device sha256 of the installed base.apk, if E0 measured it")
+                    help="device sha256 of the installed base.apk (plain adb shell sha256sum)")
+    ap.add_argument("--installed-absent", action="store_true",
+                    help="the package is explicitly not installed (first install)")
+    ap.add_argument("--installed-unreadable", default="",
+                    help="why the installed signature/hash could not be read; classifies UNKNOWN")
+    ap.add_argument("--installed-version-code", default="")
+    ap.add_argument("--installed-version-name", default="")
     ap.add_argument("--dotnet", default="dotnet",
                     help="SDK used to run ModInjector verify on the re-extracted assembly")
     ap.add_argument("--expect-events", default="auto", choices=["auto", "enabled", "disabled"],
@@ -369,18 +413,101 @@ def main(argv):
     rc, base_certs = run([apksigner, "verify", "--print-certs", "--verbose", args.baseline])
     checks.check("apksigner_baseline", rc == 0, "rc=%d" % rc)
 
-    cand_digests = parse_certs(cand_certs)
-    base_digests = parse_certs(base_certs)
+    cand_digests = apk_admission.normalize_digests(parse_certs(cand_certs))
+    base_digests = apk_admission.normalize_digests(parse_certs(base_certs))
+
+    # ---- installed evidence: its own artifact, never the baseline ------------------------
+    installed = None
+    installed_note = "no installed-APK evidence supplied"
+    if args.installed_absent:
+        installed = {"present": False}
+        installed_note = "explicitly absent (first install)"
+    elif args.installed_unreadable:
+        installed = {"present": True, "signer_digests": [],
+                     "signature_read_error": args.installed_unreadable}
+        installed_note = "unreadable: " + args.installed_unreadable
+    elif args.installed_apk:
+        if not os.path.isfile(args.installed_apk):
+            installed = {"present": True, "signer_digests": [],
+                         "signature_read_error": "installed APK path does not exist"}
+            installed_note = "missing installed APK copy"
+        else:
+            inst_sha = sha256_file(args.installed_apk)
+            rc_i, inst_certs = run([apksigner, "verify", "--print-certs", "--verbose",
+                                    args.installed_apk])
+            inst_digests = apk_admission.normalize_digests(parse_certs(inst_certs))
+            inst_package = ""
+            inst_version_code = args.installed_version_code
+            inst_version_name = args.installed_version_name
+            rc_b, inst_badging = run([aapt2, "dump", "badging", args.installed_apk])
+            if rc_b == 0:
+                m_inst = re.search(r"name='([^']+)' versionCode='([^']*)' versionName='([^']*)'",
+                                   inst_badging)
+                if m_inst:
+                    inst_package = m_inst.group(1)
+                    if not inst_version_code:
+                        inst_version_code = m_inst.group(2)
+                    if not inst_version_name:
+                        inst_version_name = m_inst.group(3)
+            installed = {
+                "present": True,
+                "signer_digests": inst_digests if rc_i == 0 else [],
+                "signature_read_error": "" if rc_i == 0 else "apksigner exited %d" % rc_i,
+                "apk_sha256": inst_sha,
+                "package": inst_package,
+                "version_code": inst_version_code,
+                "version_name": inst_version_name,
+            }
+            installed_note = ("pulled installed APK sha256=" + inst_sha[:16] +
+                              " signers=" + str(len(inst_digests)))
+    elif args.installed_signer_sha256:
+        installed = {
+            "present": True,
+            "signer_digests": apk_admission.normalize_digests(
+                args.installed_signer_sha256.split(",")),
+            "apk_sha256": args.installed_apk_sha256,
+            "package": PACKAGE,
+            "version_code": args.installed_version_code,
+            "version_name": args.installed_version_name,
+        }
+        installed_note = "signer supplied by the operator"
+    elif args.installed_apk_sha256:
+        installed = {
+            "present": True,
+            "signer_digests": [],
+            "signature_read_error": "only the APK hash was supplied; the signer is unknown",
+            "apk_sha256": args.installed_apk_sha256,
+        }
+        installed_note = "hash only (no signer evidence)"
+
+    candidate_evidence = {
+        "signer_digests": cand_digests,
+        "apk_sha256": cand_sha,
+        "package": report.get("package", {}).get("name"),
+        "version_code": report.get("package", {}).get("versionCode"),
+        "version_name": report.get("package", {}).get("versionName"),
+        "signature_read_error": "" if cand_digests else "apksigner produced no certificate digest",
+    }
+    baseline_evidence = {"signer_digests": base_digests, "apk_sha256": base_sha}
+
+    decision = apk_admission.evaluate(
+        candidate_evidence, baseline_evidence, installed, PACKAGE, VERSION_CODE, VERSION_NAME)
+
     report["signature"] = {
         "candidate_signer_sha256": cand_digests[0] if cand_digests else "",
+        "candidate_signer_sha256_all": cand_digests,
         "baseline_signer_sha256": base_digests[0] if base_digests else "",
+        "baseline_signer_sha256_all": base_digests,
         "baseline_recorded_signer_sha256": BASELINE_SIGNER_SHA256,
         "keystore": args.keystore,
         "keystore_exists": os.path.isfile(args.keystore) if args.keystore else None,
         "scheme_v1": "v1 scheme (JAR signing): true" in cand_certs,
         "scheme_v2": "v2 scheme (APK Signature Scheme v2): true" in cand_certs,
         "scheme_v3": "v3 scheme (APK Signature Scheme v3): true" in cand_certs,
-        "installed_apk_sha256": args.installed_apk_sha256,
+        "installed_apk_sha256": installed.get("apk_sha256") if installed else "",
+        "installed_signer_sha256_all": (installed.get("signer_digests") if installed else []) or [],
+        "installed_apk_source": installed_note,
+        "baseline_matches_candidate": decision["baseline_matches_candidate"],
     }
     checks.check("signer_reported", bool(cand_digests) and bool(base_digests),
                  "%s vs %s" % (cand_digests[:1], base_digests[:1]))
@@ -391,53 +518,69 @@ def main(argv):
                  and report["signature"]["scheme_v3"],
                  "v1/v2/v3")
 
-    installed_matches = None
-    if args.installed_apk_sha256:
-        installed_matches = args.installed_apk_sha256 == base_sha
-        checks.check("installed_apk_equals_baseline", installed_matches,
-                     args.installed_apk_sha256)
-    report["signature"]["installed_equals_baseline"] = installed_matches
+    # The candidate is this build's own artifact: an unreadable candidate certificate is a
+    # build failure, unlike missing device evidence (which stays UNKNOWN).
+    checks.check("candidate_signature_readable", bool(cand_digests),
+                 "%d signer(s)" % len(cand_digests))
 
-    same_signer = bool(cand_digests) and bool(base_digests) and cand_digests[0] == base_digests[0]
-    checks.check("candidate_signer_equals_baseline", same_signer,
-                 cand_digests[0] if cand_digests else "", blocked_if_false=True)
-
-    # Install admission. A mismatch is not a build failure - it is a BLOCKED admission,
-    # because replacing the installed package would need a different key it does not have.
-    if same_signer:
-        admission = "INSTALL_CANDIDATE"
-        reason = "candidate signer equals the baseline/installed signer"
+    # The baseline signer is a build fact, not device evidence. The comparison is recorded in
+    # report["signature"]["baseline_matches_candidate"] and never becomes an install verdict.
+    admission_status = decision["status"]
+    if admission_status in (apk_admission.CANDIDATE, apk_admission.FIRST_INSTALL):
+        checks.check("install_admission", True, admission_status)
+    elif admission_status in (apk_admission.NOT_VERIFIED, apk_admission.SIGNATURE_UNREADABLE):
+        checks.check("install_admission", False,
+                     admission_status + ": " + decision["reason"], unknown_if_false=True)
     else:
-        admission = "UPDATE_INCOMPATIBLE_RISK"
-        reason = ("candidate signer %s differs from the installed/baseline signer %s; "
-                  "adb install -r would fail with INSTALL_FAILED_UPDATE_INCOMPATIBLE, so an "
-                  "in-place update is impossible. Reloading the mod-enabled build needs "
-                  "uninstall+install (which deletes app data) and is allowed only on the "
-                  "designated test device after a verified off-device backup - see "
-                  "docs/audit/phase1.1.8-report.md section 6.2"
-                  % ((cand_digests[0] if cand_digests else "?"),
-                     (base_digests[0] if base_digests else "?")))
-    if args.keystore and not os.path.isfile(args.keystore):
-        admission = "SIGNING_KEY_UNAVAILABLE"
-        reason = "keystore %s does not exist" % args.keystore
-    report["install_admission"] = {"status": admission, "reason": reason,
-                                   "adb_install_allowed": same_signer}
+        checks.check("install_admission", False,
+                     admission_status + ": " + decision["reason"], blocked_if_false=True)
+
+    installed_sha = decision.get("installed_apk_sha256") or ""
+    post_install = decision.get("post_install_hash_matches")
+    if post_install is True:
+        checks.check("post_install_hash_matches_candidate", True, installed_sha)
+    elif installed_sha and installed_sha == base_sha:
+        checks.check("post_install_hash_matches_candidate", False,
+                     "installed APK is still the baseline build (pre-update state)",
+                     unknown_if_false=True)
+    else:
+        checks.check("post_install_hash_matches_candidate", False,
+                     installed_sha or "no installed APK hash evidence",
+                     unknown_if_false=True)
+
+    report["install_admission"] = {
+        "status": admission_status,
+        "reason": decision["reason"],
+        "adb_install_allowed": decision["adb_install_allowed"],
+        "same_signature": decision["same_signature"],
+        "candidate_signer_sha256": decision["candidate_signer_sha256"],
+        "installed_signer_sha256": decision["installed_signer_sha256"],
+        "baseline_signer_sha256": decision["baseline_signer_sha256"],
+        "baseline_matches_candidate": decision["baseline_matches_candidate"],
+        "installed_apk_sha256": installed_sha,
+        "post_install_hash_matches": post_install,
+        "installed_evidence": installed_note,
+    }
 
     print("\n== 6. result ==")
     failed = checks.failed
     blocked = checks.blocked
+    unknown = checks.unknown
     report["result"] = "ok" if not failed else "failed"
     report["failed_checks"] = [c["name"] for c in failed]
     report["blocked_checks"] = [c["name"] for c in blocked]
+    report["unknown_checks"] = [c["name"] for c in unknown]
     os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)
     with open(args.report, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
         f.write("\n")
 
-    print("  checks     : %d passed, %d failed, %d blocked"
-          % (len(checks.items) - len(failed) - len(blocked), len(failed), len(blocked)))
-    print("  admission  : %s" % admission)
-    print("  reason     : %s" % reason)
+    passed = len(checks.items) - len(failed) - len(blocked) - len(unknown)
+    print("  checks     : %d passed, %d failed, %d blocked, %d unknown"
+          % (passed, len(failed), len(blocked), len(unknown)))
+    print("  admission  : %s" % admission_status)
+    print("  reason     : %s" % decision["reason"])
+    print("  installed  : %s" % installed_note)
     print("  report     : %s" % args.report)
     if failed:
         print("  FAILED: " + ", ".join(c["name"] for c in failed))

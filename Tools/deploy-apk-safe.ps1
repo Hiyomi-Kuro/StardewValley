@@ -22,6 +22,10 @@
 #   7. Before any install the script prints: target serial, device class, package name, APK
 #      SHA-256, signer digest, whether a package is already installed and whether a replace
 #      is needed.
+#   7b. After an approved install the device copy is proven with the ORDINARY shell:
+#      `pm path` (exactly one base APK; a split layout is reported as unsupported, never
+#      guessed) followed by `sha256sum` on that path. No `su`, no first-token parsing: the
+#      exit code and a full 64-hex line must both match the local SHA-256.
 #   8. It never force-stops the game, never launches the game, and never touches Mods/ or Saves/
 #      unless -PushModsApproved was passed with an explicit -ModsSourceDirectory.
 #   9. -ModsSourceDirectory is the COMPLETE Mods root. The push walks the whole tree, keeps every
@@ -396,6 +400,45 @@ function Invoke-Tool([string]$tool, [string[]]$argv) {
     return [pscustomobject]@{ Exit = $code; Text = (($out | Out-String) -replace "`r", "").Trim() }
 }
 
+# Post-install proof with the ordinary adb shell (no Root, no su).
+#
+# `pm path` is authoritative for WHERE the installed bytes are. A split APK reports several
+# `package:` lines; this script does not guess which one is "the" APK, so that layout is
+# reported as unsupported instead of hashing the first line. The digest is parsed only from a
+# complete line ("[optional backslash]<64 hex><whitespace>/..."), never from "the first token"
+# of arbitrary output, and the command's exit code must be 0.
+function Get-InstalledApkProof([string]$serial, [string]$localHash) {
+    $pm = Adb-Shell $serial ("pm path " + $Package)
+    if ($pm.Exit -ne 0) {
+        return [pscustomobject]@{ Status = "UNVERIFIED"; Detail = "pm path exited " + $pm.Exit; Path = ""; Digest = "" }
+    }
+    $paths = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($pm.Text -split "`r?`n")) {
+        $t = $line.Trim()
+        if ($t -match '^package:(/.+)$') { $paths.Add($Matches[1]) }
+    }
+    if ($paths.Count -eq 0) {
+        return [pscustomobject]@{ Status = "UNVERIFIED"; Detail = "pm path reported no package:"; Path = ""; Digest = "" }
+    }
+    if ($paths.Count -gt 1) {
+        return [pscustomobject]@{ Status = "UNSUPPORTED_SPLIT_APK"; Detail = ($paths.Count.ToString() + " package: paths (split APK layout is not supported by this proof)"); Path = ""; Digest = "" }
+    }
+    $path = $paths[0]
+    $sum = Adb-Shell $serial ("sha256sum " + (Quote-Posix $path))
+    if ($sum.Exit -ne 0) {
+        return [pscustomobject]@{ Status = "UNVERIFIED"; Detail = "sha256sum exited " + $sum.Exit; Path = $path; Digest = "" }
+    }
+    $m = [regex]::Match($sum.Text, '(?m)^\\?([0-9a-f]{64})\s')
+    if (-not $m.Success) {
+        return [pscustomobject]@{ Status = "UNVERIFIED"; Detail = "no complete 64-hex SHA-256 line in sha256sum output"; Path = $path; Digest = "" }
+    }
+    $digest = $m.Groups[1].Value
+    if ($digest -ne $localHash) {
+        return [pscustomobject]@{ Status = "MISMATCH"; Detail = ("device=" + $digest + " local=" + $localHash); Path = $path; Digest = $digest }
+    }
+    return [pscustomobject]@{ Status = "MATCH"; Detail = $digest; Path = $path; Digest = $digest }
+}
+
 function Get-SignerSha256([string]$apk, [string]$tool) {
     if (-not $tool) { return [pscustomobject]@{ Ok = $false; Digest = ""; Detail = "apksigner not found" } }
     $result = Invoke-Tool $tool @("verify", "--print-certs", $apk)
@@ -638,6 +681,8 @@ if ($ModsSourceDirectory) {
 Say ""
 Say "planned commands (nothing below has run unless the verdict says so):"
 Say ("  install : adb -s " + $Serial + " install " + $installArgs + " <apk>")
+Say ("            then adb -s " + $Serial + " shell pm path " + $Package +
+     " && adb -s " + $Serial + " shell sha256sum <single base.apk> (ordinary shell, no su)")
 if ($PushModsApproved) {
     Say ("  push    : adb -s " + $Serial + " push <file> /data/local/tmp/<staging>/<relative path> (recursive, per file)")
     Say ("            su -c mkdir -p / su -c cp -p / su -c chown <app uid>:<app gid> / su -c chmod")
@@ -696,8 +741,17 @@ if ($InstallApproved) {
         Say "verdict         : INSTALL FAILED (device reported a failure; nothing was uninstalled)"
         Finish 4
     }
-    Say ("installed-apk   : " + $apkHash + " (local digest; prove the device copy with E0 sha256sum)")
-    Say "verdict         : INSTALLED (same-signature replace, no uninstall)"
+    $proof = Get-InstalledApkProof $Serial $apkHash
+    Say ("post-install    : " + $proof.Status + " - " + $proof.Detail)
+    if ($proof.Path) { Say ("installed-path  : " + (Leaf $proof.Path)) }
+    if ($proof.Status -ne "MATCH") {
+        Say "verdict         : INSTALLED_BUT_DEVICE_APK_UNVERIFIED"
+        Say "reason          : the install reported Success, but the device copy could not be proven"
+        Say "                  with pm path + a plain-shell sha256sum (see post-install above)."
+        Say "what was done   : the approved install only; no uninstall, no clear, no launch."
+        Finish 4
+    }
+    Say "verdict         : INSTALLED (same-signature replace; device base.apk SHA-256 == local APK)"
 }
 
 # ------------------------------------------------------------------ 8. recursive safe mods push

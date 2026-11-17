@@ -124,7 +124,7 @@ wrapper 的 `distributionUrl` 默认指向腾讯镜像（国内 services.gradle.
 
 产物 `app/build/outputs/apk/debug/app-debug.apk` 是 **baseline**：不含任何 Mod 支持代码。
 
-### mod-enabled APK（Phase 1.1.7 / Phase 2.0）
+### mod-enabled APK（Phase 1.1.7 / Phase 2.0 / Phase 2.0.1）
 
 要让装机后能加载 `Mods/`，必须显式构建注入版——默认构建**不会**注入。Phase 2.0 起有两个模组构建：
 
@@ -148,8 +148,9 @@ Gradle 任务自己调用 `Tools/build_modded_apk.py`，**不要**先手工跑�
 事件开关贯通 Gradle → `build_modded_apk.py --event-hooks enabled|disabled` → `ModInjector` → 构建 manifest →
 `verify_modded_apk.py`；A/B/C 的输出与工作目录互相隔离。
 
-`-Pkeystore` 必须指向**项目外长期密钥库**（`%USERPROFILE%\.android\keystores\StardewValley\`），
-不要指向 `.work/`、`.tmp/` 或 `app/build` 里的副本——那些目录会被清理。脚本不会自动生成新 key。
+`-Pkeystore` 必须指向**与被安装包签名一致的长期密钥库**。本工作区当前用的是
+`.work/debug.keystore`（signer `858ef62d…`，与测试设备已装包一致）；`.tmp/`、`app/build` 里的副本会随清理消失，
+不要把唯一副本放在那里。构建**不会**自动生成新 key：新 key 装不上已装的包，脚本会直接拒绝。
 
 最终校验（从**最终 APK 解出的程序集**验证“应有/应无”，不只相信构建 manifest）：
 
@@ -157,17 +158,25 @@ Gradle 任务自己调用 `Tools/build_modded_apk.py`，**不要**先手工跑�
 python Tools/verify_modded_apk.py --candidate app/build/outputs/apk/modded/app-modded-debug.apk `
     --baseline app/build/outputs/apk/debug/app-debug.apk `
     --blob-manifest .tmp/build-modded/modded-build-manifest.json `
+    --installed-apk <从设备拉回的 base.apk> `
     --report .tmp/verify-modded.json --dotnet <SDK>
 ```
+
+`--baseline` 只用于“除 blob 外内容未变”的证明；**升级准入**看的是 candidate 与
+**installed**（设备实际包）的签名。没有 installed 证据时报告 `NOT_VERIFIED`（UNKNOWN），
+不会拿 baseline 冒充设备；多 signer/签名轮换未实现时明确拒绝。详见
+[`docs/architecture/phase2.0.1-build-install.md`](docs/architecture/phase2.0.1-build-install.md)。
 
 最近一次验收过的交付副本放在 `final/`（`StardewValley-1.6.15.0-modded-test-debug.apk` +
 `SHA256SUMS.txt` + `DELIVERY.md`）。APK 本体被 `*.apk` 规则忽略，只入库说明与校验和；
 每次重新构建都会变（MVID 随机），所以**以 `final/SHA256SUMS.txt` 为准**。
 
-签名准入：signer 与已安装包**完全一致**才能 `adb install -r` 原位升级；不一致时只能在
-Saves/Mods 已备份并校验后，对指定测试机卸载重装（卸载本身会删应用数据）。详见
-`docs/audit/phase1.1.8-report.md` 与 `docs/audit/phase1.1.9-device-acceptance-report.md`。
-事件 API 的契约见 `docs/architecture/phase2-events.md`。
+签名准入：candidate 的 signer 与**设备上的 installed** 完全一致才能 `adb install -r` 原位升级；
+不一致时不会静默卸载，只能在 Saves/Mods 已备份并逐文件校验后，由用户显式授权对指定测试机卸载重装
+（卸载本身会删应用数据）。安装后必须用普通 `adb shell pm path` + `sha256sum` 证明设备字节。
+详见 [构建/安装验证](docs/architecture/phase2.0.1-build-install.md) 与
+[Phase 2.0.1 报告](docs/audit/phase2.0.1-report.md)；事件契约见
+[`docs/architecture/phase2-events.md`](docs/architecture/phase2-events.md)。
 
 ### Mod Framework（C#）
 
@@ -199,8 +208,9 @@ pwsh -NoProfile -File Tools/deploy-apk-safe.ps1                          # 只�
 pwsh -NoProfile -File Tools/deploy-apk-safe.ps1 -Serial <serial>         # 仍然只读
 ```
 
-> 旧的 `Tools/deploy-apk.ps1` 会先 `adb uninstall`（**删存档**）。它现在默认拒绝执行，
-> 必须显式传 `-LegacyDestructiveInstall` 才会走到卸载重装；新增改动不要再依赖它。
+> 旧的 `Tools/deploy-apk.ps1` 会先 `adb uninstall`（**删存档**）。它现在默认拒绝执行；
+> 即使传 `-LegacyDestructiveInstall`，还必须给 `-SavesBackupRoot <非空备份目录>` 与
+> `-SavesBackupConfirmed`，否则不写设备。新增改动不要再依赖它。
 
 ### 无 Root Mods 部署（Phase 1.2.2 实现，Phase 1.2.3 真机验收）
 

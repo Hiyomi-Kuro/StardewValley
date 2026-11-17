@@ -15,6 +15,7 @@ internal static class Program
         var p114Dir = "";
         var eventFixtureDir = "";
         var legacyModDir = "";
+        var perfReport = "";
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -44,6 +45,9 @@ internal static class Program
                 case "--legacy-mod-dir":
                     if (i + 1 < args.Length) { legacyModDir = args[++i]; }
                     break;
+                case "--perf-report":
+                    if (i + 1 < args.Length) { perfReport = args[++i]; }
+                    break;
                 case "--help":
                 case "-h":
                     Console.WriteLine("ModFramework.Tests [--repo-root <dir>] --fixture-mod-dir <dir>");
@@ -53,6 +57,7 @@ internal static class Program
                     Console.WriteLine("  --p114-dir         staged P114.RuntimeProbe mod package (optional, Phase 1.1.4)");
                     Console.WriteLine("  --event-fixture-dir  EventMod.A/Z/Fault builds (optional, Phase 2.0)");
                     Console.WriteLine("  --legacy-mod-dir     LegacyFixtureMod built against the frozen 1.0.0 contract");
+                    Console.WriteLine("  --perf-report <path> write the Phase 2.0.1 stable-tick allocation report");
                     Console.WriteLine("  --diff-refs <dir>  run only the read-only parser differential over <dir>");
                     return 0;
                 default:
@@ -120,6 +125,16 @@ internal static class Program
             // checks need the fixture mods, and the binary-compatibility check needs the mod built
             // against the frozen 1.0.0 contract.
             Phase20Tests.Run(runner, eventFixtureDir, legacyModDir);
+
+            // Phase 2.0.1: session isolation, ModCount identity, first-order recording,
+            // re-entrancy and the stable-tick allocation budget.
+            Phase201Tests.Run(runner, eventFixtureDir);
+
+            if (perfReport.Length > 0)
+            {
+                Phase201Tests.Perf(perfReport);
+                runner.Check("p201_perf_report_written", File.Exists(perfReport), perfReport);
+            }
         }
         finally
         {

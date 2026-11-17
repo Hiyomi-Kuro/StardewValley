@@ -9,8 +9,9 @@ namespace ModFramework.Runtime;
 /// <list type="bullet">
 /// <item><description>
 /// <b>GameLaunched</b> is dispatched at most once per process, from the normal return path of
-/// <c>StardewValley.GameRunner.Initialize()</c>. It does not claim that all content is loaded
-/// and it is not the same thing as "the title screen is visible".
+/// <c>StardewValley.GameRunner.Initialize()</c>. A new loader session does <b>not</b> re-arm it;
+/// the launch counters are process facts, not session counters. It does not claim that all
+/// content is loaded and it is not the same thing as "the title screen is visible".
 /// </description></item>
 /// <item><description>
 /// <b>Tick</b> is dispatched once per entry to <c>StardewValley.GameRunner.Update(GameTime)</c>.
@@ -24,6 +25,14 @@ namespace ModFramework.Runtime;
 /// <item><description>
 /// Each dispatch runs against a snapshot taken at the start of that dispatch. Subscribing or
 /// disposing from inside a handler takes effect on the next dispatch, never on the current one.
+/// </description></item>
+/// <item><description>
+/// A dispatch is not re-entrant: calling the bridge entry point from inside a handler returns
+/// immediately and moves no counter (it is not queued and cannot recurse).
+/// </description></item>
+/// <item><description>
+/// A loader run is a session. Committing a new session replaces the previous session's
+/// subscriptions; a failed run discards only its own, and cannot revive a stale context.
 /// </description></item>
 /// <item><description>
 /// Every handler is isolated: an exception is recorded against that subscription and the
@@ -133,7 +142,8 @@ public sealed class EventDiagnosticsSnapshot
         int loaderThreadId,
         bool gameLaunchedBeforeFirstTick,
         string firstGameLaunchedOrder,
-        string firstTickOrder)
+        string firstTickOrder,
+        int reentrantDispatchRejections)
     {
         Ready = ready;
         SessionId = sessionId;
@@ -151,6 +161,7 @@ public sealed class EventDiagnosticsSnapshot
         GameLaunchedBeforeFirstTick = gameLaunchedBeforeFirstTick;
         FirstGameLaunchedOrder = firstGameLaunchedOrder;
         FirstTickOrder = firstTickOrder;
+        ReentrantDispatchRejections = reentrantDispatchRejections;
     }
 
     /// <summary>Whether the loader committed an event session (dispatch is enabled).</summary>
@@ -159,7 +170,10 @@ public sealed class EventDiagnosticsSnapshot
     /// <summary>Monotonic loader session id; 0 means no session has started.</summary>
     public int SessionId { get; }
 
-    /// <summary>0 or 1: <c>GameLaunched</c> is dispatched at most once per process.</summary>
+    /// <summary>
+    /// 0 or 1: <c>GameLaunched</c> is dispatched at most once per process. Starting another
+    /// loader session does not reset it.
+    /// </summary>
     public int GameLaunchedCount { get; }
 
     /// <summary>Number of dispatched tick events (0 before the first one).</summary>
@@ -168,7 +182,11 @@ public sealed class EventDiagnosticsSnapshot
     /// <summary>Live subscriptions of every mod.</summary>
     public int SubscriptionCount { get; }
 
-    /// <summary>Number of mods that currently own at least one subscription.</summary>
+    /// <summary>
+    /// Number of distinct mods that currently own at least one subscription. Identity uses the
+    /// loader's ordinal-ignore-case mod-id rule; it is not an adjacent-entry count over the
+    /// append-ordered active list.
+    /// </summary>
     public int ModCount { get; }
 
     /// <summary>Total handler exceptions caught by the dispatcher.</summary>
@@ -200,6 +218,13 @@ public sealed class EventDiagnosticsSnapshot
 
     /// <summary>Mod ids of the first Tick dispatch, comma separated, in dispatch order.</summary>
     public string FirstTickOrder { get; }
+
+    /// <summary>
+    /// Number of nested bridge calls refused because a dispatch was already running on this
+    /// process. Always zero unless a handler called <c>DispatchTick</c>/<c>DispatchGameLaunched</c>
+    /// itself; the nested call returns immediately and does not move any counter.
+    /// </summary>
+    public int ReentrantDispatchRejections { get; }
 }
 
 /// <summary>

@@ -79,6 +79,7 @@ $verb = $a[$i]
 
 $devRoot = $env:FAKE_DEVICE_ROOT
 $pkg = "com.chucklefish.stardewvalley"
+$deviceApkPath = "/data/app/base/" + $pkg + "-1/base.apk"
 $filesDirDev = "/data/data/" + $pkg + "/files"
 $modsRootDev = "/data/data/" + $pkg + "/files/Mods"
 $appUid = if ($env:FAKE_APP_UID) { $env:FAKE_APP_UID } else { "10152" }
@@ -398,7 +399,12 @@ switch ($verb) {
             exit 0
         }
         if ($rest -like "pm path*") {
-            if ($env:FAKE_PMPATH) { Write-Output $env:FAKE_PMPATH }
+            if ($env:FAKE_PMPATH) {
+                foreach ($line in ($env:FAKE_PMPATH -split ";")) { if ($line) { Write-Output $line } }
+            } elseif ($devRoot -and (Test-Path -LiteralPath (Join-Path $devRoot "installed.flag"))) {
+                # A first install just happened: model the package becoming visible.
+                Write-Output ("package:" + $deviceApkPath)
+            }
             exit 0
         }
         if ($rest -like "dumpsys package*") {
@@ -423,6 +429,9 @@ switch ($verb) {
     "install" {
         Write-Output $env:FAKE_INSTALL_RESULT
         if ($env:FAKE_INSTALL_EXIT) { exit [int]$env:FAKE_INSTALL_EXIT }
+        if ($env:FAKE_INSTALL_RESULT -eq "Success") {
+            [System.IO.File]::WriteAllText((Join-Path $devRoot "installed.flag"), "installed")
+        }
         exit 0
     }
     "push" {
@@ -465,7 +474,9 @@ if ($env:FAKE_SIGNER_FAIL -eq "1") {
     [Console]::Error.WriteLine("fake apksigner: parsing failed")
     exit 2
 }
-$h = (Get-FileHash -LiteralPath $apk -Algorithm SHA256).Hash.ToLower()
+# An explicit digest models "two different APKs signed by the same key", which the
+# file-hash-derived default cannot express.
+$h = if ($env:FAKE_SIGNER_DIGEST) { $env:FAKE_SIGNER_DIGEST.ToLower() } else { (Get-FileHash -LiteralPath $apk -Algorithm SHA256).Hash.ToLower() }
 Write-Output ("Signer #1 certificate SHA-256 digest: " + $h)
 exit 0
 '@
@@ -586,7 +597,7 @@ function Invoke-Case([hashtable]$vars, [hashtable]$flags) {
     if ($seedApk -ne "none") {
         $apkLocal = Join-Path $devRoot ("data\app\base\com.chucklefish.stardewvalley-1\base.apk")
         [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $apkLocal))
-        $source = if ($seedApk -eq "other") { $otherApk } else { $localApk }
+        $source = if ($seedApk -eq "other") { $otherApk } elseif ($seedApk -eq "odd") { $oddApk } else { $localApk }
         Copy-Item -LiteralPath $source -Destination $apkLocal -Force
     }
 
@@ -673,6 +684,7 @@ $base = @{
     FAKE_INSTALL_RESULT = "Success"
     FAKE_INSTALL_EXIT = ""
     FAKE_SIGNER_FAIL = ""
+    FAKE_SIGNER_DIGEST = ""
     FAKE_SEED_APK = "match"
     FAKE_APP_UID = "10152"
     FAKE_APP_GID = "10152"
@@ -744,6 +756,7 @@ try {
     Check "approved_same_signature_uses_replace" ($r.AdbLog -match "install -r --no-incremental") "same-signature replace only"
     Check "approved_same_signature_never_uninstalls" (Test-NoDestructive $r.AdbLog) "no uninstall / clear / force-stop / launch"
     Check "approved_same_signature_gate_says_same" ($r.Output -match "signature-gate\s+: SAME") "gate evaluated and equal"
+    Check "approved_same_signature_proves_device_bytes" ($r.Output -match "post-install\s+: MATCH" -and $r.Output -match "device base\.apk SHA-256 == local APK") "plain-shell pm path + sha256sum proof"
 
     # 6. approved install, different signature -> stop, nothing written
     $r = Invoke-Case (Merge @{ FAKE_PULL_SRC = $otherApk }) @{ Install = $true }
@@ -771,6 +784,17 @@ try {
     Check "absent_package_first_install" ($r.ExitCode -eq 0 -and $r.AdbLog -match "install --no-incremental") ("exit=" + $r.ExitCode)
     Check "absent_package_not_installed_first" (-not ($r.AdbLog -match "install -r")) "no -r when nothing is installed"
     Check "absent_package_never_uninstalls" (Test-NoDestructive $r.AdbLog) "no uninstall / clear / launch"
+    Check "absent_package_post_install_proof" ($r.Output -match "post-install\s+: MATCH") "the new install is still hash-proven"
+
+    # 10b. a split APK layout is not guessed: it is reported and the run fails closed.
+    $r = Invoke-Case (Merge @{ FAKE_PMPATH = ("package:" + $deviceApkPath + ";package:/data/app/base/split_config.arm64_v8a.apk"); FAKE_PULL_SRC = $localApk }) @{ Install = $true }
+    Check "split_apk_layout_is_refused" ($r.ExitCode -eq 4 -and $r.Output -match "UNSUPPORTED_SPLIT_APK" -and $r.Output -match "INSTALLED_BUT_DEVICE_APK_UNVERIFIED") ("exit=" + $r.ExitCode)
+    Check "split_apk_never_uninstalls" (Test-NoDestructive $r.AdbLog) "no uninstall / clear / launch"
+
+    # 10c. the device copy differs from the built APK: install succeeded, proof failed closed.
+    $r = Invoke-Case (Merge @{ FAKE_SEED_APK = "other"; FAKE_PULL_SRC = $otherApk; FAKE_SIGNER_DIGEST = ("d" * 64) }) @{ Install = $true }
+    Check "device_hash_mismatch_is_refused" ($r.ExitCode -eq 4 -and $r.Output -match "post-install\s+: MISMATCH" -and $r.Output -match "INSTALLED_BUT_DEVICE_APK_UNVERIFIED") ("exit=" + $r.ExitCode)
+    Check "device_hash_mismatch_never_uninstalls" (Test-NoDestructive $r.AdbLog) "no uninstall / clear / launch"
 
     # 11. push needs its own approval
     $r = Invoke-Case (Merge @{}) @{ Install = $false; Push = $false; ModsSource = $modsSource }
@@ -785,7 +809,7 @@ try {
     Check "approved_push_never_uninstalls" (Test-NoDestructive $r.AdbLog) "no uninstall / clear / launch"
 
     # 13. paths with spaces / brackets / non-ASCII survive argument passing
-    $r = Invoke-Case (Merge @{ FAKE_PULL_SRC = $oddApk }) @{ Install = $true; ApkPath = $oddApk; OutFile = $oddOut }
+    $r = Invoke-Case (Merge @{ FAKE_PULL_SRC = $oddApk; FAKE_SEED_APK = "odd" }) @{ Install = $true; ApkPath = $oddApk; OutFile = $oddOut }
     $oddTail = (($r.Output -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -Last 2) -join " / "
     Check "odd_paths_are_safe" ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath $oddOut)) ("exit=" + $r.ExitCode + " " + $oddTail)
     $oddText = if (Test-Path -LiteralPath $oddOut) { [System.IO.File]::ReadAllText($oddOut) } else { "" }

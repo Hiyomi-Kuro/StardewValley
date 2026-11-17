@@ -48,7 +48,12 @@ param(
     # Phase 1.1.4: required for the historical uninstall+install and for -PushMods.
     # Without it the script still builds the APK, then stops before any device write.
     # Uninstalling deletes Saves; prefer Tools/deploy-apk-safe.ps1.
-    [switch]$LegacyDestructiveInstall
+    [switch]$LegacyDestructiveInstall,
+    # Phase 2.0.1: an uninstall+install is only allowed when the operator names the completed
+    # off-device backup AND confirms it. Naming a backup is not a permanent permission; this
+    # switch authorises one run, and the directory must exist and contain files.
+    [string]$SavesBackupRoot = "",
+    [switch]$SavesBackupConfirmed
 )
 
 $ErrorActionPreference = "Stop"
@@ -153,9 +158,9 @@ Write-Host "local apk  : $localApkHash ($((Get-Item $apk).Length) bytes)"
 
 if ($SkipInstall) { exit 0 }
 
-# 3.4 Phase 1.1.4 safety gate. Everything from here on writes to the device, and the
+# 3.4 Phase 1.1.4 / 2.0.1 safety gate. Everything from here on writes to the device, and the
 # historical path uninstalls the game (which deletes Saves). Refuse unless the operator
-# asked for the legacy behaviour explicitly.
+# asked for the legacy behaviour explicitly AND named a completed, non-empty backup.
 if (-not $LegacyDestructiveInstall) {
     Write-Host ""
     Write-Host "DANGER: the rest of this script uninstalls com.chucklefish.stardewvalley,"
@@ -167,9 +172,29 @@ if (-not $LegacyDestructiveInstall) {
     Write-Host "  pwsh -NoProfile -File Tools/deploy-apk-safe.ps1"
     Write-Host "  pwsh -NoProfile -File Tools/deploy-apk-safe.ps1 -InstallApproved   # after approval"
     Write-Host ""
-    Write-Host "To reproduce the historical behaviour anyway, re-run with -LegacyDestructiveInstall."
+    Write-Host "To reproduce the historical behaviour anyway, re-run with -LegacyDestructiveInstall"
+    Write-Host "-SavesBackupRoot <completed backup directory> -SavesBackupConfirmed."
     exit 2
 }
+
+if (-not $SavesBackupConfirmed -or -not $SavesBackupRoot) {
+    Write-Host "REFUSED: -LegacyDestructiveInstall needs -SavesBackupRoot and -SavesBackupConfirmed."
+    Write-Host "         An uninstall deletes Saves; a named backup root must be confirmed first."
+    Write-Host "Nothing was done to the device."
+    exit 2
+}
+if (-not (Test-Path -LiteralPath $SavesBackupRoot -PathType Container)) {
+    Write-Host ("REFUSED: the declared backup root does not exist: " + (Split-Path -Leaf $SavesBackupRoot))
+    Write-Host "Nothing was done to the device."
+    exit 2
+}
+$backupFileCount = @(Get-ChildItem -LiteralPath $SavesBackupRoot -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+if ($backupFileCount -eq 0) {
+    Write-Host "REFUSED: the declared backup root contains no files."
+    Write-Host "Nothing was done to the device."
+    exit 2
+}
+Write-Host ("backup     : confirmed (" + $backupFileCount + " files under the declared root)")
 
 # 3.5 pick a device explicitly. Auto-select only when exactly one is attached: this
 # script uninstalls the game, so silently targeting a guessed endpoint is unacceptable.
@@ -198,14 +223,34 @@ if ($LASTEXITCODE -ne 0) {
 }
 if ($LASTEXITCODE -ne 0) { throw "install failed" }
 
-$installedPath = (& $adb -s $serial shell "pm path com.chucklefish.stardewvalley") -replace "package:", "" -replace "`r", ""
-$installedPath = $installedPath.Trim()
-$deviceHash = (& $adb -s $serial shell "su -c 'sha256sum $installedPath'") -split "\s+" | Select-Object -First 1
-Write-Host "device apk : $deviceHash"
+# Ordinary shell only: this device has no Root. `pm path` may return several lines for a
+# split APK; this legacy script does not model that layout and refuses to guess.
+$pmLines = @(& $adb -s $serial shell "pm path com.chucklefish.stardewvalley")
+$installedPaths = @()
+foreach ($line in $pmLines) {
+    $t = "$line".Trim()
+    if ($t -match '^package:(/.+)$') { $installedPaths += $Matches[1] }
+}
+if ($installedPaths.Count -ne 1) {
+    throw ("INSTALL UNVERIFIED: expected exactly one installed base.apk, pm path reported " +
+           $installedPaths.Count + " (split APK layouts are not supported by this legacy script)")
+}
+$installedPath = $installedPaths[0]
+$sumResult = @(& $adb -s $serial shell "sha256sum '$installedPath'")
+$sumExit = $LASTEXITCODE
+$deviceHash = ""
+if ($sumExit -eq 0 -and $sumResult.Count -gt 0) {
+    $m = [regex]::Match("$($sumResult[0])", '^\\?([0-9a-f]{64})\s')
+    if ($m.Success) { $deviceHash = $m.Groups[1].Value }
+}
+Write-Host "device apk : $deviceHash (sha256sum exit $sumExit)"
+if ($sumExit -ne 0 -or $deviceHash.Length -ne 64) {
+    throw "INSTALL UNVERIFIED: the device copy could not be read with a plain-shell sha256sum"
+}
 if ($deviceHash -ne $localApkHash) {
     throw "INSTALL MISMATCH: device APK hash does not match the build we just produced"
 }
-Write-Host "verdict    : installed APK == freshly built APK (proven by sha256)"
+Write-Host "verdict    : installed APK == freshly built APK (proven by plain-shell sha256)"
 
 # 5. optionally stage the runtime + probe into the app's Mods dir (owned by the app uid)
 if ($PushMods) {

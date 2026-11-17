@@ -41,6 +41,8 @@ internal static class Program
             WrongSignatureRejected();
             AmbiguousOverloadRejected();
             PartialPatchDetected(work);
+            CompletionRejectsEdgeBypassingHook();
+            WrongHookOverloadRejected();
             ShortBranchesAreWidened(work);
         }
         finally
@@ -241,6 +243,8 @@ internal static class Program
 
         var inserted = GameMethodInjector.InjectEntryHook(method, hook);
         Check(name + "_one_call_inserted", inserted == 1, "inserted=" + inserted);
+        Check(name + "_entry_hook_recognized",
+            GameMethodInjector.HasEntryHook(method, SyntheticType, "Hook"), "exact void Hook()");
 
         var loaded = Load(Write(module, work, name));
         InvokeTarget(loaded, null);
@@ -306,6 +310,87 @@ internal static class Program
         method.Body.GetILProcessor().Remove(toRemove);
         var partial = GameMethodInjector.HasCompleteCompletionHook(method, SyntheticType, "Hook");
         Check(name + "_partial_patch_detected", !partial, "one ret without its call");
+    }
+
+    /// <summary>
+    /// "The call sits immediately before the ret" is not the same claim as "every path runs it".
+    /// This synthetic bad input has that textual layout AND a branch that jumps straight at the
+    /// ret, so a completion check that only looks at <c>ret.Previous</c> would accept a method
+    /// whose hook is bypassable.
+    /// </summary>
+    private static void CompletionRejectsEdgeBypassingHook()
+    {
+        var module = NewModule("bypass");
+        var type = AddType(module, "Synthetic");
+        var hook = AddHook(type);
+        var method = AddTarget(module, type, withIntParameter: false);
+        var il = method.Body.GetILProcessor();
+
+        var ret = il.Create(OpCodes.Ret);
+        il.Emit(OpCodes.Br, ret);      // edge: jumps over the call straight at the ret
+        il.Emit(OpCodes.Call, hook);   // textually the instruction before the ret
+        il.Append(ret);
+
+        var complete = GameMethodInjector.HasCompleteCompletionHook(method, SyntheticType, "Hook");
+        Check("bypass_edge_rejected", !complete,
+            "call-before-ret with a branch straight at ret must not count as complete");
+
+        // Control: the same method shape as produced by the injector (edge re-targeted) is
+        // accepted, so the new edge rule does not simply reject everything.
+        var module2 = NewModule("bypass-control");
+        var type2 = AddType(module2, "Synthetic");
+        var hook2 = AddHook(type2);
+        var method2 = AddTarget(module2, type2, withIntParameter: false);
+        var il2 = method2.Body.GetILProcessor();
+        var ret2 = il2.Create(OpCodes.Ret);
+        il2.Emit(OpCodes.Br, ret2);
+        il2.Emit(OpCodes.Nop);
+        il2.Append(ret2);
+        GameMethodInjector.InjectCompletionHook(method2, hook2);
+        Check("bypass_control_accepted",
+            GameMethodInjector.HasCompleteCompletionHook(method2, SyntheticType, "Hook"),
+            "injector output has no edge to the ret and is accepted");
+    }
+
+    /// <summary>
+    /// A method that calls <c>Hook(int)</c> instead of <c>Hook()</c> must not be mistaken for a
+    /// patched method. Matching only declaring type and name would accept this wrong overload.
+    /// </summary>
+    private static void WrongHookOverloadRejected()
+    {
+        var module = NewModule("hook-overload");
+        var type = AddType(module, "Synthetic");
+        AddHook(type);
+        var overload = new MethodDefinition("Hook",
+            MethodAttributes.Public | MethodAttributes.Static, module.TypeSystem.Void);
+        overload.Parameters.Add(new ParameterDefinition("value", ParameterAttributes.None,
+            module.TypeSystem.Int32));
+        overload.Body.GetILProcessor().Emit(OpCodes.Ret);
+        type.Methods.Add(overload);
+
+        var method = AddTarget(module, type, withIntParameter: false);
+        var il = method.Body.GetILProcessor();
+        il.Emit(OpCodes.Ldc_I4_0);
+        il.Emit(OpCodes.Call, overload);
+        il.Emit(OpCodes.Ret);
+
+        Check("completion_wrong_overload_rejected",
+            !GameMethodInjector.HasCompleteCompletionHook(method, SyntheticType, "Hook"),
+            "Hook(int) before ret is not the completion hook");
+        Check("count_calls_ignores_wrong_overload",
+            GameMethodInjector.CountCalls(method, SyntheticType, "Hook") == 0,
+            "only the exact void Hook() signature is counted");
+
+        var entry = new MethodDefinition("Entry",
+            MethodAttributes.Public | MethodAttributes.Static, module.TypeSystem.Void);
+        var entryIl = entry.Body.GetILProcessor();
+        entryIl.Emit(OpCodes.Ldc_I4_0);
+        entryIl.Emit(OpCodes.Call, overload);
+        entryIl.Emit(OpCodes.Ret);
+        type.Methods.Add(entry);
+        Check("entry_wrong_overload_rejected",
+            !GameMethodInjector.HasEntryHook(entry, SyntheticType, "Hook"),
+            "Hook(int) as the first call is not the entry hook");
     }
 
     private static void ShortBranchesAreWidened(string work)

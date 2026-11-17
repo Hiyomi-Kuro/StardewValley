@@ -47,6 +47,12 @@ jobs:
         # No game assemblies, no APK, no device.
         run: python Tools/tests/test_modded_build.py
 
+      - name: APK install-admission synthetic tests
+        # Pure-data tests: baseline / candidate / installed are three different artifacts. The
+        # old predicate compared the candidate with the content baseline and never looked at the
+        # device; these cases pin the corrected decision table without an APK or a device.
+        run: python Tools/tests/test_apk_admission.py
+
       - name: P114 static safety audit
         # Source-text audit: the default probe path has no P/Invoke/mprotect/detour code, the
         # historical T11/T12 files are compiled out, and the deployment scripts have no

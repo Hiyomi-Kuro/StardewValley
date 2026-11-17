@@ -222,7 +222,27 @@ internal static class GameMethodInjector
         return 1;
     }
 
-    /// <summary>Number of direct calls to <paramref name="declaringType"/>.<paramref name="name"/>.</summary>
+    /// <summary>
+    /// True when <paramref name="mr"/> is exactly the hook shape this injector emits: a direct
+    /// call to <paramref name="declaringType"/>.<paramref name="name"/> with return type
+    /// <c>System.Void</c> and no parameters.
+    ///
+    /// Matching only the declaring type and the method name would accept a wrong overload (for
+    /// example <c>Hook(int)</c> next to <c>Hook()</c>), which is exactly the ambiguity this gate
+    /// exists to refuse.
+    /// </summary>
+    private static bool IsHookCall(MethodReference mr, string declaringType, string name)
+    {
+        return string.Equals(mr.DeclaringType.FullName, declaringType, StringComparison.Ordinal) &&
+               string.Equals(mr.Name, name, StringComparison.Ordinal) &&
+               string.Equals(mr.ReturnType.FullName, "System.Void", StringComparison.Ordinal) &&
+               mr.Parameters.Count == 0;
+    }
+
+    /// <summary>
+    /// Number of direct calls whose exact signature is the hook shape
+    /// (<paramref name="declaringType"/>.<paramref name="name"/>, void, no parameters).
+    /// </summary>
     internal static int CountCalls(MethodDefinition method, string declaringType, string name)
     {
         var count = 0;
@@ -230,8 +250,7 @@ internal static class GameMethodInjector
         {
             if ((ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt) &&
                 ins.Operand is MethodReference mr &&
-                string.Equals(mr.DeclaringType.FullName, declaringType, StringComparison.Ordinal) &&
-                string.Equals(mr.Name, name, StringComparison.Ordinal))
+                IsHookCall(mr, declaringType, name))
             {
                 count++;
             }
@@ -242,8 +261,16 @@ internal static class GameMethodInjector
 
     /// <summary>
     /// True when every normal return of <paramref name="method"/> is immediately preceded by the
-    /// named call and there is no other call to it. Used by the idempotent patch path: a method
-    /// that only has <i>some</i> of its returns hooked is a partial patch and is refused.
+    /// exact hook call, no control-flow edge jumps straight at a return (which would bypass the
+    /// call), and there is no other call to it. Used by the idempotent patch path: a method that
+    /// only has <i>some</i> of its returns hooked is a partial patch and is refused.
+    ///
+    /// <para><b>Why the edge check is required.</b> "The call is textually in front of the ret"
+    /// does not prove that every path reaches it. An instruction sequence such as
+    /// <c>br ret; call Hook; ret</c> has the call immediately before the ret, but the branch
+    /// skips it. The injector retargets edges when it patches, so a genuine patch has no edge to
+    /// a ret; an edge that survives means the method is not a complete patch and must be refused
+    /// rather than reported as one.</para>
     /// </summary>
     internal static bool HasCompleteCompletionHook(MethodDefinition method, string declaringType, string name)
     {
@@ -256,6 +283,11 @@ internal static class GameMethodInjector
             }
 
             normalReturns++;
+            if (AnyEdgeTargets(method.Body, ins))
+            {
+                return false;
+            }
+
             var previous = ins.Previous;
             while (previous != null && previous.OpCode == OpCodes.Nop)
             {
@@ -264,8 +296,7 @@ internal static class GameMethodInjector
 
             if (previous is null || previous.OpCode != OpCodes.Call ||
                 previous.Operand is not MethodReference mr ||
-                !string.Equals(mr.DeclaringType.FullName, declaringType, StringComparison.Ordinal) ||
-                !string.Equals(mr.Name, name, StringComparison.Ordinal))
+                !IsHookCall(mr, declaringType, name))
             {
                 return false;
             }
@@ -280,9 +311,38 @@ internal static class GameMethodInjector
         var first = method.Body.Instructions.FirstOrDefault(i => i.OpCode != OpCodes.Nop);
         return first is not null && first.OpCode == OpCodes.Call &&
                first.Operand is MethodReference mr &&
-               string.Equals(mr.DeclaringType.FullName, declaringType, StringComparison.Ordinal) &&
-               string.Equals(mr.Name, name, StringComparison.Ordinal) &&
+               IsHookCall(mr, declaringType, name) &&
                CountCalls(method, declaringType, name) == 1;
+    }
+
+    /// <summary>
+    /// True when any instruction's operand (a branch target or a switch table entry) is
+    /// <paramref name="target"/>. Cecil stores branch targets and switch tables as
+    /// <see cref="Instruction"/> operands, so this covers br/brtrue/brfalse/switch/leave and any
+    /// future branch form without maintaining an opcode list.
+    /// </summary>
+    private static bool AnyEdgeTargets(MethodBody body, Instruction target)
+    {
+        foreach (var ins in body.Instructions)
+        {
+            if (ReferenceEquals(ins.Operand, target))
+            {
+                return true;
+            }
+
+            if (ins.Operand is Instruction[] targets)
+            {
+                for (var i = 0; i < targets.Length; i++)
+                {
+                    if (ReferenceEquals(targets[i], target))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
     }
 
     private static bool IsInsideTry(Instruction ins, MethodBody body)
