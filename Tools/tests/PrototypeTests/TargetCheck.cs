@@ -21,6 +21,22 @@ internal static class TargetCheck
     private const string BridgeNamespace = "Phase21.Prototype";
     private const string BridgeType = "WorldReadyBridge";
 
+    private static readonly string[] BridgeMethods =
+    {
+        PrototypeInjector.ResetEntryHookName,
+        PrototypeInjector.ResetExitHookName,
+        PrototypeInjector.ResetEpochGetterName,
+        PrototypeInjector.StartHookName,
+        PrototypeInjector.CompletionHookName,
+    };
+
+    private static readonly string[] ExpectedChangedMethods =
+    {
+        "System.Void StardewValley.Game1::loadForNewGame(System.Boolean)",
+        "System.Void StardewValley.Game1::OnDayStarted()",
+        "System.Void StardewValley.Game1::ResetGameStateOnTitleScreen()",
+    };
+
     public static int Apply(string inputPath, string outputPath, string? refsDirectory)
     {
         var failures = new List<string>();
@@ -57,6 +73,7 @@ internal static class TargetCheck
         }
 
         var before = PrototypeInjector.Fingerprint(module);
+        var maxStackBefore = PrototypeInjector.MaxStackMap(module);
         var refsBefore = string.Join("|", module.AssemblyReferences.Select(a => a.FullName));
         var originalMvid = module.Mvid;
 
@@ -65,13 +82,19 @@ internal static class TargetCheck
         var injection = PrototypeInjector.Inject(targets, hooks);
         module.Mvid = Guid.NewGuid();
 
-        Console.WriteLine("EVIDENCE load_hook_sites     = " + injection.WorldLoadingCalls);
-        Console.WriteLine("EVIDENCE completion_hook_sites = " + injection.DayCompletedCalls);
-        Console.WriteLine("EVIDENCE handler_returns_skipped = " + injection.SkippedHandlerReturns);
-        Console.WriteLine("EVIDENCE maxstack load       = " + injection.LoadMaxStackBefore + " -> " +
+        Console.WriteLine("EVIDENCE reset_entry_hook_sites   = " + injection.ResetEntryCalls);
+        Console.WriteLine("EVIDENCE reset_exit_hook_sites    = " + injection.ResetCompletedCalls);
+        Console.WriteLine("EVIDENCE reset_handler_returns_skipped = " +
+                          injection.ResetSkippedHandlerReturns);
+        Console.WriteLine("EVIDENCE load_hook_sites          = " + injection.WorldLoadingCalls);
+        Console.WriteLine("EVIDENCE completion_hook_sites    = " + injection.DayCompletedCalls);
+        Console.WriteLine("EVIDENCE handler_returns_skipped  = " + injection.SkippedHandlerReturns);
+        Console.WriteLine("EVIDENCE maxstack reset           = " + injection.ResetMaxStackBefore +
+                          " -> " + injection.ResetMaxStackAfter);
+        Console.WriteLine("EVIDENCE maxstack load            = " + injection.LoadMaxStackBefore + " -> " +
                           injection.LoadMaxStackAfter);
-        Console.WriteLine("EVIDENCE maxstack completion = " + injection.CompletionMaxStackBefore + " -> " +
-                          injection.CompletionMaxStackAfter);
+        Console.WriteLine("EVIDENCE maxstack completion      = " + injection.CompletionMaxStackBefore +
+                          " -> " + injection.CompletionMaxStackAfter);
 
         var directory = Path.GetDirectoryName(Path.GetFullPath(outputPath));
         if (!string.IsNullOrEmpty(directory))
@@ -107,28 +130,31 @@ internal static class TargetCheck
             return 1;
         }
 
-        var worldLoading = bridge.Methods.FirstOrDefault(m => m.Name == PrototypeInjector.StartHookName);
-        var dayCompleted = bridge.Methods.FirstOrDefault(m => m.Name == PrototypeInjector.CompletionHookName);
-        if (worldLoading is null || dayCompleted is null)
+        var hookRefs = ResolveBridgeHooks(bridge);
+        if (hookRefs is null)
         {
             failures.Add("bridge hook methods missing after write");
             Report(failures);
             return 1;
         }
 
-        var verification = PrototypeInjector.Verify(writtenTargets,
-            new PrototypeHooks(worldLoading, dayCompleted));
+        var verification = PrototypeInjector.Verify(writtenTargets, hookRefs);
         foreach (var problem in verification.Problems)
         {
             failures.Add("verify: " + problem);
         }
 
-        Console.WriteLine("EVIDENCE verify_start_calls      = " + verification.WorldLoadingCalls);
-        Console.WriteLine("EVIDENCE verify_completion_calls = " + verification.DayCompletedCalls);
-        Console.WriteLine("EVIDENCE normal_returns          = " + verification.NormalReturns);
-        Console.WriteLine("EVIDENCE handler_returns         = " + verification.HandlerReturns);
-        Console.WriteLine("EVIDENCE edges_to_normal_returns = " + verification.EdgesToNormalReturns);
-        Console.WriteLine("EVIDENCE mvid_changed            = " + (written.Mvid != originalMvid));
+        Console.WriteLine("EVIDENCE verify_reset_entry_calls      = " + verification.ResetEntryCalls);
+        Console.WriteLine("EVIDENCE verify_reset_completed_calls  = " + verification.ResetCompletedCalls);
+        Console.WriteLine("EVIDENCE verify_reset_normal_returns   = " + verification.ResetNormalReturns);
+        Console.WriteLine("EVIDENCE verify_reset_handler_returns  = " + verification.ResetHandlerReturns);
+        Console.WriteLine("EVIDENCE verify_start_calls            = " + verification.WorldLoadingCalls);
+        Console.WriteLine("EVIDENCE verify_epoch_read_first       = " + verification.EpochReadFirst);
+        Console.WriteLine("EVIDENCE verify_completion_calls       = " + verification.DayCompletedCalls);
+        Console.WriteLine("EVIDENCE normal_returns                = " + verification.NormalReturns);
+        Console.WriteLine("EVIDENCE handler_returns               = " + verification.HandlerReturns);
+        Console.WriteLine("EVIDENCE edges_to_normal_returns       = " + verification.EdgesToNormalReturns);
+        Console.WriteLine("EVIDENCE mvid_changed                  = " + (written.Mvid != originalMvid));
 
         if (string.Join("|", written.AssemblyReferences.Select(a => a.FullName)) != refsBefore)
         {
@@ -155,12 +181,7 @@ internal static class TargetCheck
 
         Console.WriteLine("EVIDENCE removed_methods = " + removed.Count);
 
-        var expectedChanged = new[]
-        {
-            "System.Void StardewValley.Game1::loadForNewGame(System.Boolean)",
-            "System.Void StardewValley.Game1::OnDayStarted()",
-        };
-        foreach (var expected in expectedChanged)
+        foreach (var expected in ExpectedChangedMethods)
         {
             if (!changed.Contains(expected, StringComparer.Ordinal))
             {
@@ -170,7 +191,7 @@ internal static class TargetCheck
 
         foreach (var name in changed)
         {
-            if (!expectedChanged.Contains(name, StringComparer.Ordinal))
+            if (!ExpectedChangedMethods.Contains(name, StringComparer.Ordinal))
             {
                 failures.Add("unexpected method changed: " + name);
             }
@@ -181,13 +202,15 @@ internal static class TargetCheck
             failures.Add("methods disappeared");
         }
 
-        if (added.Count != 2 || added.Any(a =>
+        if (added.Count != BridgeMethods.Length || added.Any(a =>
                 !a.Contains(" " + BridgeNamespace + "." + BridgeType + "::", StringComparison.Ordinal)))
         {
-            failures.Add("added methods are not exactly the two bridge methods");
+            failures.Add("added methods are not exactly the " + BridgeMethods.Length +
+                         " bridge methods");
         }
 
         CheckBridgeFields(bridge, failures);
+        ReportMaxStackNormalisation(maxStackBefore, written, failures);
 
         Report(failures);
         return failures.Count == 0 ? 0 : 1;
@@ -210,21 +233,28 @@ internal static class TargetCheck
         }
         else
         {
-            var worldLoading = bridge.Methods.FirstOrDefault(m => m.Name == PrototypeInjector.StartHookName);
-            var dayCompleted = bridge.Methods.FirstOrDefault(m => m.Name == PrototypeInjector.CompletionHookName);
-            if (worldLoading is null || dayCompleted is null)
+            var hookRefs = ResolveBridgeHooks(bridge);
+            if (hookRefs is null)
             {
                 failures.Add("bridge hook methods missing");
             }
             else
             {
                 var targets = PrototypeInjector.Resolve(module);
-                var verification = PrototypeInjector.Verify(targets,
-                    new PrototypeHooks(worldLoading, dayCompleted));
+                var verification = PrototypeInjector.Verify(targets, hookRefs);
                 failures.AddRange(verification.Problems.Select(p => "verify: " + p));
-                Console.WriteLine("EVIDENCE verify_start_calls      = " + verification.WorldLoadingCalls);
-                Console.WriteLine("EVIDENCE verify_completion_calls = " + verification.DayCompletedCalls);
-                Console.WriteLine("EVIDENCE normal_returns          = " + verification.NormalReturns);
+                Console.WriteLine("EVIDENCE verify_reset_entry_calls     = " +
+                                  verification.ResetEntryCalls);
+                Console.WriteLine("EVIDENCE verify_reset_completed_calls = " +
+                                  verification.ResetCompletedCalls);
+                Console.WriteLine("EVIDENCE verify_start_calls           = " +
+                                  verification.WorldLoadingCalls);
+                Console.WriteLine("EVIDENCE verify_epoch_read_first      = " +
+                                  verification.EpochReadFirst);
+                Console.WriteLine("EVIDENCE verify_completion_calls      = " +
+                                  verification.DayCompletedCalls);
+                Console.WriteLine("EVIDENCE normal_returns               = " +
+                                  verification.NormalReturns);
             }
 
             CheckBridgeFields(bridge, failures);
@@ -234,12 +264,30 @@ internal static class TargetCheck
         return failures.Count == 0 ? 0 : 1;
     }
 
+    private static PrototypeHooks? ResolveBridgeHooks(TypeDefinition bridge)
+    {
+        var resetBegan = bridge.Methods.FirstOrDefault(m => m.Name == PrototypeInjector.ResetEntryHookName);
+        var resetCompleted = bridge.Methods.FirstOrDefault(m => m.Name == PrototypeInjector.ResetExitHookName);
+        var getEpoch = bridge.Methods.FirstOrDefault(m => m.Name == PrototypeInjector.ResetEpochGetterName);
+        var worldLoading = bridge.Methods.FirstOrDefault(m => m.Name == PrototypeInjector.StartHookName);
+        var dayCompleted = bridge.Methods.FirstOrDefault(m => m.Name == PrototypeInjector.CompletionHookName);
+        if (resetBegan is null || resetCompleted is null || getEpoch is null || worldLoading is null ||
+            dayCompleted is null)
+        {
+            return null;
+        }
+
+        return new PrototypeHooks(resetBegan, resetCompleted, getEpoch, worldLoading, dayCompleted);
+    }
+
     private static void CheckBridgeFields(TypeDefinition bridge, List<string> failures)
     {
         foreach (var name in new[]
                  {
-                     "WorldLoadingCalls", "DayCompletedCalls", "LastLoadedGame", "LastHasLoadedGame",
-                     "LastGameMode", "LastLoaderWasNull",
+                     "ResetBeganCalls", "ResetCompletedCalls", "GetResetEpochCalls", "EpochCounter",
+                     "LastResetEpochAtStart", "LastResetEpochOnExit", "WorldLoadingCalls",
+                     "DayCompletedCalls", "LastLoadedGame", "LastHasLoadedGame", "LastGameMode",
+                     "LastLoaderWasNull",
                  })
         {
             var field = bridge.Fields.FirstOrDefault(f => f.Name == name);
@@ -248,6 +296,44 @@ internal static class TargetCheck
                 failures.Add("bridge field missing or not static: " + name);
             }
         }
+    }
+
+    /// <summary>
+    /// Cecil recomputes maxstack for every written method, so methods unrelated to the three hook
+    /// sites can change their maxstack value. That is a metadata normalisation, not a semantic
+    /// edit; it is listed separately and never counted as a changed method.
+    /// </summary>
+    private static void ReportMaxStackNormalisation(Dictionary<string, int> before,
+        ModuleDefinition written, List<string> failures)
+    {
+        var after = PrototypeInjector.MaxStackMap(written);
+        var normalised = new List<string>();
+        foreach (var pair in before)
+        {
+            if (after.TryGetValue(pair.Key, out var value) && value != pair.Value)
+            {
+                normalised.Add(pair.Key + " " + pair.Value + "->" + value);
+            }
+        }
+
+        normalised.Sort(StringComparer.Ordinal);
+        Console.WriteLine("EVIDENCE maxstack_normalised_methods = " + normalised.Count);
+        foreach (var item in normalised)
+        {
+            Console.WriteLine("EVIDENCE   maxstack: " + item);
+        }
+
+        foreach (var hooked in ExpectedChangedMethods)
+        {
+            if (before.TryGetValue(hooked, out var hookedBefore) &&
+                after.TryGetValue(hooked, out var hookedAfter))
+            {
+                Console.WriteLine("EVIDENCE maxstack_hooked: " + hooked + " " + hookedBefore + "->" +
+                                  hookedAfter);
+            }
+        }
+
+        _ = failures;
     }
 
     private static void Report(List<string> failures)

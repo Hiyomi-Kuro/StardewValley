@@ -14,16 +14,17 @@ public sealed class PrototypeInjectionException : Exception
     }
 }
 
-/// <summary>The two game methods and the three state members the prototype reads.</summary>
+/// <summary>The three game methods and the three state members the prototype reads.</summary>
 public sealed class PrototypeTargets
 {
     public PrototypeTargets(ModuleDefinition module, MethodDefinition loadForNewGame,
-        MethodDefinition onDayStarted, MethodReference getGameMode, FieldDefinition hasLoadedGame,
-        FieldDefinition currentLoader)
+        MethodDefinition onDayStarted, MethodDefinition resetGameStateOnTitleScreen,
+        MethodReference getGameMode, FieldDefinition hasLoadedGame, FieldDefinition currentLoader)
     {
         Module = module;
         LoadForNewGame = loadForNewGame;
         OnDayStarted = onDayStarted;
+        ResetGameStateOnTitleScreen = resetGameStateOnTitleScreen;
         GetGameMode = getGameMode;
         HasLoadedGame = hasLoadedGame;
         CurrentLoader = currentLoader;
@@ -35,6 +36,9 @@ public sealed class PrototypeTargets
 
     public MethodDefinition OnDayStarted { get; }
 
+    /// <summary>The reset/invalidations boundary: <c>public virtual instance void()</c>.</summary>
+    public MethodDefinition ResetGameStateOnTitleScreen { get; }
+
     public MethodReference GetGameMode { get; }
 
     public FieldDefinition HasLoadedGame { get; }
@@ -45,13 +49,26 @@ public sealed class PrototypeTargets
 /// <summary>The hook methods to call, with the exact prototypes this injector emits.</summary>
 public sealed class PrototypeHooks
 {
-    public PrototypeHooks(MethodReference worldLoading, MethodReference dayCompleted)
+    public PrototypeHooks(MethodReference resetBegan, MethodReference resetCompleted,
+        MethodReference getResetEpoch, MethodReference worldLoading, MethodReference dayCompleted)
     {
+        ResetBegan = resetBegan;
+        ResetCompleted = resetCompleted;
+        GetResetEpoch = getResetEpoch;
         WorldLoading = worldLoading;
         DayCompleted = dayCompleted;
     }
 
-    /// <summary><c>void WorldLoading(bool loadedGame, object loader, int gameMode)</c>.</summary>
+    /// <summary><c>void ResetBegan()</c>.</summary>
+    public MethodReference ResetBegan { get; }
+
+    /// <summary><c>void ResetCompleted()</c>.</summary>
+    public MethodReference ResetCompleted { get; }
+
+    /// <summary><c>long GetResetEpoch()</c>.</summary>
+    public MethodReference GetResetEpoch { get; }
+
+    /// <summary><c>void WorldLoading(long resetEpoch, bool loadedGame, int gameMode, object loader)</c>.</summary>
     public MethodReference WorldLoading { get; }
 
     /// <summary><c>void DayCompleted(int gameMode, bool hasLoadedGame, object loader)</c>.</summary>
@@ -61,6 +78,12 @@ public sealed class PrototypeHooks
 /// <summary>Counts returned by one injection pass.</summary>
 public sealed class PrototypeInjectionResult
 {
+    public int ResetEntryCalls { get; internal set; }
+
+    public int ResetCompletedCalls { get; internal set; }
+
+    public int ResetSkippedHandlerReturns { get; internal set; }
+
     public int WorldLoadingCalls { get; internal set; }
 
     public int DayCompletedCalls { get; internal set; }
@@ -74,6 +97,10 @@ public sealed class PrototypeInjectionResult
     public int CompletionMaxStackBefore { get; internal set; }
 
     public int CompletionMaxStackAfter { get; internal set; }
+
+    public int ResetMaxStackBefore { get; internal set; }
+
+    public int ResetMaxStackAfter { get; internal set; }
 }
 
 /// <summary>Structural verification of one (possibly already written) module.</summary>
@@ -91,6 +118,14 @@ public sealed class PrototypeVerification
         get { return _problems.Count == 0; }
     }
 
+    public int ResetEntryCalls { get; internal set; }
+
+    public int ResetCompletedCalls { get; internal set; }
+
+    public int ResetNormalReturns { get; internal set; }
+
+    public int ResetHandlerReturns { get; internal set; }
+
     public int WorldLoadingCalls { get; internal set; }
 
     public int DayCompletedCalls { get; internal set; }
@@ -100,6 +135,12 @@ public sealed class PrototypeVerification
     public int HandlerReturns { get; internal set; }
 
     public int EdgesToNormalReturns { get; internal set; }
+
+    /// <summary>
+    /// True when the start call site reads the epoch before <c>gameMode</c> and the loader. This is
+    /// the instruction order the reset/start race depends on.
+    /// </summary>
+    public bool EpochReadFirst { get; internal set; }
 
     internal void Fail(string problem)
     {
@@ -117,11 +158,19 @@ public sealed class PrototypeVerification
 ///
 /// <para>The emitted call sequences are exactly the minimum the coordinator needs:</para>
 /// <code>
+/// ResetGameStateOnTitleScreen() entry:
+///   call   ResetBegan()
+///
+/// ResetGameStateOnTitleScreen() normal ret:
+///   call   ResetCompleted()
+///   ret
+///
 /// loadForNewGame(bool) entry:
+///   call   GetResetEpoch()        ; epoch FIRST, before any game field is read
 ///   ldarg.1                       ; loadedGame
-///   ldsfld Game1::currentLoader
-///   call   Game1::get_gameMode()
-///   call   WorldLoading(bool, object, int)
+///   call   Game1::get_gameMode()  ; then the mode
+///   ldsfld Game1::currentLoader    ; then the loader
+///   call   WorldLoading(long, bool, int, object)
 ///
 /// OnDayStarted() normal ret:
 ///   call   Game1::get_gameMode()
@@ -136,10 +185,18 @@ public static class PrototypeInjector
     public const string DefaultGame1Type = "StardewValley.Game1";
     public const string StartHookName = "WorldLoading";
     public const string CompletionHookName = "DayCompleted";
+    public const string ResetEntryHookName = "ResetBegan";
+    public const string ResetExitHookName = "ResetCompleted";
+    public const string ResetEpochGetterName = "GetResetEpoch";
+    public const string ResetMethodName = "ResetGameStateOnTitleScreen";
+
+    private static readonly string[] NoParameters = Array.Empty<string>();
+
+    private static readonly string[] EpochGetterSignature = NoParameters;
 
     private static readonly string[] StartHookSignature =
     {
-        "System.Boolean", "System.Object", "System.Int32",
+        "System.Int64", "System.Boolean", "System.Int32", "System.Object",
     };
 
     private static readonly string[] CompletionHookSignature =
@@ -147,7 +204,7 @@ public static class PrototypeInjector
         "System.Int32", "System.Boolean", "System.Object",
     };
 
-    /// <summary>Resolves the two methods and three state members by exact structural shape.</summary>
+    /// <summary>Resolves the three methods and three state members by exact structural shape.</summary>
     public static PrototypeTargets Resolve(ModuleDefinition module, string game1TypeName = DefaultGame1Type)
     {
         var type = module.GetType(game1TypeName)
@@ -155,6 +212,7 @@ public static class PrototypeInjector
 
         var loadMatches = new List<MethodDefinition>();
         var dayMatches = new List<MethodDefinition>();
+        var resetMatches = new List<MethodDefinition>();
         foreach (var method in type.Methods)
         {
             if (method.HasGenericParameters)
@@ -179,6 +237,15 @@ public static class PrototypeInjector
             {
                 dayMatches.Add(method);
             }
+
+            if (string.Equals(method.Name, ResetMethodName, StringComparison.Ordinal) &&
+                !method.IsStatic && method.HasThis &&
+                method.ReturnType.FullName == "System.Void" &&
+                method.Parameters.Count == 0 &&
+                method.HasBody && method.Body.Instructions.Count > 0)
+            {
+                resetMatches.Add(method);
+            }
         }
 
         if (loadMatches.Count != 1)
@@ -193,6 +260,13 @@ public static class PrototypeInjector
             throw new PrototypeInjectionException(
                 "expected exactly one static void " + game1TypeName +
                 "::OnDayStarted(); found " + Describe(type, "OnDayStarted"));
+        }
+
+        if (resetMatches.Count != 1)
+        {
+            throw new PrototypeInjectionException(
+                "expected exactly one instance void " + game1TypeName + "::" + ResetMethodName +
+                "(); found " + Describe(type, ResetMethodName));
         }
 
         var getGameMode = type.Methods.FirstOrDefault(m =>
@@ -214,26 +288,33 @@ public static class PrototypeInjector
                 "currentLoader must be a reference type, found " + currentLoader.FieldType.FullName);
         }
 
-        return new PrototypeTargets(module, loadMatches[0], dayMatches[0], getGameMode,
-            hasLoadedGame, currentLoader);
+        return new PrototypeTargets(module, loadMatches[0], dayMatches[0], resetMatches[0],
+            getGameMode, hasLoadedGame, currentLoader);
     }
 
-    /// <summary>Places both hooks. Refuses an already-injected or unsupported method.</summary>
+    /// <summary>Places all three hooks. Refuses an already-injected or unsupported method.</summary>
     public static PrototypeInjectionResult Inject(PrototypeTargets targets, PrototypeHooks hooks)
     {
-        RequireHookShape(hooks.WorldLoading, StartHookName, StartHookSignature);
-        RequireHookShape(hooks.DayCompleted, CompletionHookName, CompletionHookSignature);
+        RequireHookShape(hooks.ResetBegan, ResetEntryHookName, "System.Void", NoParameters);
+        RequireHookShape(hooks.ResetCompleted, ResetExitHookName, "System.Void", NoParameters);
+        RequireHookShape(hooks.GetResetEpoch, ResetEpochGetterName, "System.Int64",
+            EpochGetterSignature);
+        RequireHookShape(hooks.WorldLoading, StartHookName, "System.Void", StartHookSignature);
+        RequireHookShape(hooks.DayCompleted, CompletionHookName, "System.Void",
+            CompletionHookSignature);
 
         var load = targets.LoadForNewGame;
         var day = targets.OnDayStarted;
+        var reset = targets.ResetGameStateOnTitleScreen;
 
-        var existingStart = CountCalls(load, hooks.WorldLoading);
-        var existingCompletion = CountCalls(day, hooks.DayCompleted);
-        if (existingStart > 0 || existingCompletion > 0)
+        var existing = CountCalls(reset, hooks.ResetBegan) + CountCalls(reset, hooks.ResetCompleted) +
+                       CountCalls(load, hooks.WorldLoading) + CountCalls(load, hooks.GetResetEpoch) +
+                       CountCalls(day, hooks.DayCompleted);
+        if (existing > 0)
         {
             throw new PrototypeInjectionException(
-                "prototype hooks already present (start=" + existingStart + ", completion=" +
-                existingCompletion + "); refusing to patch twice");
+                "prototype hooks already present (total call sites=" + existing +
+                "); refusing to patch twice");
         }
 
         var result = new PrototypeInjectionResult
@@ -242,14 +323,95 @@ public static class PrototypeInjector
             LoadMaxStackAfter = load.Body.MaxStackSize,
             CompletionMaxStackBefore = day.Body.MaxStackSize,
             CompletionMaxStackAfter = day.Body.MaxStackSize,
+            ResetMaxStackBefore = reset.Body.MaxStackSize,
+            ResetMaxStackAfter = reset.Body.MaxStackSize,
         };
 
+        InjectResetEntry(targets, hooks, result);
+        InjectResetCompletion(targets, hooks, result);
         InjectEntry(targets, hooks, result);
         InjectCompletion(targets, hooks, result);
         return result;
     }
 
-    private static void InjectEntry(PrototypeTargets targets, PrototypeHooks hooks, PrototypeInjectionResult result)
+    private static void InjectResetEntry(PrototypeTargets targets, PrototypeHooks hooks,
+        PrototypeInjectionResult result)
+    {
+        var method = targets.ResetGameStateOnTitleScreen;
+        var body = method.Body;
+        var first = body.Instructions[0];
+        if (IsInsideTry(first, body) || IsInsideHandler(first, body))
+        {
+            throw new PrototypeInjectionException(
+                "unsupported control flow: the first instruction of " + method.FullName +
+                " is inside a protected region");
+        }
+
+        var il = body.GetILProcessor();
+        var call = il.Create(OpCodes.Call, hooks.ResetBegan);
+        il.InsertBefore(first, call);
+
+        result.ResetEntryCalls = 1;
+        result.ResetMaxStackAfter = body.MaxStackSize;
+
+        WidenShortBranches(method);
+    }
+
+    private static void InjectResetCompletion(PrototypeTargets targets, PrototypeHooks hooks,
+        PrototypeInjectionResult result)
+    {
+        var method = targets.ResetGameStateOnTitleScreen;
+        var body = method.Body;
+        var normalReturns = new List<Instruction>();
+        var handlerReturns = 0;
+
+        foreach (var ins in body.Instructions)
+        {
+            if (ins.OpCode.Code != Code.Ret)
+            {
+                continue;
+            }
+
+            if (IsInsideTry(ins, body))
+            {
+                throw new PrototypeInjectionException(
+                    "unsupported control flow: a ret inside a try region in " + method.FullName);
+            }
+
+            if (IsInsideHandler(ins, body))
+            {
+                handlerReturns++;
+                continue;
+            }
+
+            normalReturns.Add(ins);
+        }
+
+        if (normalReturns.Count == 0)
+        {
+            throw new PrototypeInjectionException(
+                "no normal completion path in " + method.FullName +
+                " (all returns are inside handlers or there is none)");
+        }
+
+        var il = body.GetILProcessor();
+        foreach (var ret in normalReturns)
+        {
+            var call = il.Create(OpCodes.Call, hooks.ResetCompleted);
+            il.InsertBefore(ret, call);
+            RetargetEdges(body, ret, call);
+            MoveBoundaries(body, ret, call);
+        }
+
+        result.ResetCompletedCalls = normalReturns.Count;
+        result.ResetSkippedHandlerReturns = handlerReturns;
+        result.ResetMaxStackAfter = Math.Max(body.MaxStackSize, 1);
+
+        WidenShortBranches(method);
+    }
+
+    private static void InjectEntry(PrototypeTargets targets, PrototypeHooks hooks,
+        PrototypeInjectionResult result)
     {
         var method = targets.LoadForNewGame;
         var body = method.Body;
@@ -263,23 +425,27 @@ public static class PrototypeInjector
 
         var il = body.GetILProcessor();
         var call = il.Create(OpCodes.Call, hooks.WorldLoading);
-        var getMode = il.Create(OpCodes.Call, targets.GetGameMode);
         var loadLoader = il.Create(OpCodes.Ldsfld, targets.CurrentLoader);
+        var getMode = il.Create(OpCodes.Call, targets.GetGameMode);
         var loadFlag = il.Create(OpCodes.Ldarg, method.Parameters[0]);
+        var getEpoch = il.Create(OpCodes.Call, hooks.GetResetEpoch);
 
+        // Push order == parameter order: epoch, loadedGame, gameMode, loader.
         il.InsertBefore(first, call);
-        il.InsertBefore(call, getMode);
-        il.InsertBefore(getMode, loadLoader);
-        il.InsertBefore(loadLoader, loadFlag);
+        il.InsertBefore(call, loadLoader);
+        il.InsertBefore(loadLoader, getMode);
+        il.InsertBefore(getMode, loadFlag);
+        il.InsertBefore(loadFlag, getEpoch);
 
-        body.MaxStackSize = Math.Max(body.MaxStackSize, 3);
+        body.MaxStackSize = Math.Max(body.MaxStackSize, 4);
         result.LoadMaxStackAfter = body.MaxStackSize;
         result.WorldLoadingCalls = 1;
 
         WidenShortBranches(method);
     }
 
-    private static void InjectCompletion(PrototypeTargets targets, PrototypeHooks hooks, PrototypeInjectionResult result)
+    private static void InjectCompletion(PrototypeTargets targets, PrototypeHooks hooks,
+        PrototypeInjectionResult result)
     {
         var method = targets.OnDayStarted;
         var body = method.Body;
@@ -343,16 +509,100 @@ public static class PrototypeInjector
         WidenShortBranches(method);
     }
 
-    /// <summary>Checks the exact hook call sites and prototypes on a module.</summary>
+    /// <summary>Checks the exact hook call sites, prototypes and instruction order on a module.</summary>
     public static PrototypeVerification Verify(PrototypeTargets targets, PrototypeHooks hooks)
     {
         var report = new PrototypeVerification();
-        RequireHookShape(hooks.WorldLoading, StartHookName, StartHookSignature, report);
-        RequireHookShape(hooks.DayCompleted, CompletionHookName, CompletionHookSignature, report);
+        RequireHookShape(hooks.ResetBegan, ResetEntryHookName, "System.Void", NoParameters, report);
+        RequireHookShape(hooks.ResetCompleted, ResetExitHookName, "System.Void", NoParameters, report);
+        RequireHookShape(hooks.GetResetEpoch, ResetEpochGetterName, "System.Int64",
+            EpochGetterSignature, report);
+        RequireHookShape(hooks.WorldLoading, StartHookName, "System.Void", StartHookSignature, report);
+        RequireHookShape(hooks.DayCompleted, CompletionHookName, "System.Void",
+            CompletionHookSignature, report);
 
+        VerifyReset(targets, hooks, report);
+        VerifyStart(targets, hooks, report);
+        VerifyCompletion(targets, hooks, report);
+        return report;
+    }
+
+    private static void VerifyReset(PrototypeTargets targets, PrototypeHooks hooks,
+        PrototypeVerification report)
+    {
+        var reset = targets.ResetGameStateOnTitleScreen;
+        report.ResetEntryCalls = CountCalls(reset, hooks.ResetBegan);
+        if (report.ResetEntryCalls != 1)
+        {
+            report.Fail("ResetBegan call sites != 1: " + report.ResetEntryCalls);
+        }
+
+        var instructions = reset.Body.Instructions;
+        var firstIndex = 0;
+        while (firstIndex < instructions.Count && instructions[firstIndex].OpCode == OpCodes.Nop)
+        {
+            firstIndex++;
+        }
+
+        if (firstIndex >= instructions.Count ||
+            instructions[firstIndex].OpCode != OpCodes.Call ||
+            !IsHookCall(instructions[firstIndex], hooks.ResetBegan))
+        {
+            report.Fail("ResetGameStateOnTitleScreen does not start with the ResetBegan call");
+        }
+
+        var normalReturns = 0;
+        foreach (var ins in reset.Body.Instructions)
+        {
+            if (ins.OpCode.Code != Code.Ret)
+            {
+                continue;
+            }
+
+            if (IsInsideTry(ins, reset.Body))
+            {
+                report.Fail("a ret is inside a try region in ResetGameStateOnTitleScreen");
+                continue;
+            }
+
+            if (IsInsideHandler(ins, reset.Body))
+            {
+                report.ResetHandlerReturns++;
+                continue;
+            }
+
+            normalReturns++;
+            if (AnyEdgeTargets(reset.Body, ins))
+            {
+                report.Fail("a control-flow edge still targets the reset normal ret (hook bypassed)");
+            }
+
+            var previous = ins.Previous;
+            while (previous != null && previous.OpCode == OpCodes.Nop)
+            {
+                previous = previous.Previous;
+            }
+
+            if (previous is null || previous.OpCode != OpCodes.Call ||
+                !IsHookCall(previous, hooks.ResetCompleted))
+            {
+                report.Fail("the reset normal ret is not immediately preceded by ResetCompleted");
+            }
+        }
+
+        report.ResetNormalReturns = normalReturns;
+        report.ResetCompletedCalls = CountCalls(reset, hooks.ResetCompleted);
+        if (report.ResetCompletedCalls != normalReturns)
+        {
+            report.Fail("ResetCompleted call sites (" + report.ResetCompletedCalls +
+                        ") != normal returns (" + normalReturns + ")");
+        }
+    }
+
+    private static void VerifyStart(PrototypeTargets targets, PrototypeHooks hooks,
+        PrototypeVerification report)
+    {
         var load = targets.LoadForNewGame;
-        var day = targets.OnDayStarted;
-
         report.WorldLoadingCalls = CountCalls(load, hooks.WorldLoading);
         if (report.WorldLoadingCalls != 1)
         {
@@ -366,19 +616,35 @@ public static class PrototypeInjector
             firstIndex++;
         }
 
-        var entryOk = firstIndex + 3 < instructions.Count &&
-                      instructions[firstIndex].OpCode == OpCodes.Ldarg &&
-                      instructions[firstIndex].Operand is ParameterDefinition parameter &&
-                      parameter.Index == load.Parameters[0].Index &&
-                      IsFieldLoad(instructions[firstIndex + 1], targets.CurrentLoader) &&
-                      IsMethodCall(instructions[firstIndex + 2], targets.GetGameMode) &&
-                      instructions[firstIndex + 3].OpCode == OpCodes.Call &&
-                      IsHookCall(instructions[firstIndex + 3], hooks.WorldLoading);
-        if (!entryOk)
+        var epochFirst = firstIndex + 4 < instructions.Count &&
+                         instructions[firstIndex].OpCode == OpCodes.Call &&
+                         IsHookCall(instructions[firstIndex], hooks.GetResetEpoch) &&
+                         instructions[firstIndex + 1].OpCode == OpCodes.Ldarg &&
+                         instructions[firstIndex + 1].Operand is ParameterDefinition parameter &&
+                         parameter.Index == load.Parameters[0].Index &&
+                         IsMethodCall(instructions[firstIndex + 2], targets.GetGameMode) &&
+                         IsFieldLoad(instructions[firstIndex + 3], targets.CurrentLoader) &&
+                         instructions[firstIndex + 4].OpCode == OpCodes.Call &&
+                         IsHookCall(instructions[firstIndex + 4], hooks.WorldLoading);
+
+        report.EpochReadFirst = epochFirst;
+        if (!epochFirst)
         {
-            report.Fail("loadForNewGame does not start with the WorldLoading argument sequence");
+            report.Fail("loadForNewGame does not start with GetResetEpoch, loadedGame, " +
+                        "get_gameMode, currentLoader, WorldLoading (epoch must be read first)");
         }
 
+        var epochReads = CountCalls(load, hooks.GetResetEpoch);
+        if (epochReads != 1)
+        {
+            report.Fail("GetResetEpoch call sites != 1: " + epochReads);
+        }
+    }
+
+    private static void VerifyCompletion(PrototypeTargets targets, PrototypeHooks hooks,
+        PrototypeVerification report)
+    {
+        var day = targets.OnDayStarted;
         var normalReturns = 0;
         foreach (var ins in day.Body.Instructions)
         {
@@ -411,7 +677,8 @@ public static class PrototypeInjector
                 previous = previous.Previous;
             }
 
-            if (previous is null || previous.OpCode != OpCodes.Call || !IsHookCall(previous, hooks.DayCompleted))
+            if (previous is null || previous.OpCode != OpCodes.Call ||
+                !IsHookCall(previous, hooks.DayCompleted))
             {
                 report.Fail("a normal ret is not immediately preceded by the DayCompleted call");
             }
@@ -432,11 +699,9 @@ public static class PrototypeInjector
                 report.EdgesToNormalReturns++;
             }
         }
-
-        return report;
     }
 
-    /// <summary>Exact hook call count (declaring type, name, void return, exact parameters).</summary>
+    /// <summary>Exact hook call count (declaring type, name, return type, exact parameters).</summary>
     public static int CountCalls(MethodDefinition method, MethodReference hook)
     {
         var count = 0;
@@ -452,7 +717,7 @@ public static class PrototypeInjector
     }
 
     /// <summary>
-    /// Per-method structural fingerprint. Used to prove that only the two intended methods changed
+    /// Per-method structural fingerprint. Used to prove that only the intended methods changed
     /// when the prototype is applied to a temporary copy of the target assembly.
     /// </summary>
     public static Dictionary<string, string> Fingerprint(ModuleDefinition module)
@@ -481,6 +746,37 @@ public static class PrototypeInjector
         return result;
     }
 
+    /// <summary>
+    /// MaxStackSize per method, keyed like <see cref="Fingerprint"/>. Cecil recomputes maxstack
+    /// when it writes a module, so this is reported separately: it is a metadata normalisation,
+    /// not a semantic edit.
+    /// </summary>
+    public static Dictionary<string, int> MaxStackMap(ModuleDefinition module)
+    {
+        var result = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var type in module.GetTypes())
+        {
+            foreach (var method in type.Methods)
+            {
+                if (!method.HasBody)
+                {
+                    continue;
+                }
+
+                var key = method.FullName;
+                var suffix = 1;
+                while (result.ContainsKey(key))
+                {
+                    key = method.FullName + "#" + suffix++;
+                }
+
+                result[key] = method.Body.MaxStackSize;
+            }
+        }
+
+        return result;
+    }
+
     private static string FingerprintMethod(MethodDefinition method)
     {
         var body = method.Body;
@@ -494,7 +790,8 @@ public static class PrototypeInjector
         var sb = new StringBuilder();
         // MaxStackSize is deliberately excluded: Cecil recomputes it for every written method
         // (the original metadata is often more generous than the IL needs). That is a metadata
-        // normalisation, not a semantic edit; the hooked methods' stacks are checked separately.
+        // normalisation, not a semantic edit; the hooked methods' stacks are checked separately
+        // and the full normalisation range is reported by the target check.
         sb.Append("init=").Append(body.InitLocals).Append(';');
         foreach (var local in body.Variables)
         {
@@ -573,8 +870,8 @@ public static class PrototypeInjector
         return index.TryGetValue(instruction, out var value) ? value.ToString(CultureInfo.InvariantCulture) : "?";
     }
 
-    private static void RequireHookShape(MethodReference hook, string name, string[] parameters,
-        PrototypeVerification? report = null)
+    private static void RequireHookShape(MethodReference hook, string name, string returnType,
+        string[] parameters, PrototypeVerification? report = null)
     {
         void Fail(string problem)
         {
@@ -592,9 +889,9 @@ public static class PrototypeInjector
             return;
         }
 
-        if (hook.ReturnType.FullName != "System.Void")
+        if (hook.ReturnType.FullName != returnType)
         {
-            Fail("hook " + name + " must return System.Void");
+            Fail("hook " + name + " must return " + returnType + ", got " + hook.ReturnType.FullName);
             return;
         }
 
@@ -635,7 +932,7 @@ public static class PrototypeInjector
         return ins.Operand is MethodReference mr &&
                string.Equals(mr.DeclaringType.FullName, hook.DeclaringType.FullName, StringComparison.Ordinal) &&
                string.Equals(mr.Name, hook.Name, StringComparison.Ordinal) &&
-               mr.ReturnType.FullName == "System.Void" &&
+               mr.ReturnType.FullName == hook.ReturnType.FullName &&
                mr.Parameters.Count == hook.Parameters.Count &&
                ParametersMatch(mr, hook);
     }

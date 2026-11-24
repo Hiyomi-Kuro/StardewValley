@@ -4,10 +4,80 @@ using Phase21.WorldReady;
 
 namespace Phase21PrototypeTests;
 
+/// <summary>Shape of the synthetic <c>ResetGameStateOnTitleScreen</c> body.</summary>
+internal enum ResetShape
+{
+    /// <summary>Gate, then clear mode/loader/flag, then return (mirrors the real cleanup order).</summary>
+    Normal = 0,
+
+    /// <summary>Gate, then throw before any field is cleaned (the reset aborts).</summary>
+    ThrowsBeforeCleanup = 1,
+
+    /// <summary>A <c>ret</c> inside a try region (must be refused).</summary>
+    RetInsideTry = 2,
+
+    /// <summary>Only a return inside an exception handler (no normal completion, must be refused).</summary>
+    HandlerOnlyRet = 3,
+
+    /// <summary>The handler ends exactly at the normal <c>ret</c> (half-open boundary check).</summary>
+    HandlerEndsAtRet = 4,
+
+    /// <summary>A finally block before the normal return.</summary>
+    WithFinally = 5,
+}
+
+/// <summary>
+/// Deterministic synchronisation points for the reset race fixtures. Lives in the test assembly;
+/// the synthetic fixture takes an AssemblyRef to it, exactly like it takes one to
+/// <c>Phase21.WorldReady</c> for the bridge. It must be public: the fixture is a separate
+/// assembly and calls <see cref="MidReset"/> from inside its reset body.
+/// </summary>
+public static class SyntheticGate
+{
+    private static readonly object Sync = new object();
+
+    public static ManualResetEventSlim Reached { get; } = new ManualResetEventSlim(false);
+
+    public static ManualResetEventSlim Resume { get; } = new ManualResetEventSlim(false);
+
+    public static bool Paused { get; set; }
+
+    /// <summary>Injected-into-fixture body call, placed after the reset entry hook.</summary>
+    public static void MidReset()
+    {
+        lock (Sync)
+        {
+            if (!Paused)
+            {
+                return;
+            }
+        }
+
+        Reached.Set();
+        if (!Resume.Wait(TimeSpan.FromSeconds(30)))
+        {
+            throw new TimeoutException("synthetic reset gate timed out");
+        }
+    }
+
+    public static void Open(bool paused)
+    {
+        Paused = paused;
+        Reached.Reset();
+        Resume.Reset();
+    }
+
+    public static void Release()
+    {
+        Resume.Set();
+    }
+}
+
 /// <summary>
 /// Builds a minimal synthetic "Game1" with the same shapes the real candidate methods have:
 /// an instance <c>loadForNewGame(bool)</c>, a static <c>OnDayStarted()</c> with one normal
-/// return and an optional finally block, and the three state members the completion edge reads.
+/// return and an optional finally block, an instance <c>ResetGameStateOnTitleScreen()</c> with the
+/// real cleanup order, and the three state members the edges read.
 ///
 /// <para>This is a fixture, not a model of Stardew Valley: it exists so the injector can be
 /// executed against ordinary IL and against the shapes it must refuse.</para>
@@ -15,13 +85,18 @@ namespace Phase21PrototypeTests;
 internal sealed class SyntheticFixture
 {
     public const string Game1Type = "Synthetic.Game1";
+    public const string GateType = "Phase21PrototypeTests.SyntheticGate";
 
     public string AssemblyName = "";
     public ModuleDefinition Module = null!;
     public TypeDefinition Game1 = null!;
     public MethodDefinition LoadForNewGame = null!;
     public MethodDefinition OnDayStarted = null!;
+    public MethodDefinition ResetGameStateOnTitleScreen = null!;
     public MethodDefinition GetGameMode = null!;
+    public MethodReference ResetBeganHook = null!;
+    public MethodReference ResetCompletedHook = null!;
+    public MethodReference GetResetEpochHook = null!;
     public MethodReference StartHook = null!;
     public MethodReference CompletionHook = null!;
 
@@ -31,9 +106,20 @@ internal sealed class SyntheticFixture
     public FieldDefinition LoadCount = null!;
     public FieldDefinition BodyCount = null!;
     public FieldDefinition FinallyCount = null!;
+    public FieldDefinition ResetCount = null!;
+
+    public PrototypeHooks Hooks
+    {
+        get
+        {
+            return new PrototypeHooks(ResetBeganHook, ResetCompletedHook, GetResetEpochHook, StartHook,
+                CompletionHook);
+        }
+    }
 
     public static SyntheticFixture Build(string tag, bool withState = true, bool withFinally = true,
-        bool retInsideTry = false, bool handlerOnlyRet = false, bool throws = false)
+        bool retInsideTry = false, bool handlerOnlyRet = false, bool throws = false,
+        ResetShape resetShape = ResetShape.Normal)
     {
         var fixture = new SyntheticFixture();
         fixture.AssemblyName = "SyntheticGame." + tag;
@@ -56,6 +142,7 @@ internal sealed class SyntheticFixture
         fixture.LoadCount = AddStaticField(game1, "LoadCount", module.TypeSystem.Int32);
         fixture.BodyCount = AddStaticField(game1, "BodyCount", module.TypeSystem.Int32);
         fixture.FinallyCount = AddStaticField(game1, "FinallyCount", module.TypeSystem.Int32);
+        fixture.ResetCount = AddStaticField(game1, "ResetCount", module.TypeSystem.Int32);
 
         if (withState)
         {
@@ -76,7 +163,9 @@ internal sealed class SyntheticFixture
         fixture.LoadForNewGame.Parameters.Add(new ParameterDefinition("loadedGame",
             ParameterAttributes.None, module.TypeSystem.Boolean));
         var loadIl = fixture.LoadForNewGame.Body.GetILProcessor();
+        loadIl.Emit(OpCodes.Ldsfld, fixture.LoadCount);
         loadIl.Emit(OpCodes.Ldc_I4_1);
+        loadIl.Emit(OpCodes.Add);
         loadIl.Emit(OpCodes.Stsfld, fixture.LoadCount);
         loadIl.Emit(OpCodes.Ret);
         game1.Methods.Add(fixture.LoadForNewGame);
@@ -103,11 +192,196 @@ internal sealed class SyntheticFixture
             EmitNormalBody(module, fixture, withFinally);
         }
 
-        AddBridgeReferences(module, out var start, out var completion);
-        fixture.StartHook = start;
-        fixture.CompletionHook = completion;
+        // public virtual instance void ResetGameStateOnTitleScreen()
+        fixture.ResetGameStateOnTitleScreen = new MethodDefinition(
+            PrototypeInjector.ResetMethodName,
+            MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.HideBySig,
+            module.TypeSystem.Void);
+        game1.Methods.Add(fixture.ResetGameStateOnTitleScreen);
+        EmitResetBody(module, fixture, resetShape);
 
+        AddBridgeReferences(module, fixture);
         return fixture;
+    }
+
+    private static void EmitResetBody(ModuleDefinition module, SyntheticFixture fixture,
+        ResetShape shape)
+    {
+        var method = fixture.ResetGameStateOnTitleScreen;
+        var il = method.Body.GetILProcessor();
+
+        switch (shape)
+        {
+            case ResetShape.RetInsideTry:
+            {
+                var tryStart = il.Create(OpCodes.Nop);
+                var ret = il.Create(OpCodes.Ret);
+                var tryEnd = il.Create(OpCodes.Nop);
+                var handlerStart = il.Create(OpCodes.Pop);
+                var handlerRet = il.Create(OpCodes.Ret);
+                var end = il.Create(OpCodes.Nop);
+                il.Append(tryStart);
+                il.Append(ret);
+                il.Append(tryEnd);
+                il.Append(handlerStart);
+                il.Append(handlerRet);
+                il.Append(end);
+                method.Body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+                {
+                    TryStart = tryStart,
+                    TryEnd = tryEnd,
+                    HandlerStart = handlerStart,
+                    HandlerEnd = end,
+                    CatchType = module.ImportReference(typeof(Exception)),
+                });
+                return;
+            }
+
+            case ResetShape.HandlerOnlyRet:
+            {
+                var tryStart = il.Create(OpCodes.Nop);
+                var end = il.Create(OpCodes.Nop);
+                var leaveTry = il.Create(OpCodes.Leave_S, end);
+                var handlerStart = il.Create(OpCodes.Pop);
+                var handlerRet = il.Create(OpCodes.Ret);
+                il.Append(tryStart);
+                il.Append(leaveTry);
+                il.Append(handlerStart);
+                il.Append(handlerRet);
+                il.Append(end);
+                method.Body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+                {
+                    TryStart = tryStart,
+                    TryEnd = handlerStart,
+                    HandlerStart = handlerStart,
+                    HandlerEnd = end,
+                    CatchType = module.ImportReference(typeof(Exception)),
+                });
+                return;
+            }
+
+            case ResetShape.HandlerEndsAtRet:
+            {
+                // The entry instruction must stay outside every protected region (the real method
+                // is the same way), so a plain nop leads and the try starts after it.
+                var entry = il.Create(OpCodes.Nop);
+                var tryStart = il.Create(OpCodes.Nop);
+                var ret = il.Create(OpCodes.Ret);
+                var leaveTry = il.Create(OpCodes.Leave_S, ret);
+                var handlerStart = il.Create(OpCodes.Pop);
+                il.Append(entry);
+                il.Append(tryStart);
+                il.Append(leaveTry);
+                il.Append(handlerStart);
+                il.Append(ret);
+                method.Body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+                {
+                    TryStart = tryStart,
+                    TryEnd = handlerStart,
+                    HandlerStart = handlerStart,
+                    HandlerEnd = ret,
+                    CatchType = module.ImportReference(typeof(Exception)),
+                });
+                return;
+            }
+
+            case ResetShape.ThrowsBeforeCleanup:
+            {
+                EmitGateCall(module, il);
+                var ctor = module.ImportReference(
+                    typeof(Exception).GetConstructor(new[] { typeof(string) })!);
+                il.Emit(OpCodes.Ldstr, "synthetic reset failure");
+                il.Emit(OpCodes.Newobj, ctor);
+                il.Emit(OpCodes.Throw);
+                il.Emit(OpCodes.Ret);
+                return;
+            }
+
+            case ResetShape.WithFinally:
+            {
+                EmitGateCall(module, il);
+                var tryStart = il.Create(OpCodes.Nop);
+                var finallyStart = il.Create(OpCodes.Ldsfld, fixture.FinallyCount);
+                var one = il.Create(OpCodes.Ldc_I4_1);
+                var add = il.Create(OpCodes.Add);
+                var store = il.Create(OpCodes.Stsfld, fixture.FinallyCount);
+                var endFinally = il.Create(OpCodes.Endfinally);
+                var afterFinally = il.Create(OpCodes.Nop);
+                var leaveTry = il.Create(OpCodes.Leave_S, afterFinally);
+                var ret = il.Create(OpCodes.Ret);
+
+                il.Append(tryStart);
+                EmitCleanup(module, il, fixture);
+                il.Append(leaveTry);
+                il.Append(finallyStart);
+                il.Append(one);
+                il.Append(add);
+                il.Append(store);
+                il.Append(endFinally);
+                il.Append(afterFinally);
+                il.Append(ret);
+
+                method.Body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Finally)
+                {
+                    TryStart = tryStart,
+                    TryEnd = finallyStart,
+                    HandlerStart = finallyStart,
+                    HandlerEnd = afterFinally,
+                });
+                return;
+            }
+
+            default:
+            {
+                EmitGateCall(module, il);
+                EmitCleanup(module, il, fixture);
+                il.Emit(OpCodes.Ret);
+                return;
+            }
+        }
+    }
+
+    /// <summary>The real cleanup order: gameMode first, then currentLoader, then hasLoadedGame.</summary>
+    private static void EmitCleanup(ModuleDefinition module, ILProcessor il, SyntheticFixture fixture)
+    {
+        if (fixture.CurrentLoader != null && fixture.HasLoadedGame != null)
+        {
+            il.Emit(OpCodes.Ldc_I4_0);
+            il.Emit(OpCodes.Stsfld, fixture.GameMode);
+            il.Emit(OpCodes.Ldnull);
+            il.Emit(OpCodes.Stsfld, fixture.CurrentLoader);
+            il.Emit(OpCodes.Ldc_I4_0);
+            il.Emit(OpCodes.Stsfld, fixture.HasLoadedGame);
+        }
+
+        il.Emit(OpCodes.Ldsfld, fixture.ResetCount);
+        il.Emit(OpCodes.Ldc_I4_1);
+        il.Emit(OpCodes.Add);
+        il.Emit(OpCodes.Stsfld, fixture.ResetCount);
+    }
+
+    private static void EmitGateCall(ModuleDefinition module, ILProcessor il)
+    {
+        var gate = GateReference(module);
+        il.Emit(OpCodes.Call, gate);
+    }
+
+    private static MethodReference GateReference(ModuleDefinition module)
+    {
+        var existing = module.AssemblyReferences.FirstOrDefault(a => a.Name == "Phase21.PrototypeTests");
+        if (existing is null)
+        {
+            existing = new AssemblyNameReference("Phase21.PrototypeTests",
+                typeof(SyntheticGate).Assembly.GetName().Version ?? new Version(1, 0, 0, 0));
+            module.AssemblyReferences.Add(existing);
+        }
+
+        var type = new TypeReference("Phase21PrototypeTests", "SyntheticGate", module, existing);
+        var method = new MethodReference("MidReset", module.TypeSystem.Void, type)
+        {
+            HasThis = false,
+        };
+        return method;
     }
 
     private static void EmitNormalBody(ModuleDefinition module, SyntheticFixture fixture, bool withFinally)
@@ -256,8 +530,7 @@ internal sealed class SyntheticFixture
         return field;
     }
 
-    private static void AddBridgeReferences(ModuleDefinition module, out MethodReference start,
-        out MethodReference completion)
+    private static void AddBridgeReferences(ModuleDefinition module, SyntheticFixture fixture)
     {
         var version = typeof(PrototypeBridge).Assembly.GetName().Version ?? new Version(1, 0, 0, 0);
         var assembly = new AssemblyNameReference("Phase21.WorldReady", version);
@@ -265,20 +538,41 @@ internal sealed class SyntheticFixture
 
         var type = new TypeReference("Phase21.WorldReady", "PrototypeBridge", module, assembly);
 
-        start = new MethodReference(PrototypeInjector.StartHookName, module.TypeSystem.Void, type)
+        fixture.ResetBeganHook = new MethodReference(PrototypeInjector.ResetEntryHookName,
+            module.TypeSystem.Void, type)
         {
             HasThis = false,
         };
-        start.Parameters.Add(new ParameterDefinition(module.TypeSystem.Boolean));
-        start.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
-        start.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int32));
 
-        completion = new MethodReference(PrototypeInjector.CompletionHookName, module.TypeSystem.Void, type)
+        fixture.ResetCompletedHook = new MethodReference(PrototypeInjector.ResetExitHookName,
+            module.TypeSystem.Void, type)
         {
             HasThis = false,
         };
-        completion.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int32));
-        completion.Parameters.Add(new ParameterDefinition(module.TypeSystem.Boolean));
-        completion.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+
+        fixture.GetResetEpochHook = new MethodReference(PrototypeInjector.ResetEpochGetterName,
+            module.TypeSystem.Int64, type)
+        {
+            HasThis = false,
+        };
+
+        fixture.StartHook = new MethodReference(PrototypeInjector.StartHookName, module.TypeSystem.Void,
+            type)
+        {
+            HasThis = false,
+        };
+        fixture.StartHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int64));
+        fixture.StartHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Boolean));
+        fixture.StartHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int32));
+        fixture.StartHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+
+        fixture.CompletionHook = new MethodReference(PrototypeInjector.CompletionHookName,
+            module.TypeSystem.Void, type)
+        {
+            HasThis = false,
+        };
+        fixture.CompletionHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int32));
+        fixture.CompletionHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Boolean));
+        fixture.CompletionHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
     }
 }
