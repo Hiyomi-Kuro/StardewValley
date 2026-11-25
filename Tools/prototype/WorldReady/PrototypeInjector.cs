@@ -19,7 +19,8 @@ public sealed class PrototypeTargets
 {
     public PrototypeTargets(ModuleDefinition module, MethodDefinition loadForNewGame,
         MethodDefinition onDayStarted, MethodDefinition resetGameStateOnTitleScreen,
-        MethodReference getGameMode, FieldDefinition hasLoadedGame, FieldDefinition currentLoader)
+        MethodReference getGameMode, FieldDefinition hasLoadedGame, FieldDefinition currentLoader,
+        MethodDefinition updateTitleScreenDuringLoadingMode)
     {
         Module = module;
         LoadForNewGame = loadForNewGame;
@@ -28,6 +29,7 @@ public sealed class PrototypeTargets
         GetGameMode = getGameMode;
         HasLoadedGame = hasLoadedGame;
         CurrentLoader = currentLoader;
+        UpdateTitleScreenDuringLoadingMode = updateTitleScreenDuringLoadingMode;
     }
 
     public ModuleDefinition Module { get; }
@@ -44,19 +46,27 @@ public sealed class PrototypeTargets
     public FieldDefinition HasLoadedGame { get; }
 
     public FieldDefinition CurrentLoader { get; }
+
+    /// <summary>
+    /// The P.2 success-handoff edge: <c>Game1.UpdateTitleScreenDuringLoadingMode()</c>, the only place
+    /// the game advances <c>currentLoader</c> and observes its terminal result.
+    /// </summary>
+    public MethodDefinition UpdateTitleScreenDuringLoadingMode { get; }
 }
 
 /// <summary>The hook methods to call, with the exact prototypes this injector emits.</summary>
 public sealed class PrototypeHooks
 {
     public PrototypeHooks(MethodReference resetBegan, MethodReference resetCompleted,
-        MethodReference getResetEpoch, MethodReference worldLoading, MethodReference dayCompleted)
+        MethodReference getResetEpoch, MethodReference worldLoading, MethodReference dayCompleted,
+        MethodReference loadAdvanced)
     {
         ResetBegan = resetBegan;
         ResetCompleted = resetCompleted;
         GetResetEpoch = getResetEpoch;
         WorldLoading = worldLoading;
         DayCompleted = dayCompleted;
+        LoadAdvanced = loadAdvanced;
     }
 
     /// <summary><c>void ResetBegan()</c>.</summary>
@@ -73,6 +83,13 @@ public sealed class PrototypeHooks
 
     /// <summary><c>void DayCompleted(int gameMode, bool hasLoadedGame, object loader)</c>.</summary>
     public MethodReference DayCompleted { get; }
+
+    /// <summary>
+    /// <c>void LoadAdvanced(object loader, int gameMode, bool moved, bool hasLoadedGame)</c>: the
+    /// identity-carrying completion edge. <c>loader</c> is the exact object whose <c>MoveNext()</c>
+    /// was just called, held in a local — not re-read from <c>currentLoader</c>.
+    /// </summary>
+    public MethodReference LoadAdvanced { get; }
 }
 
 /// <summary>Counts returned by one injection pass.</summary>
@@ -101,6 +118,12 @@ public sealed class PrototypeInjectionResult
     public int ResetMaxStackBefore { get; internal set; }
 
     public int ResetMaxStackAfter { get; internal set; }
+
+    public int AdvanceCalls { get; internal set; }
+
+    public int AdvanceMaxStackBefore { get; internal set; }
+
+    public int AdvanceMaxStackAfter { get; internal set; }
 }
 
 /// <summary>Structural verification of one (possibly already written) module.</summary>
@@ -135,6 +158,22 @@ public sealed class PrototypeVerification
     public int HandlerReturns { get; internal set; }
 
     public int EdgesToNormalReturns { get; internal set; }
+
+    /// <summary>P.2: <c>LoadAdvanced</c> call sites in <c>UpdateTitleScreenDuringLoadingMode</c>.</summary>
+    public int AdvanceCalls { get; internal set; }
+
+    /// <summary>
+    /// P.2: true when the completion edge takes its identity from a local that was loaded from
+    /// <c>currentLoader</c> once, used for <c>MoveNext()</c>, and passed to the hook — i.e. the hook
+    /// never re-reads the global.
+    /// </summary>
+    public bool AdvanceIdentityFromLocal { get; internal set; }
+
+    /// <summary>P.2: true when both original loader guards still target the same instruction.</summary>
+    public bool AdvanceGuardsIntact { get; internal set; }
+
+    /// <summary>P.2: true when the injected region is outside every try/handler region.</summary>
+    public bool AdvanceSiteUnprotected { get; internal set; }
 
     /// <summary>
     /// True when the start call site reads the epoch before <c>gameMode</c> and the loader. This is
@@ -189,6 +228,8 @@ public static class PrototypeInjector
     public const string ResetExitHookName = "ResetCompleted";
     public const string ResetEpochGetterName = "GetResetEpoch";
     public const string ResetMethodName = "ResetGameStateOnTitleScreen";
+    public const string AdvanceHookName = "LoadAdvanced";
+    public const string AdvanceMethodName = "UpdateTitleScreenDuringLoadingMode";
 
     private static readonly string[] NoParameters = Array.Empty<string>();
 
@@ -202,6 +243,12 @@ public static class PrototypeInjector
     private static readonly string[] CompletionHookSignature =
     {
         "System.Int32", "System.Boolean", "System.Object",
+    };
+
+    /// <summary>Parameters of <c>LoadAdvanced(object, int, bool, bool)</c>, in push order.</summary>
+    private static readonly string[] AdvanceHookSignature =
+    {
+        "System.Object", "System.Int32", "System.Boolean", "System.Boolean",
     };
 
     /// <summary>Resolves the three methods and three state members by exact structural shape.</summary>
@@ -280,6 +327,19 @@ public static class PrototypeInjector
                 "missing static int/byte " + game1TypeName + "::get_gameMode()");
         }
 
+        var advanceMatches = type.Methods.Where(m =>
+            string.Equals(m.Name, AdvanceMethodName, StringComparison.Ordinal) &&
+            !m.IsStatic && m.HasThis &&
+            m.ReturnType.FullName == "System.Void" &&
+            m.Parameters.Count == 0 &&
+            m.HasBody && m.Body.Instructions.Count > 0).ToList();
+        if (advanceMatches.Count != 1)
+        {
+            throw new PrototypeInjectionException(
+                "expected exactly one instance void " + game1TypeName + "::" + AdvanceMethodName +
+                "(); found " + Describe(type, AdvanceMethodName));
+        }
+
         var hasLoadedGame = RequireStaticField(type, "hasLoadedGame", "System.Boolean");
         var currentLoader = RequireStaticField(type, "currentLoader", null);
         if (currentLoader.FieldType.IsValueType || currentLoader.FieldType is PointerType)
@@ -289,7 +349,7 @@ public static class PrototypeInjector
         }
 
         return new PrototypeTargets(module, loadMatches[0], dayMatches[0], resetMatches[0],
-            getGameMode, hasLoadedGame, currentLoader);
+            getGameMode, hasLoadedGame, currentLoader, advanceMatches[0]);
     }
 
     /// <summary>Places all three hooks. Refuses an already-injected or unsupported method.</summary>
@@ -302,14 +362,16 @@ public static class PrototypeInjector
         RequireHookShape(hooks.WorldLoading, StartHookName, "System.Void", StartHookSignature);
         RequireHookShape(hooks.DayCompleted, CompletionHookName, "System.Void",
             CompletionHookSignature);
+        RequireHookShape(hooks.LoadAdvanced, AdvanceHookName, "System.Void", AdvanceHookSignature);
 
         var load = targets.LoadForNewGame;
         var day = targets.OnDayStarted;
         var reset = targets.ResetGameStateOnTitleScreen;
+        var advance = targets.UpdateTitleScreenDuringLoadingMode;
 
         var existing = CountCalls(reset, hooks.ResetBegan) + CountCalls(reset, hooks.ResetCompleted) +
                        CountCalls(load, hooks.WorldLoading) + CountCalls(load, hooks.GetResetEpoch) +
-                       CountCalls(day, hooks.DayCompleted);
+                       CountCalls(day, hooks.DayCompleted) + CountCalls(advance, hooks.LoadAdvanced);
         if (existing > 0)
         {
             throw new PrototypeInjectionException(
@@ -325,13 +387,135 @@ public static class PrototypeInjector
             CompletionMaxStackAfter = day.Body.MaxStackSize,
             ResetMaxStackBefore = reset.Body.MaxStackSize,
             ResetMaxStackAfter = reset.Body.MaxStackSize,
+            AdvanceMaxStackBefore = advance.Body.MaxStackSize,
+            AdvanceMaxStackAfter = advance.Body.MaxStackSize,
         };
 
         InjectResetEntry(targets, hooks, result);
         InjectResetCompletion(targets, hooks, result);
         InjectEntry(targets, hooks, result);
         InjectCompletion(targets, hooks, result);
+        InjectAdvance(targets, hooks, result);
         return result;
+    }
+
+    /// <summary>
+    /// Places the identity-carrying completion edge in <c>UpdateTitleScreenDuringLoadingMode</c>.
+    ///
+    /// <para>The original sequence is:</para>
+    /// <code>
+    /// ldsfld  currentLoader          ; guard
+    /// brfalse END
+    /// ldsfld  currentLoader          ; the object to advance
+    /// callvirt IEnumerator::MoveNext()
+    /// brtrue  END
+    /// ldnull / stsfld currentLoader  ; cleared only on the failure branch
+    /// </code>
+    ///
+    /// <para>After injection the loader value is held in a single local, <c>MoveNext</c> is invoked on
+    /// that local, and the hook receives that same local plus the post-advance mode, the
+    /// <c>MoveNext</c> result and <c>hasLoadedGame</c>. The hook therefore never re-reads the global,
+    /// which is what makes "this completion belongs to the attempt that created this enumerator"
+    /// a data-transfer fact instead of a global comparison.</para>
+    /// </summary>
+    private static void InjectAdvance(PrototypeTargets targets, PrototypeHooks hooks,
+        PrototypeInjectionResult result)
+    {
+        var method = targets.UpdateTitleScreenDuringLoadingMode;
+        var body = method.Body;
+
+        if (body.ExceptionHandlers.Count != 0)
+        {
+            throw new PrototypeInjectionException(
+                "unsupported control flow: " + method.FullName + " has exception handlers");
+        }
+
+        var instructions = body.Instructions;
+        var guardLoad = -1;
+        for (var i = 0; i + 4 < instructions.Count; i++)
+        {
+            if (!IsFieldLoad(instructions[i], targets.CurrentLoader))
+            {
+                continue;
+            }
+
+            if (instructions[i + 1].OpCode != OpCodes.Brfalse &&
+                instructions[i + 1].OpCode != OpCodes.Brfalse_S)
+            {
+                continue;
+            }
+
+            if (!IsFieldLoad(instructions[i + 2], targets.CurrentLoader))
+            {
+                continue;
+            }
+
+            if (!(instructions[i + 3].OpCode == OpCodes.Callvirt &&
+                  instructions[i + 3].Operand is MethodReference moved &&
+                  moved.Name == "MoveNext") &&
+                !(instructions[i + 3].OpCode == OpCodes.Call &&
+                  instructions[i + 3].Operand is MethodReference direct && direct.Name == "MoveNext"))
+            {
+                continue;
+            }
+
+            if (instructions[i + 4].OpCode != OpCodes.Brtrue &&
+                instructions[i + 4].OpCode != OpCodes.Brtrue_S)
+            {
+                continue;
+            }
+
+            guardLoad = i;
+            break;
+        }
+
+        if (guardLoad < 0)
+        {
+            throw new PrototypeInjectionException(
+                "unsupported shape: " + method.FullName + " does not match " +
+                "ldsfld currentLoader; brfalse; ldsfld currentLoader; MoveNext; brtrue");
+        }
+
+        var loaderLocal = new VariableDefinition(targets.CurrentLoader.FieldType);
+        var movedLocal = new VariableDefinition(targets.Module.TypeSystem.Boolean);
+        body.Variables.Add(loaderLocal);
+        body.Variables.Add(movedLocal);
+        body.InitLocals = true;
+
+        var il = body.GetILProcessor();
+        var firstLoad = instructions[guardLoad];
+        var secondLoad = instructions[guardLoad + 2];
+        var moveNext = instructions[guardLoad + 3];
+
+        // ldsfld currentLoader ; stloc L ; ldloc L ; brfalse END ; ldloc L ; MoveNext ; stloc M
+        il.InsertAfter(firstLoad, il.Create(OpCodes.Stloc, loaderLocal));
+        il.InsertAfter(firstLoad.Next!, il.Create(OpCodes.Ldloc, loaderLocal));
+
+        secondLoad.OpCode = OpCodes.Ldloc;
+        secondLoad.Operand = loaderLocal;
+
+        // ldloc L ; get_gameMode ; ldloc M ; ldsfld hasLoadedGame ; call LoadAdvanced ; ldloc M
+        var afterMoveNext = moveNext;
+        foreach (var emitted in new[]
+                 {
+                     il.Create(OpCodes.Stloc, movedLocal),
+                     il.Create(OpCodes.Ldloc, loaderLocal),
+                     il.Create(OpCodes.Call, targets.GetGameMode),
+                     il.Create(OpCodes.Ldloc, movedLocal),
+                     il.Create(OpCodes.Ldsfld, targets.HasLoadedGame),
+                     il.Create(OpCodes.Call, hooks.LoadAdvanced),
+                     il.Create(OpCodes.Ldloc, movedLocal),
+                 })
+        {
+            il.InsertAfter(afterMoveNext, emitted);
+            afterMoveNext = emitted;
+        }
+
+        body.MaxStackSize = Math.Max(body.MaxStackSize, 4);
+        result.AdvanceCalls = 1;
+        result.AdvanceMaxStackAfter = body.MaxStackSize;
+
+        WidenShortBranches(method);
     }
 
     private static void InjectResetEntry(PrototypeTargets targets, PrototypeHooks hooks,
@@ -520,11 +704,149 @@ public static class PrototypeInjector
         RequireHookShape(hooks.WorldLoading, StartHookName, "System.Void", StartHookSignature, report);
         RequireHookShape(hooks.DayCompleted, CompletionHookName, "System.Void",
             CompletionHookSignature, report);
+        RequireHookShape(hooks.LoadAdvanced, AdvanceHookName, "System.Void", AdvanceHookSignature,
+            report);
 
         VerifyReset(targets, hooks, report);
         VerifyStart(targets, hooks, report);
         VerifyCompletion(targets, hooks, report);
+        VerifyAdvance(targets, hooks, report);
         return report;
+    }
+
+    /// <summary>
+    /// Checks the injected completion edge: one <c>LoadAdvanced</c> call, the loader held in a local,
+    /// <c>MoveNext</c> invoked on that local, the hook fed from that local, both original guards still
+    /// targeting one instruction, and the region unprotected.
+    /// </summary>
+    private static void VerifyAdvance(PrototypeTargets targets, PrototypeHooks hooks,
+        PrototypeVerification report)
+    {
+        var method = targets.UpdateTitleScreenDuringLoadingMode;
+        var body = method.Body;
+        var instructions = body.Instructions;
+
+        report.AdvanceCalls = CountCalls(method, hooks.LoadAdvanced);
+        if (report.AdvanceCalls != 1)
+        {
+            report.Fail("LoadAdvanced call sites != 1: " + report.AdvanceCalls);
+        }
+
+        if (body.ExceptionHandlers.Count != 0)
+        {
+            report.Fail("UpdateTitleScreenDuringLoadingMode gained exception handlers");
+        }
+
+        var hookIndex = -1;
+        for (var i = 0; i < instructions.Count; i++)
+        {
+            if (IsCallOf(instructions[i], hooks.LoadAdvanced))
+            {
+                hookIndex = i;
+                break;
+            }
+        }
+
+        if (hookIndex < 0)
+        {
+            report.AdvanceIdentityFromLocal = false;
+            report.AdvanceGuardsIntact = false;
+            report.AdvanceSiteUnprotected = false;
+            report.Fail("LoadAdvanced call site not found for structural verification");
+            return;
+        }
+
+        // Exact injected layout around the hook (see InjectAdvance):
+        //   -8 brfalse END | -7 ldloc L | -6 MoveNext | -5 stloc M | -4 ldloc L
+        //   -3 get_gameMode | -2 ldloc M | -1 ldsfld hasLoadedGame | +0 LoadAdvanced
+        //   +1 ldloc M | +2 brtrue END
+        var ok = hookIndex >= 8 && hookIndex + 2 < instructions.Count;
+
+        VariableDefinition? loaderLocal = null;
+        if (ok)
+        {
+            ok = instructions[hookIndex - 4].OpCode == OpCodes.Ldloc &&
+                 instructions[hookIndex - 4].Operand is VariableDefinition l1 &&
+                 l1.VariableType.FullName == targets.CurrentLoader.FieldType.FullName &&
+                 IsMethodCall(instructions[hookIndex - 3], targets.GetGameMode) &&
+                 instructions[hookIndex - 2].OpCode == OpCodes.Ldloc &&
+                 instructions[hookIndex - 1].OpCode == OpCodes.Ldsfld &&
+                 instructions[hookIndex - 1].Operand is FieldReference flag &&
+                 flag.FullName == targets.HasLoadedGame.FullName;
+            if (ok)
+            {
+                loaderLocal = (VariableDefinition)instructions[hookIndex - 4].Operand!;
+            }
+        }
+
+        report.AdvanceIdentityFromLocal = ok;
+        if (!ok)
+        {
+            report.Fail("LoadAdvanced arguments are not (local loader, get_gameMode, local moved, " +
+                        "hasLoadedGame)");
+        }
+
+        // The hook must not receive a fresh read of the global.
+        for (var i = hookIndex - 4; i < hookIndex; i++)
+        {
+            if (IsFieldLoad(instructions[i], targets.CurrentLoader))
+            {
+                report.Fail("LoadAdvanced receives a re-read of currentLoader instead of the local");
+                report.AdvanceIdentityFromLocal = false;
+            }
+        }
+
+        var moveNextOk = hookIndex >= 7 &&
+                         instructions[hookIndex - 6].Operand is MethodReference mr &&
+                         mr.Name == "MoveNext" &&
+                         (instructions[hookIndex - 6].OpCode == OpCodes.Callvirt ||
+                          instructions[hookIndex - 6].OpCode == OpCodes.Call) &&
+                         instructions[hookIndex - 7].OpCode == OpCodes.Ldloc &&
+                         ReferenceEquals(instructions[hookIndex - 7].Operand, loaderLocal) &&
+                         instructions[hookIndex - 5].OpCode == OpCodes.Stloc;
+        if (!moveNextOk)
+        {
+            report.Fail("MoveNext is not invoked on the captured loader local with its result stored");
+        }
+
+        var nullGuard = hookIndex >= 8 ? instructions[hookIndex - 8] : null;
+        var finishGuard = hookIndex + 2 < instructions.Count ? instructions[hookIndex + 2] : null;
+        report.AdvanceGuardsIntact =
+            nullGuard != null && finishGuard != null &&
+            (nullGuard.OpCode == OpCodes.Brfalse || nullGuard.OpCode == OpCodes.Brfalse_S) &&
+            (finishGuard.OpCode == OpCodes.Brtrue || finishGuard.OpCode == OpCodes.Brtrue_S) &&
+            nullGuard.Operand is Instruction a && finishGuard.Operand is Instruction b &&
+            ReferenceEquals(a, b);
+        if (!report.AdvanceGuardsIntact)
+        {
+            report.Fail("the two original currentLoader guards no longer target one instruction");
+        }
+
+        report.AdvanceSiteUnprotected = !IsInsideTry(instructions[hookIndex], body) &&
+                                        !IsInsideHandler(instructions[hookIndex], body);
+        if (!report.AdvanceSiteUnprotected)
+        {
+            report.Fail("the LoadAdvanced call site is inside a protected region");
+        }
+
+        var returns = 0;
+        foreach (var ins in instructions)
+        {
+            if (ins.OpCode.Code == Code.Ret)
+            {
+                returns++;
+            }
+        }
+
+        if (returns != 2)
+        {
+            report.Fail("UpdateTitleScreenDuringLoadingMode no longer has 2 returns: " + returns);
+        }
+    }
+
+    private static bool IsCallOf(Instruction ins, MethodReference hook)
+    {
+        return ins.OpCode == OpCodes.Call && IsHookCall(ins, hook);
     }
 
     private static void VerifyReset(PrototypeTargets targets, PrototypeHooks hooks,

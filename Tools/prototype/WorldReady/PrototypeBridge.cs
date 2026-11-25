@@ -15,6 +15,14 @@ public interface IWorldReadySink
     void OnWorldLoading(long resetEpoch, bool loadedGame, int gameMode, object? loader, int threadId);
 
     void OnDayCompleted(int gameMode, bool hasLoadedGame, object? loader, int threadId);
+
+    /// <summary>
+    /// P.2 completion edge: the loading-mode driver advanced the load state machine.
+    /// <paramref name="loader"/> is the exact object whose <c>MoveNext()</c> was called, taken from a
+    /// local in the injected code. <paramref name="gameMode"/> is read <i>after</i> the advance, so a
+    /// value of the playing mode means the enumerator itself performed the success handoff.
+    /// </summary>
+    void OnLoadAdvanced(object? loader, int gameMode, bool moved, bool hasLoadedGame, int threadId);
 }
 
 /// <summary>
@@ -74,6 +82,14 @@ public static class PrototypeBridge
     {
         var sink = Volatile.Read(ref _sink);
         sink?.OnDayCompleted(gameMode, hasLoadedGame, loader, Environment.CurrentManagedThreadId);
+    }
+
+    /// <summary>Injected after <c>currentLoader.MoveNext()</c> in the loading-mode driver.</summary>
+    public static void LoadAdvanced(object? loader, int gameMode, bool moved, bool hasLoadedGame)
+    {
+        var sink = Volatile.Read(ref _sink);
+        sink?.OnLoadAdvanced(loader, gameMode, moved, hasLoadedGame,
+            Environment.CurrentManagedThreadId);
     }
 }
 
@@ -141,8 +157,15 @@ public sealed class CoordinatorSink : IWorldReadySink
     public void OnWorldLoading(long resetEpoch, bool loadedGame, int gameMode, object? loader,
         int threadId)
     {
-        if (!_coordinator.TryBeginAttempt(loadedGame, gameMode, loader, threadId, resetEpoch,
-                out _, out var refusal))
+        // P.2: a real load attempt registers the load state machine itself as the attempt identity, so
+        // the completion edge can prove ownership. A new game has no such object and keeps the
+        // identity-unproven path (its ownership stays UNKNOWN on purpose).
+        var begun = loadedGame && loader is not null
+            ? _coordinator.BeginLoad(loader, gameMode, resetEpoch, threadId, out _, out var refusal)
+            : _coordinator.TryBeginAttempt(loadedGame, gameMode, loader, threadId, resetEpoch, out _,
+                out refusal);
+
+        if (!begun)
         {
             Note("start refused: " + refusal + " (loadedGame=" + loadedGame + ", gameMode=" +
                  gameMode + ", epoch=" + resetEpoch + ", thread=" + threadId + ")");
@@ -157,6 +180,27 @@ public sealed class CoordinatorSink : IWorldReadySink
             Note("completion refused: " + outcome.Refusal + " (gameMode=" + gameMode +
                  ", hasLoadedGame=" + hasLoadedGame + ", thread=" + threadId + ")");
         }
+    }
+
+    public void OnLoadAdvanced(object? loader, int gameMode, bool moved, bool hasLoadedGame,
+        int threadId)
+    {
+        var outcome = _coordinator.Advance(loader, gameMode, moved, hasLoadedGame, threadId);
+        if (outcome.Kind == AdvanceOutcomeKind.InProgress)
+        {
+            return;
+        }
+
+        if (outcome.Kind == AdvanceOutcomeKind.Completed)
+        {
+            Note("load completed: attempt " + outcome.AttemptId + ", mode=" + gameMode +
+                 ", thread=" + threadId + ", ownership=" + outcome.OwnershipVerified);
+            return;
+        }
+
+        Note("load advance " + outcome.Kind + ": " + outcome.Refusal + " (mode=" + gameMode +
+             ", moved=" + moved + ", hasLoadedGame=" + hasLoadedGame + ", thread=" + threadId +
+             ", owned=" + outcome.OwnershipVerified + ")");
     }
 
     private void Note(string text)

@@ -50,6 +50,13 @@ public static class TargetBridgeEmitter
         var lastHasLoadedGame = AddField(type, "LastHasLoadedGame", module.TypeSystem.Boolean);
         var lastGameMode = AddField(type, "LastGameMode", module.TypeSystem.Int32);
         var lastLoaderWasNull = AddField(type, "LastLoaderWasNull", module.TypeSystem.Boolean);
+        var loadAdvancedCalls = AddField(type, "LoadAdvancedCalls", module.TypeSystem.Int32);
+        var lastAdvanceGameMode = AddField(type, "LastAdvanceGameMode", module.TypeSystem.Int32);
+        var lastAdvanceMoved = AddField(type, "LastAdvanceMoved", module.TypeSystem.Boolean);
+        var lastAdvanceHasLoadedGame =
+            AddField(type, "LastAdvanceHasLoadedGame", module.TypeSystem.Boolean);
+        var lastAdvanceLoaderWasNull =
+            AddField(type, "LastAdvanceLoaderWasNull", module.TypeSystem.Boolean);
 
         // void ResetBegan(): ResetBeganCalls++; EpochCounter++;
         var resetBegan = NewStaticVoid(module, type, PrototypeInjector.ResetEntryHookName);
@@ -114,7 +121,29 @@ public static class TargetBridgeEmitter
         EmitNullCheck(completedIl, lastLoaderWasNull, 2);
         completedIl.Emit(OpCodes.Ret);
 
-        return new PrototypeHooks(resetBegan, resetCompleted, getEpoch, worldLoading, dayCompleted);
+        // void LoadAdvanced(object loader, int gameMode, bool moved, bool hasLoadedGame)
+        var loadAdvanced = NewStaticVoid(module, type, PrototypeInjector.AdvanceHookName);
+        loadAdvanced.Parameters.Add(new ParameterDefinition("loader", ParameterAttributes.None,
+            module.TypeSystem.Object));
+        loadAdvanced.Parameters.Add(new ParameterDefinition("gameMode", ParameterAttributes.None,
+            module.TypeSystem.Int32));
+        loadAdvanced.Parameters.Add(new ParameterDefinition("moved", ParameterAttributes.None,
+            module.TypeSystem.Boolean));
+        loadAdvanced.Parameters.Add(new ParameterDefinition("hasLoadedGame",
+            ParameterAttributes.None, module.TypeSystem.Boolean));
+        var advanceIl = loadAdvanced.Body.GetILProcessor();
+        EmitIntIncrement(advanceIl, loadAdvancedCalls);
+        advanceIl.Emit(OpCodes.Ldarg_1);
+        advanceIl.Emit(OpCodes.Stsfld, lastAdvanceGameMode);
+        advanceIl.Emit(OpCodes.Ldarg_2);
+        advanceIl.Emit(OpCodes.Stsfld, lastAdvanceMoved);
+        advanceIl.Emit(OpCodes.Ldarg_3);
+        advanceIl.Emit(OpCodes.Stsfld, lastAdvanceHasLoadedGame);
+        EmitNullCheck(advanceIl, lastAdvanceLoaderWasNull, 0);
+        advanceIl.Emit(OpCodes.Ret);
+
+        return new PrototypeHooks(resetBegan, resetCompleted, getEpoch, worldLoading, dayCompleted,
+            loadAdvanced);
     }
 
     private static MethodDefinition NewStaticVoid(ModuleDefinition module, TypeDefinition type, string name)

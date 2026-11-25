@@ -91,6 +91,7 @@ internal static class Program
         ResetCommitOrder();
         LateCompletionReadsBLoader();
         ResetThreadCases();
+        AttemptOwnershipCases();
     }
 
     private static void ColdStartAndNoStart()
@@ -106,7 +107,7 @@ internal static class Program
     private static void LoadAndNewGameEntries()
     {
         var c = NewCoordinator();
-        var loader = new object();
+        var loader = new TestLoader();
         var begun = c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loader, Tid,
             out var id, out var refusal);
         var outcome = c.Complete(WorldReadyCoordinator.PlayingGameMode, true, loader, Tid);
@@ -133,7 +134,7 @@ internal static class Program
     private static void StartGuards()
     {
         var c = NewCoordinator();
-        var loader = new object();
+        var loader = new TestLoader();
         var begun = c.TryBeginAttempt(true, 0, loader, Tid, out _, out var refusal);
         Check("read_start_outside_load_mode_refused",
             !begun && refusal == RefusalKind.StartOutsideLoadMode, "refusal=" + refusal);
@@ -147,7 +148,7 @@ internal static class Program
     private static void PostConsumptionCompletions()
     {
         var c = NewCoordinator();
-        var loader = new object();
+        var loader = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loader, Tid, out _, out _);
         c.Complete(WorldReadyCoordinator.PlayingGameMode, true, loader, Tid);
 
@@ -162,7 +163,7 @@ internal static class Program
     private static void TitleAndModeGuards()
     {
         var c = NewCoordinator();
-        var loader = new object();
+        var loader = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loader, Tid, out _, out _);
         var title = c.Complete(0, true, loader, Tid);
         var restored = c.Complete(WorldReadyCoordinator.PlayingGameMode, true, loader, Tid);
@@ -193,7 +194,7 @@ internal static class Program
     private static void ThreadGuards()
     {
         var c = NewCoordinator();
-        var loader = new object();
+        var loader = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loader, Tid, out _, out _);
         CompletionOutcome? wrong = null;
         var thread = new Thread(() =>
@@ -221,12 +222,12 @@ internal static class Program
     private static void ReloadAndSwitch()
     {
         var c = NewCoordinator();
-        var first = new object();
+        var first = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, first, Tid, out var firstId, out _);
         c.Complete(WorldReadyCoordinator.PlayingGameMode, true, first, Tid);
         c.ResetWorld(Tid, "return-to-title");
 
-        var second = new object();
+        var second = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, second, Tid, out var secondId, out _);
         var secondOutcome = c.Complete(WorldReadyCoordinator.PlayingGameMode, true, second, Tid);
         Check("same_day_reload_plus_one",
@@ -235,7 +236,7 @@ internal static class Program
             "observations=" + c.ObservationCount);
 
         c.ResetWorld(Tid, "switch-save");
-        var third = new object();
+        var third = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, third, Tid, out _, out _);
         var thirdOutcome = c.Complete(WorldReadyCoordinator.PlayingGameMode, true, third, Tid);
         Check("switch_save_plus_one", thirdOutcome.Accepted && c.ObservationCount == 3,
@@ -245,7 +246,7 @@ internal static class Program
     private static void FailureAndCancel()
     {
         var c = NewCoordinator();
-        var loader = new object();
+        var loader = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loader, Tid, out _, out _);
         c.ResetWorld(Tid, "cancel");
         var late = c.Complete(0, true, loader, Tid);
@@ -258,11 +259,11 @@ internal static class Program
     private static void StaleAttemptDoesNotEatNext()
     {
         var c = NewCoordinator();
-        var loaderA = new object();
+        var loaderA = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loaderA, Tid, out _, out _);
         c.ResetWorld(Tid, "cancel A");
 
-        var loaderB = new object();
+        var loaderB = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loaderB, Tid, out var bId, out _);
         var stale = c.Complete(WorldReadyCoordinator.PlayingGameMode, true, loaderA, Tid);
         var preserved = c.PendingAttemptId == bId;
@@ -279,11 +280,11 @@ internal static class Program
     {
         var c = new WorldReadyCoordinator(CorrelationMode.PendingOnly);
         c.TrySetGameLoopThread(Tid);
-        var loaderA = new object();
+        var loaderA = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loaderA, Tid, out _, out _);
         c.ResetWorld(Tid, "cancel A");
 
-        var loaderB = new object();
+        var loaderB = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loaderB, Tid, out var bId, out _);
         var stale = c.Complete(WorldReadyCoordinator.PlayingGameMode, true, loaderA, Tid);
         var fresh = c.Complete(WorldReadyCoordinator.PlayingGameMode, true, loaderB, Tid);
@@ -297,9 +298,9 @@ internal static class Program
     private static void SupersededAttempt()
     {
         var c = NewCoordinator();
-        var loaderA = new object();
+        var loaderA = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loaderA, Tid, out _, out _);
-        var loaderB = new object();
+        var loaderB = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loaderB, Tid, out var bId, out _);
         var old = c.Complete(WorldReadyCoordinator.PlayingGameMode, true, loaderA, Tid);
         var current = c.Complete(WorldReadyCoordinator.PlayingGameMode, true, loaderB, Tid);
@@ -313,7 +314,7 @@ internal static class Program
     private static void ResetEpochClosesStartRace()
     {
         var c = NewCoordinator();
-        var loader = new object();
+        var loader = new TestLoader();
         var epochReadByCallSite = c.ResetEpoch;
 
         // The worker read the epoch (and believes the load is live) ...
@@ -333,7 +334,7 @@ internal static class Program
         for (var i = 0; i < 100; i++)
         {
             var c = NewCoordinator();
-            var loader = new object();
+            var loader = new TestLoader();
             c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loader, Tid, out _, out _);
 
             CompletionOutcome? outcome = null;
@@ -374,7 +375,7 @@ internal static class Program
     private static void ResetLifecycle()
     {
         var c = NewCoordinator();
-        var loader = new object();
+        var loader = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loader, Tid, out var id, out _);
         var began = c.TryBeginReset(Tid, "title", out var epoch, out var refusal);
         Check("reset_cancels_pending_and_bumps_epoch",
@@ -401,7 +402,7 @@ internal static class Program
     {
         // Start inside the reset window: epoch is current, the fields are the previous world's.
         var c = NewCoordinator();
-        var loader = new object();
+        var loader = new TestLoader();
         c.TryBeginReset(Tid, "title", out var epoch, out _);
         var begun = c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loader, Tid,
             epoch, out _, out var refusal);
@@ -447,7 +448,7 @@ internal static class Program
 
         // Normal retry after a reset still produces exactly one observation.
         c = NewCoordinator();
-        var retryLoader = new object();
+        var retryLoader = new TestLoader();
         c.TryBeginReset(Tid, "title", out _, out _);
         c.TryCompleteReset(Tid, out _);
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, retryLoader, Tid,
@@ -489,7 +490,7 @@ internal static class Program
         var epochBefore = c.ResetEpoch;
         c.TryBeginReset(Tid, "title", out _, out _);
         c.TryCompleteReset(Tid, out _);
-        var loaderB = new object();
+        var loaderB = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loaderB, Tid,
             c.ResetEpoch, out var bId, out _);
         var staleBegin = c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loaderB,
@@ -507,7 +508,7 @@ internal static class Program
         // Completion committed first, reset second: the observation stands, the reset only bumps
         // the epoch and cancels nothing.
         var c = NewCoordinator();
-        var loader = new object();
+        var loader = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loader, Tid, out _, out _);
         c.Complete(WorldReadyCoordinator.PlayingGameMode, true, loader, Tid);
         c.TryBeginReset(Tid, "title", out var epoch, out _);
@@ -541,12 +542,12 @@ internal static class Program
     private static void LateCompletionReadsBLoader()
     {
         var c = NewCoordinator();
-        var loaderA = new object();
+        var loaderA = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loaderA, Tid, out _, out _);
         c.TryBeginReset(Tid, "cancel A", out _, out _);
         c.TryCompleteReset(Tid, out _);
 
-        var loaderB = new object();
+        var loaderB = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loaderB, Tid,
             c.ResetEpoch, out var bId, out _);
 
@@ -568,7 +569,7 @@ internal static class Program
     private static void ResetThreadCases()
     {
         var c = NewCoordinator();
-        var loader = new object();
+        var loader = new TestLoader();
         c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loader, Tid, out var id, out _);
         var epochBefore = c.ResetEpoch;
 
@@ -622,6 +623,364 @@ internal static class Program
             "signals=" + SignalPath(ordered));
     }
 
+    // ------------------------------------------------------- section 1b: attempt ownership (P.2)
+
+    private static WorldReadyCoordinator NewOwnershipCoordinator()
+    {
+        var coordinator = new WorldReadyCoordinator(CorrelationMode.StateMachineIdentity);
+        coordinator.TrySetGameLoopThread(Tid);
+        return coordinator;
+    }
+
+    private static void AttemptOwnershipCases()
+    {
+        OwnershipCompletionOnce();
+        ForeignIdentityPreservesNewerPending();
+        StaleAdvanceWithNewerIdentityCannotComplete();
+        MissingIdentityPreservesPending();
+        UnprovenPendingIdentityRefused();
+        OwnedWrongThreadPreserves();
+        OwnedNotReadyConsumesWithoutObservation();
+        FailedLoadConsumesWithoutObservation();
+        AdvanceDuringResetRefused();
+        DayStartedEdgeCannotCompleteLoad();
+        ReloadAndCrossDay();
+        AdvanceVersusResetRace();
+    }
+
+    private static void OwnershipCompletionOnce()
+    {
+        var c = NewOwnershipCoordinator();
+        var loader = new TestLoader();
+        var begun = c.BeginLoad(loader, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid,
+            out var id, out var refusal);
+        var first = c.Advance(loader, WorldReadyCoordinator.PlayingGameMode, moved: true,
+            hasLoadedGame: true, Tid);
+        var second = c.Advance(loader, WorldReadyCoordinator.PlayingGameMode, moved: true,
+            hasLoadedGame: true, Tid);
+        Check("ownership_completion_once",
+            begun && refusal == RefusalKind.None &&
+            first.Kind == AdvanceOutcomeKind.Completed && first.OwnershipVerified &&
+            first.AttemptId == id &&
+            first.Observation is
+            {
+                AttemptOwnershipProven: true,
+                Basis: AttributionBasis.LoadStateMachine,
+                Kind: AttemptKind.Load,
+            } &&
+            !second.Kind.Equals(AdvanceOutcomeKind.Completed) &&
+            second.Refusal == RefusalKind.AlreadyConsumed &&
+            c.ObservationCount == 1,
+            "begun=" + begun + ", kind=" + first.Kind + ", basis=" + first.Observation?.Basis +
+            ", ownership=" + first.Observation?.AttemptOwnershipProven +
+            ", duplicate=" + second.Refusal + ", observations=" + c.ObservationCount);
+    }
+
+    private static void ForeignIdentityPreservesNewerPending()
+    {
+        var c = NewOwnershipCoordinator();
+        var loaderA = new TestLoader();
+        c.BeginLoad(loaderA, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out _, out _);
+        c.TryBeginReset(Tid, "cancel A", out _, out _);
+        c.TryCompleteReset(Tid, out _);
+
+        var loaderB = new TestLoader();
+        c.BeginLoad(loaderB, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out var bId,
+            out _);
+
+        // A's completion edge names A's own object: it is foreign to B and must not touch it.
+        var foreign = c.Advance(loaderA, WorldReadyCoordinator.PlayingGameMode, moved: true,
+            hasLoadedGame: true, Tid);
+        var preserved = c.PendingAttemptId == bId;
+
+        var real = c.Advance(loaderB, WorldReadyCoordinator.PlayingGameMode, moved: true,
+            hasLoadedGame: true, Tid);
+        Check("foreign_identity_preserves_newer_pending",
+            foreign.Kind == AdvanceOutcomeKind.Refused &&
+            foreign.Refusal == RefusalKind.ForeignAttemptIdentity && foreign.PendingPreserved &&
+            preserved && real.Kind == AdvanceOutcomeKind.Completed && real.AttemptId == bId &&
+            c.ObservationCount == 1 && c.RefusalCount(RefusalKind.ForeignAttemptIdentity) == 1,
+            "foreign=" + foreign.Refusal + ", preserved=" + preserved + ", observations=" +
+            c.ObservationCount);
+    }
+
+    /// <summary>
+    /// The P.2 replacement for counterexample B: A's late advance that reads B's loader object still
+    /// cannot observe or clear B, because B is still in the loading mode. Only an advance that sees
+    /// the playing mode — that is, B's own enumerator flipping it — can complete B.
+    /// </summary>
+    private static void StaleAdvanceWithNewerIdentityCannotComplete()
+    {
+        var c = NewOwnershipCoordinator();
+        var loaderA = new TestLoader();
+        c.BeginLoad(loaderA, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out _, out _);
+        c.TryBeginReset(Tid, "cancel A", out _, out _);
+        c.TryCompleteReset(Tid, out _);
+
+        var loaderB = new TestLoader();
+        c.BeginLoad(loaderB, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out var bId,
+            out _);
+
+        var stale = c.Advance(loaderB, WorldReadyCoordinator.LoadingGameMode, moved: true,
+            hasLoadedGame: true, Tid);
+        var preserved = c.PendingAttemptId == bId;
+        var observedAfterStale = c.ObservationCount;
+
+        var real = c.Advance(loaderB, WorldReadyCoordinator.PlayingGameMode, moved: true,
+            hasLoadedGame: true, Tid);
+        Check("stale_advance_cannot_complete_b",
+            stale.Kind == AdvanceOutcomeKind.InProgress && preserved && observedAfterStale == 0 &&
+            real.Kind == AdvanceOutcomeKind.Completed && real.AttemptId == bId &&
+            c.ObservationCount == 1,
+            "stale=" + stale.Kind + ", observedAfterStale=" + observedAfterStale +
+            ", real=" + real.Kind + ", observations=" + c.ObservationCount);
+    }
+
+    private static void MissingIdentityPreservesPending()
+    {
+        var c = NewOwnershipCoordinator();
+        var loaderB = new TestLoader();
+        c.BeginLoad(loaderB, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out var bId,
+            out _);
+
+        var missing = c.Advance(null, WorldReadyCoordinator.PlayingGameMode, moved: true,
+            hasLoadedGame: true, Tid);
+        Check("missing_identity_preserves_pending",
+            missing.Kind == AdvanceOutcomeKind.Refused &&
+            missing.Refusal == RefusalKind.MissingAttemptIdentity && missing.PendingPreserved &&
+            c.PendingAttemptId == bId && c.ObservationCount == 0,
+            "refusal=" + missing.Refusal + ", pending=" + c.PendingAttemptId +
+            ", observations=" + c.ObservationCount);
+    }
+
+    private static void UnprovenPendingIdentityRefused()
+    {
+        var c = NewOwnershipCoordinator();
+        var loader = new TestLoader();
+        // The legacy start edge records a loader but no proven identity.
+        c.TryBeginAttempt(true, WorldReadyCoordinator.LoadingGameMode, loader, Tid, out var id,
+            out _);
+        var advance = c.Advance(loader, WorldReadyCoordinator.PlayingGameMode, moved: true,
+            hasLoadedGame: true, Tid);
+        Check("unproven_pending_identity_refused",
+            advance.Kind == AdvanceOutcomeKind.Refused &&
+            advance.Refusal == RefusalKind.MissingAttemptIdentity && advance.PendingPreserved &&
+            c.PendingAttemptId == id && c.ObservationCount == 0,
+            "refusal=" + advance.Refusal + ", pending=" + c.PendingAttemptId);
+    }
+
+    private static void OwnedWrongThreadPreserves()
+    {
+        var c = NewOwnershipCoordinator();
+        var loader = new TestLoader();
+        c.BeginLoad(loader, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out var id,
+            out _);
+
+        LoadAdvanceOutcome? off = null;
+        var thread = new Thread(() =>
+        {
+            off = c.Advance(loader, WorldReadyCoordinator.PlayingGameMode, moved: true,
+                hasLoadedGame: true, Environment.CurrentManagedThreadId);
+        });
+        thread.Start();
+        thread.Join();
+
+        Check("owned_wrong_thread_preserves",
+            off is
+            {
+                Kind: AdvanceOutcomeKind.Refused,
+                Refusal: RefusalKind.OwnedButWrongThread,
+                OwnershipVerified: true,
+                PendingPreserved: true,
+            } &&
+            c.PendingAttemptId == id && c.ObservationCount == 0 &&
+            c.RefusalCount(RefusalKind.OwnedButWrongThread) == 1,
+            "wrong=" + off?.Refusal + ", owned=" + off?.OwnershipVerified +
+            ", pending=" + c.PendingAttemptId + " (defined: preserve, an off-thread advance is not " +
+            "trustworthy evidence the attempt ended)");
+    }
+
+    private static void OwnedNotReadyConsumesWithoutObservation()
+    {
+        var c = NewOwnershipCoordinator();
+        var loader = new TestLoader();
+        c.BeginLoad(loader, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out _,
+            out _);
+        var advance = c.Advance(loader, WorldReadyCoordinator.PlayingGameMode, moved: true,
+            hasLoadedGame: false, Tid);
+        Check("owned_not_ready_consumes_without_observation",
+            advance.Kind == AdvanceOutcomeKind.Failed && advance.OwnershipVerified &&
+            advance.Refusal == RefusalKind.OwnedButWorldNotLoaded && advance.PendingCleared &&
+            !advance.PendingPreserved && c.PendingAttemptId == 0 && c.ObservationCount == 0 &&
+            c.OwnedTerminalWithoutObservation == 1,
+            "refusal=" + advance.Refusal + ", cleared=" + advance.PendingCleared +
+            ", observations=" + c.ObservationCount + ", ownedTerminal=" +
+            c.OwnedTerminalWithoutObservation);
+    }
+
+    private static void FailedLoadConsumesWithoutObservation()
+    {
+        var c = NewOwnershipCoordinator();
+        var loader = new TestLoader();
+        c.BeginLoad(loader, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out _,
+            out _);
+        var advance = c.Advance(loader, WorldReadyCoordinator.LoadingGameMode, moved: false,
+            hasLoadedGame: false, Tid);
+        Check("failed_load_consumes_without_observation",
+            advance.Kind == AdvanceOutcomeKind.Failed && advance.OwnershipVerified &&
+            advance.Refusal == RefusalKind.LoadFailed && advance.PendingCleared &&
+            c.PendingAttemptId == 0 && c.ObservationCount == 0 &&
+            c.OwnedTerminalWithoutObservation == 1,
+            "refusal=" + advance.Refusal + ", observations=" + c.ObservationCount);
+    }
+
+    private static void AdvanceDuringResetRefused()
+    {
+        var c = NewOwnershipCoordinator();
+        var loader = new TestLoader();
+        c.BeginLoad(loader, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out _,
+            out _);
+        c.TryBeginReset(Tid, "title", out _, out _);
+        var advance = c.Advance(loader, WorldReadyCoordinator.PlayingGameMode, moved: true,
+            hasLoadedGame: true, Tid);
+        Check("advance_during_reset_refused",
+            advance.Kind == AdvanceOutcomeKind.Refused &&
+            advance.Refusal == RefusalKind.ResetInProgress && c.ObservationCount == 0 &&
+            c.PendingAttemptId == 0,
+            "refusal=" + advance.Refusal + ", observations=" + c.ObservationCount);
+    }
+
+    /// <summary>
+    /// The OnDayStarted edge cannot complete a P.2 load attempt: it carries no identity, and the real
+    /// success path leaves <c>currentLoader</c> either null or pointing at a newer attempt.
+    /// </summary>
+    private static void DayStartedEdgeCannotCompleteLoad()
+    {
+        var c = NewOwnershipCoordinator();
+        var loader = new TestLoader();
+        c.BeginLoad(loader, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out var id,
+            out _);
+        var dayStarted = c.Complete(WorldReadyCoordinator.PlayingGameMode, true, null, Tid);
+        Check("day_started_edge_cannot_complete_load",
+            !dayStarted.Accepted &&
+            dayStarted.Refusal == RefusalKind.MissingAttemptIdentity &&
+            dayStarted.PendingPreserved && c.PendingAttemptId == id && c.ObservationCount == 0,
+            "refusal=" + dayStarted.Refusal + ", preserved=" + c.PendingAttemptId +
+            " (the day-started hook reads a global, not an attempt identity)");
+    }
+
+    private static void ReloadAndCrossDay()
+    {
+        var c = NewOwnershipCoordinator();
+        var first = new TestLoader();
+        c.BeginLoad(first, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out var firstId,
+            out _);
+        c.Advance(first, WorldReadyCoordinator.PlayingGameMode, moved: true, hasLoadedGame: true, Tid);
+        var crossDay = c.Complete(WorldReadyCoordinator.PlayingGameMode, true, null, Tid);
+
+        var second = new TestLoader();
+        c.BeginLoad(second, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out var secondId,
+            out _);
+        var secondOutcome = c.Advance(second, WorldReadyCoordinator.PlayingGameMode, moved: true,
+            hasLoadedGame: true, Tid);
+
+        Check("reload_plus_one_cross_day_zero",
+            secondOutcome.Kind == AdvanceOutcomeKind.Completed && secondId > firstId &&
+            !crossDay.Accepted && c.ObservationCount == 2,
+            "observations=" + c.ObservationCount + ", crossDay=" + crossDay.Refusal +
+            " (a normal cross-day is not a first-load completion)");
+    }
+
+    private static void AdvanceVersusResetRace()
+    {
+        var violations = 0;
+        var completedWins = 0;
+        var resetWins = 0;
+        var concurrent = 0;
+
+        for (var i = 0; i < 100; i++)
+        {
+            var c = NewOwnershipCoordinator();
+            var loader = new TestLoader();
+            c.BeginLoad(loader, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out _,
+                out _);
+
+            if (i % 3 == 0)
+            {
+                // Deterministic ordering 1: the completion commits, then the reset lands.
+                var outcome = c.Advance(loader, WorldReadyCoordinator.PlayingGameMode, moved: true,
+                    hasLoadedGame: true, Tid);
+                c.TryBeginReset(Tid, "after completion", out _, out _);
+                if (outcome.Kind == AdvanceOutcomeKind.Completed && c.ObservationCount == 1 &&
+                    c.PendingAttemptId == 0)
+                {
+                    completedWins++;
+                }
+                else
+                {
+                    violations++;
+                }
+
+                continue;
+            }
+
+            if (i % 3 == 1)
+            {
+                // Deterministic ordering 2: the reset commits first, then the advance arrives.
+                c.TryBeginReset(Tid, "before completion", out _, out _);
+                var outcome = c.Advance(loader, WorldReadyCoordinator.PlayingGameMode, moved: true,
+                    hasLoadedGame: true, Tid);
+                if (outcome.Kind != AdvanceOutcomeKind.Completed && c.ObservationCount == 0)
+                {
+                    resetWins++;
+                }
+                else
+                {
+                    violations++;
+                }
+
+                continue;
+            }
+
+            // Genuine concurrency: both threads released together, invariants only.
+            concurrent++;
+            LoadAdvanceOutcome? raced = null;
+            using var barrier = new Barrier(2);
+            var thread = new Thread(() =>
+            {
+                barrier.SignalAndWait();
+                raced = c.Advance(loader, WorldReadyCoordinator.PlayingGameMode, moved: true,
+                    hasLoadedGame: true, Tid);
+            });
+            thread.Start();
+            barrier.SignalAndWait();
+            c.TryBeginReset(Tid, "race", out _, out _);
+            thread.Join();
+
+            if (c.ObservationCount > 1)
+            {
+                violations++;
+            }
+
+            if (raced is { Kind: AdvanceOutcomeKind.Completed })
+            {
+                if (c.ObservationCount != 1)
+                {
+                    violations++;
+                }
+            }
+            else if (c.ObservationCount != 0)
+            {
+                violations++;
+            }
+        }
+
+        Check("advance_versus_reset_race_invariants",
+            violations == 0 && completedWins > 0 && resetWins > 0 && concurrent > 0,
+            "100 races: completionFirst=" + completedWins + ", resetFirst=" + resetWins +
+            ", concurrent=" + concurrent + ", violations=" + violations);
+    }
+
     // ------------------------------------------------------------------ section 2: synthetic IL
 
     private static void SyntheticCases()
@@ -640,6 +999,198 @@ internal static class Program
         SyntheticResetShapeRejections();
         SyntheticEpochOrderRegression();
         SyntheticResetEHEndBoundary();
+        SyntheticOwnershipCases();
+    }
+
+    private static void SyntheticOwnershipCases()
+    {
+        SyntheticAdvanceShape();
+        SyntheticAdvanceCompletesOnce();
+        SyntheticAdvanceForeignIdentity();
+        SyntheticAdvanceWrongThread();
+        SyntheticAdvanceMissingRejected();
+        SyntheticAdvanceHookShapeRejected();
+    }
+
+    private static void SyntheticAdvanceShape()
+    {
+        var fixture = SyntheticFixture.Build("adv-shape");
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var result = PrototypeInjector.Inject(targets, fixture.Hooks);
+        var verification = PrototypeInjector.Verify(targets, fixture.Hooks);
+        Check("synthetic_advance_shape",
+            result.AdvanceCalls == 1 && verification.Ok && verification.AdvanceCalls == 1 &&
+            verification.AdvanceIdentityFromLocal && verification.AdvanceGuardsIntact &&
+            verification.AdvanceSiteUnprotected,
+            "adv=" + verification.AdvanceCalls + ", identityFromLocal=" +
+            verification.AdvanceIdentityFromLocal + ", guards=" + verification.AdvanceGuardsIntact +
+            ", unprotected=" + verification.AdvanceSiteUnprotected + ", maxstack=" +
+            result.AdvanceMaxStackBefore + "->" + result.AdvanceMaxStackAfter + ", problems=" +
+            string.Join("; ", verification.Problems));
+    }
+
+    /// <summary>
+    /// Write -> reload -> execute: the identity-carrying completion edge completes a load attempt once
+    /// and ignores its duplicate, entirely through the injected IL, the bridge and the coordinator.
+    /// </summary>
+    private static void SyntheticAdvanceCompletesOnce()
+    {
+        var fixture = SyntheticFixture.Build("adv-once");
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        PrototypeInjector.Inject(targets, fixture.Hooks);
+        var assembly = Load(fixture, "adv-once");
+
+        var coordinator = NewOwnershipCoordinator();
+        var sink = new CoordinatorSink(coordinator);
+        PrototypeBridge.Install(sink);
+        try
+        {
+            var loader = new TestLoader(true, true, true);
+            SetStatic(assembly, "currentLoader", loader);
+            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadingGameMode);
+            SetStatic(assembly, "hasLoadedGame", true);
+            InvokeLoad(assembly, true);
+
+            var pending = coordinator.PendingAttemptId;
+            InvokeAdvance(assembly);
+            var stillPending = coordinator.PendingAttemptId == pending;
+
+            // The enumerator itself performs the success handoff by flipping the mode.
+            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.PlayingGameMode);
+            InvokeAdvance(assembly);
+            var observed = coordinator.ObservationCount;
+            InvokeAdvance(assembly);
+
+            Check("synthetic_advance_completes_once",
+                stillPending && observed == 1 && coordinator.ObservationCount == 1 &&
+                coordinator.Observations[0].AttemptOwnershipProven &&
+                coordinator.Observations[0].Basis == AttributionBasis.LoadStateMachine &&
+                coordinator.Observations[0].AttemptId == pending &&
+                coordinator.RefusalCount(RefusalKind.AlreadyConsumed) == 1,
+                "pendingAfterFirst=" + stillPending + ", observations=" + coordinator.ObservationCount +
+                ", basis=" + (coordinator.ObservationCount == 1
+                    ? coordinator.Observations[0].Basis
+                    : AttributionBasis.None) +
+                ", ownership=" + (coordinator.ObservationCount == 1 &&
+                                  coordinator.Observations[0].AttemptOwnershipProven));
+        }
+        finally
+        {
+            PrototypeBridge.Install(null);
+        }
+    }
+
+    /// <summary>
+    /// A -> reset -> B -> A's advance naming A's object: refused as foreign, B preserved, B then
+    /// completes exactly once. Runs through the injected IL, not the coordinator alone.
+    /// </summary>
+    private static void SyntheticAdvanceForeignIdentity()
+    {
+        var fixture = SyntheticFixture.Build("adv-foreign");
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        PrototypeInjector.Inject(targets, fixture.Hooks);
+        var assembly = Load(fixture, "adv-foreign");
+
+        var coordinator = NewOwnershipCoordinator();
+        var sink = new CoordinatorSink(coordinator);
+        PrototypeBridge.Install(sink);
+        try
+        {
+            var loaderA = new TestLoader(true, true, true);
+            SetStatic(assembly, "currentLoader", loaderA);
+            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadingGameMode);
+            SetStatic(assembly, "hasLoadedGame", true);
+            InvokeLoad(assembly, true);
+
+            InvokeReset(assembly);
+
+            var loaderB = new TestLoader(true, true, true);
+            SetStatic(assembly, "currentLoader", loaderB);
+            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadingGameMode);
+            SetStatic(assembly, "hasLoadedGame", true);
+            InvokeLoad(assembly, true);
+            var bId = coordinator.PendingAttemptId;
+
+            // A's stale advance can only see the loading mode and A's own object.
+            SetStatic(assembly, "currentLoader", loaderA);
+            InvokeAdvance(assembly);
+            var preserved = coordinator.PendingAttemptId == bId;
+
+            SetStatic(assembly, "currentLoader", loaderB);
+            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.PlayingGameMode);
+            InvokeAdvance(assembly);
+
+            Check("synthetic_advance_foreign_identity_preserves_b",
+                preserved && coordinator.ObservationCount == 1 &&
+                coordinator.Observations[0].AttemptId == bId &&
+                coordinator.RefusalCount(RefusalKind.ForeignAttemptIdentity) == 1,
+                "preserved=" + preserved + ", observations=" + coordinator.ObservationCount +
+                ", foreignRefusals=" + coordinator.RefusalCount(RefusalKind.ForeignAttemptIdentity));
+        }
+        finally
+        {
+            PrototypeBridge.Install(null);
+        }
+    }
+
+    private static void SyntheticAdvanceWrongThread()
+    {
+        var fixture = SyntheticFixture.Build("adv-thread");
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        PrototypeInjector.Inject(targets, fixture.Hooks);
+        var assembly = Load(fixture, "adv-thread");
+
+        var coordinator = NewOwnershipCoordinator();
+        PrototypeBridge.Install(new CoordinatorSink(coordinator));
+        try
+        {
+            var loader = new TestLoader(true, true, true);
+            SetStatic(assembly, "currentLoader", loader);
+            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadingGameMode);
+            SetStatic(assembly, "hasLoadedGame", true);
+            InvokeLoad(assembly, true);
+            var pending = coordinator.PendingAttemptId;
+            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.PlayingGameMode);
+
+            var thread = new Thread(() => InvokeAdvance(assembly));
+            thread.Start();
+            thread.Join();
+
+            Check("synthetic_advance_wrong_thread_preserves",
+                coordinator.RefusalCount(RefusalKind.OwnedButWrongThread) == 1 &&
+                coordinator.PendingAttemptId == pending && coordinator.ObservationCount == 0,
+                "wrongThreadRefusals=" +
+                coordinator.RefusalCount(RefusalKind.OwnedButWrongThread) +
+                ", pending=" + coordinator.PendingAttemptId + ", observations=" +
+                coordinator.ObservationCount);
+        }
+        finally
+        {
+            PrototypeBridge.Install(null);
+        }
+    }
+
+    private static void SyntheticAdvanceMissingRejected()
+    {
+        var fixture = SyntheticFixture.Build("adv-missing", withAdvance: false);
+        CheckThrows("synthetic_advance_edge_missing_rejected", () =>
+            PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type));
+    }
+
+    private static void SyntheticAdvanceHookShapeRejected()
+    {
+        var fixture = SyntheticFixture.Build("adv-hookshape");
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var bad = new MethodReference(PrototypeInjector.AdvanceHookName, fixture.Module.TypeSystem.Void,
+            fixture.AdvanceHook.DeclaringType)
+        {
+            HasThis = false,
+        };
+        bad.Parameters.Add(new ParameterDefinition(fixture.Module.TypeSystem.Object));
+        var badHooks = new PrototypeHooks(fixture.ResetBeganHook, fixture.ResetCompletedHook,
+            fixture.GetResetEpochHook, fixture.StartHook, fixture.CompletionHook, bad);
+        CheckThrows("synthetic_advance_hook_shape_rejected", () =>
+            PrototypeInjector.Inject(targets, badHooks));
     }
 
     private static void SyntheticSuccess()
@@ -662,7 +1213,7 @@ internal static class Program
         PrototypeBridge.Install(recorder);
         try
         {
-            var loader = new object();
+            var loader = new TestLoader();
             SetStatic(assembly, "currentLoader", loader);
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
             var startThread = new Thread(() => InvokeLoad(assembly, true));
@@ -695,7 +1246,7 @@ internal static class Program
         PrototypeBridge.Install(sink);
         try
         {
-            var loader = new object();
+            var loader = new TestLoader();
             SetStatic(assembly, "currentLoader", loader);
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
             InvokeLoad(assembly, true);
@@ -896,14 +1447,14 @@ internal static class Program
         PrototypeBridge.Install(new CoordinatorSink(coordinator));
         try
         {
-            var loaderA = new object();
+            var loaderA = new TestLoader();
             SetStatic(assembly, "currentLoader", loaderA);
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
             InvokeLoad(assembly, true);
 
             coordinator.ResetWorld(Tid, "cancel A");
 
-            var loaderB = new object();
+            var loaderB = new TestLoader();
             SetStatic(assembly, "currentLoader", loaderB);
             InvokeLoad(assembly, true);
             var pendingB = coordinator.PendingAttemptId;
@@ -943,7 +1494,7 @@ internal static class Program
         PrototypeBridge.Install(sink);
         try
         {
-            var loader = new object();
+            var loader = new TestLoader();
             SetStatic(assembly, "currentLoader", loader);
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
             SetStatic(assembly, "hasLoadedGame", true);
@@ -969,7 +1520,7 @@ internal static class Program
                 ", hasLoadedGame=" + GetStatic<bool>(assembly, "hasLoadedGame"));
 
             // A start after the completed reset is accepted under the new epoch.
-            var loaderB = new object();
+            var loaderB = new TestLoader();
             SetStatic(assembly, "currentLoader", loaderB);
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
             InvokeLoad(assembly, true);
@@ -1008,7 +1559,7 @@ internal static class Program
         PrototypeBridge.Install(sink);
         try
         {
-            var loaderA = new object();
+            var loaderA = new TestLoader();
             SetStatic(assembly, "currentLoader", loaderA);
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
             SetStatic(assembly, "hasLoadedGame", true);
@@ -1030,7 +1581,7 @@ internal static class Program
             var staleRefused = coordinator.RefusalCount(RefusalKind.ResetEpochChanged) == 1;
 
             // B starts under the new epoch and completes exactly once.
-            var loaderB = new object();
+            var loaderB = new TestLoader();
             SetStatic(assembly, "currentLoader", loaderB);
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
             InvokeLoad(assembly, true);
@@ -1074,7 +1625,7 @@ internal static class Program
         try
         {
             // Previous world still visible: mode 6, loader A, hasLoadedGame true.
-            var loaderA = new object();
+            var loaderA = new TestLoader();
             SetStatic(assembly, "currentLoader", loaderA);
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
             SetStatic(assembly, "hasLoadedGame", true);
@@ -1101,7 +1652,7 @@ internal static class Program
             var noPendingInWindow = coordinator.PendingAttemptId == 0;
 
             // After the reset completed, a fresh start and completion are accepted exactly once.
-            var loaderB = new object();
+            var loaderB = new TestLoader();
             SetStatic(assembly, "currentLoader", loaderB);
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
             InvokeLoad(assembly, true);
@@ -1141,14 +1692,14 @@ internal static class Program
         PrototypeBridge.Install(new CoordinatorSink(coordinator));
         try
         {
-            var loaderA = new object();
+            var loaderA = new TestLoader();
             SetStatic(assembly, "currentLoader", loaderA);
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
             InvokeLoad(assembly, true);
 
             InvokeReset(assembly);
 
-            var loaderB = new object();
+            var loaderB = new TestLoader();
             SetStatic(assembly, "currentLoader", loaderB);
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
             InvokeLoad(assembly, true);
@@ -1197,7 +1748,7 @@ internal static class Program
         PrototypeBridge.Install(new CoordinatorSink(coordinator));
         try
         {
-            var loader = new object();
+            var loader = new TestLoader();
             SetStatic(throwingAssembly, "currentLoader", loader);
             SetStatic(throwingAssembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
             SetStatic(throwingAssembly, "hasLoadedGame", true);
@@ -1222,7 +1773,7 @@ internal static class Program
             InvokeReset(normalAssembly);
             var healed = !coordinator.ResetInProgress;
 
-            SetStatic(throwingAssembly, "currentLoader", new object());
+            SetStatic(throwingAssembly, "currentLoader", new TestLoader());
             SetStatic(throwingAssembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
             InvokeLoad(throwingAssembly, true);
             var startAccepted = coordinator.PendingAttemptId != 0;
@@ -1298,7 +1849,7 @@ internal static class Program
         // Model-level negative control: the epoch-less Begin overload accepts a start whose
         // evidence was read before the reset. That is the "old wiring" that regresses.
         var c = NewCoordinator();
-        var loader = new object();
+        var loader = new TestLoader();
         c.TryBeginReset(Tid, "title", out _, out _);
         c.TryCompleteReset(Tid, out _);
         var accepted = c.TryBeginAttempt(true, WorldReadyCoordinator.LoadScreenGameMode, loader, Tid,
@@ -1381,6 +1932,19 @@ internal static class Program
         var method = type.GetMethod(PrototypeInjector.ResetMethodName,
                          BindingFlags.Public | BindingFlags.Instance)
                      ?? throw new InvalidOperationException("ResetGameStateOnTitleScreen missing");
+        method.Invoke(instance, null);
+    }
+
+    /// <summary>Drives the injected loading-mode advance edge.</summary>
+    private static void InvokeAdvance(Assembly assembly)
+    {
+        var type = assembly.GetType(SyntheticFixture.Game1Type)
+                   ?? throw new InvalidOperationException("synthetic Game1 missing");
+        var instance = Activator.CreateInstance(type)
+                       ?? throw new InvalidOperationException("synthetic Game1 ctor failed");
+        var method = type.GetMethod(PrototypeInjector.AdvanceMethodName,
+                         BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance)
+                     ?? throw new InvalidOperationException("UpdateTitleScreenDuringLoadingMode missing");
         method.Invoke(instance, null);
     }
 
@@ -1477,6 +2041,22 @@ internal static class Program
             LastLoader = loader;
             CompletedThreadId = threadId;
         }
+
+        public int AdvanceCount;
+        public bool LastAdvanceMoved;
+        public int LastAdvanceGameMode = -1;
+        public bool LastAdvanceHasLoadedGame;
+        public object? LastAdvanceLoader;
+
+        public void OnLoadAdvanced(object? loader, int gameMode, bool moved, bool hasLoadedGame,
+            int threadId)
+        {
+            AdvanceCount++;
+            LastAdvanceLoader = loader;
+            LastAdvanceGameMode = gameMode;
+            LastAdvanceMoved = moved;
+            LastAdvanceHasLoadedGame = hasLoadedGame;
+        }
     }
 
     /// <summary>
@@ -1526,6 +2106,12 @@ internal static class Program
         public void OnDayCompleted(int gameMode, bool hasLoadedGame, object? loader, int threadId)
         {
             _inner.OnDayCompleted(gameMode, hasLoadedGame, loader, threadId);
+        }
+
+        public void OnLoadAdvanced(object? loader, int gameMode, bool moved, bool hasLoadedGame,
+            int threadId)
+        {
+            _inner.OnLoadAdvanced(loader, gameMode, moved, hasLoadedGame, threadId);
         }
     }
 }

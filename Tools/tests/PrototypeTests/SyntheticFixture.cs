@@ -93,12 +93,14 @@ internal sealed class SyntheticFixture
     public MethodDefinition LoadForNewGame = null!;
     public MethodDefinition OnDayStarted = null!;
     public MethodDefinition ResetGameStateOnTitleScreen = null!;
+    public MethodDefinition UpdateTitleScreenDuringLoadingMode = null!;
     public MethodDefinition GetGameMode = null!;
     public MethodReference ResetBeganHook = null!;
     public MethodReference ResetCompletedHook = null!;
     public MethodReference GetResetEpochHook = null!;
     public MethodReference StartHook = null!;
     public MethodReference CompletionHook = null!;
+    public MethodReference AdvanceHook = null!;
 
     public FieldDefinition GameMode = null!;
     public FieldDefinition HasLoadedGame = null!;
@@ -107,19 +109,21 @@ internal sealed class SyntheticFixture
     public FieldDefinition BodyCount = null!;
     public FieldDefinition FinallyCount = null!;
     public FieldDefinition ResetCount = null!;
+    public FieldDefinition AdvanceSuccessCount = null!;
+    public FieldDefinition AdvanceExitCount = null!;
 
     public PrototypeHooks Hooks
     {
         get
         {
             return new PrototypeHooks(ResetBeganHook, ResetCompletedHook, GetResetEpochHook, StartHook,
-                CompletionHook);
+                CompletionHook, AdvanceHook);
         }
     }
 
     public static SyntheticFixture Build(string tag, bool withState = true, bool withFinally = true,
         bool retInsideTry = false, bool handlerOnlyRet = false, bool throws = false,
-        ResetShape resetShape = ResetShape.Normal)
+        ResetShape resetShape = ResetShape.Normal, bool withAdvance = true)
     {
         var fixture = new SyntheticFixture();
         fixture.AssemblyName = "SyntheticGame." + tag;
@@ -143,11 +147,17 @@ internal sealed class SyntheticFixture
         fixture.BodyCount = AddStaticField(game1, "BodyCount", module.TypeSystem.Int32);
         fixture.FinallyCount = AddStaticField(game1, "FinallyCount", module.TypeSystem.Int32);
         fixture.ResetCount = AddStaticField(game1, "ResetCount", module.TypeSystem.Int32);
+        fixture.AdvanceSuccessCount =
+            AddStaticField(game1, "AdvanceSuccessCount", module.TypeSystem.Int32);
+        fixture.AdvanceExitCount = AddStaticField(game1, "AdvanceExitCount", module.TypeSystem.Int32);
 
         if (withState)
         {
             fixture.HasLoadedGame = AddStaticField(game1, "hasLoadedGame", module.TypeSystem.Boolean);
-            fixture.CurrentLoader = AddStaticField(game1, "currentLoader", module.TypeSystem.Object);
+            // Typed like the real field's base interface so the emitted `callvirt MoveNext` matches
+            // the shape the injector recognises.
+            fixture.CurrentLoader =
+                AddStaticField(game1, "currentLoader", module.ImportReference(typeof(System.Collections.IEnumerator)));
         }
 
         fixture.GetGameMode = new MethodDefinition("get_gameMode",
@@ -201,7 +211,76 @@ internal sealed class SyntheticFixture
         EmitResetBody(module, fixture, resetShape);
 
         AddBridgeReferences(module, fixture);
+
+        if (withState && withAdvance)
+        {
+            BuildAdvanceMethod(module, fixture);
+        }
+
         return fixture;
+    }
+
+    /// <summary>
+    /// Mirrors <c>Game1.UpdateTitleScreenDuringLoadingMode</c>: the loader guard, the advance, the
+    /// failure branch that nulls the loader and exits to title, and the success branch with exactly
+    /// two returns. The injector's advance edge requires this shape.
+    /// </summary>
+    private static void BuildAdvanceMethod(ModuleDefinition module, SyntheticFixture fixture)
+    {
+        var method = new MethodDefinition(PrototypeInjector.AdvanceMethodName,
+            MethodAttributes.Assembly | MethodAttributes.HideBySig, module.TypeSystem.Void);
+        fixture.Game1.Methods.Add(method);
+        fixture.UpdateTitleScreenDuringLoadingMode = method;
+
+        var il = method.Body.GetILProcessor();
+
+        var successStart = il.Create(OpCodes.Ldsfld, fixture.AdvanceSuccessCount);
+        var successOne = il.Create(OpCodes.Ldc_I4_1);
+        var successAdd = il.Create(OpCodes.Add);
+        var successStore = il.Create(OpCodes.Stsfld, fixture.AdvanceSuccessCount);
+        var successRet = il.Create(OpCodes.Ret);
+
+        var exitStart = il.Create(OpCodes.Ldsfld, fixture.AdvanceExitCount);
+        var exitOne = il.Create(OpCodes.Ldc_I4_1);
+        var exitAdd = il.Create(OpCodes.Add);
+        var exitStore = il.Create(OpCodes.Stsfld, fixture.AdvanceExitCount);
+
+        // Shared target of both original guards, exactly like the real method's final `ret`.
+        var end = il.Create(OpCodes.Ret);
+        var exitJump = il.Create(OpCodes.Br, end);
+
+        var branchExit = il.Create(OpCodes.Bne_Un, exitStart);
+        var branchEnd = il.Create(OpCodes.Brtrue, end);
+
+        var moveNext = new MethodReference("MoveNext", module.TypeSystem.Boolean,
+            module.ImportReference(typeof(System.Collections.IEnumerator)))
+        {
+            HasThis = true,
+        };
+
+        il.Append(il.Create(OpCodes.Ldsfld, fixture.CurrentLoader));
+        il.Append(il.Create(OpCodes.Brfalse, end));
+        il.Append(il.Create(OpCodes.Ldsfld, fixture.CurrentLoader));
+        il.Append(il.Create(OpCodes.Callvirt, moveNext));
+        il.Append(branchEnd);
+        il.Append(il.Create(OpCodes.Ldnull));
+        il.Append(il.Create(OpCodes.Stsfld, fixture.CurrentLoader));
+        il.Append(il.Create(OpCodes.Call, fixture.GetGameMode));
+        il.Append(il.Create(OpCodes.Ldc_I4_3));
+        il.Append(branchExit);
+        il.Append(successStart);
+        il.Append(successOne);
+        il.Append(successAdd);
+        il.Append(successStore);
+        il.Append(successRet);
+        il.Append(exitStart);
+        il.Append(exitOne);
+        il.Append(exitAdd);
+        il.Append(exitStore);
+        il.Append(exitJump);
+        il.Append(end);
+
+        method.Body.MaxStackSize = 2;
     }
 
     private static void EmitResetBody(ModuleDefinition module, SyntheticFixture fixture,
@@ -574,5 +653,47 @@ internal sealed class SyntheticFixture
         fixture.CompletionHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int32));
         fixture.CompletionHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Boolean));
         fixture.CompletionHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+
+        fixture.AdvanceHook = new MethodReference(PrototypeInjector.AdvanceHookName,
+            module.TypeSystem.Void, type)
+        {
+            HasThis = false,
+        };
+        fixture.AdvanceHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+        fixture.AdvanceHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int32));
+        fixture.AdvanceHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Boolean));
+        fixture.AdvanceHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Boolean));
+    }
+}
+
+/// <summary>
+/// Stand-in load state machine. It implements the same interface the real <c>currentLoader</c> exposes
+/// (<see cref="System.Collections.IEnumerator"/>) so the fixture's <c>callvirt MoveNext</c> has the
+/// real shape, and it lets a test script the sequence of <c>MoveNext</c> results.
+/// </summary>
+public sealed class TestLoader : System.Collections.IEnumerator
+{
+    private readonly Queue<bool> _script;
+
+    public TestLoader(params bool[] script)
+    {
+        _script = new Queue<bool>(script ?? Array.Empty<bool>());
+    }
+
+    public int MoveNextCount { get; private set; }
+
+    public object Current
+    {
+        get { return 0; }
+    }
+
+    public bool MoveNext()
+    {
+        MoveNextCount++;
+        return _script.Count > 0 && _script.Dequeue();
+    }
+
+    public void Reset()
+    {
     }
 }

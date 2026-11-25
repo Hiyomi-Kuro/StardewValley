@@ -70,6 +70,40 @@ public enum RefusalKind
 
     /// <summary>A reset-completed signal arrived with no reset in progress.</summary>
     NoResetInProgress,
+
+    /// <summary>
+    /// A load-advance signal named a loader object that is not the pending attempt's own state
+    /// machine. The pending attempt is <b>preserved</b>: a foreign advance must never consume or
+    /// clear a newer attempt (P.2 §"ownership before consumption").
+    /// </summary>
+    ForeignAttemptIdentity,
+
+    /// <summary>
+    /// A load-advance signal arrived with no usable identity (null loader, or a pending attempt
+    /// that was never given a proven state-machine identity). The pending attempt is preserved.
+    /// </summary>
+    MissingAttemptIdentity,
+
+    /// <summary>
+    /// Ownership of the completion was proven (the advanced state machine is the pending attempt's
+    /// own object), but the signal did not run on the confirmed game-loop thread. Defined behaviour:
+    /// the pending attempt is <b>preserved</b>, because an off-thread advance is not trustworthy
+    /// evidence that the attempt reached its terminal state.
+    /// </summary>
+    OwnedButWrongThread,
+
+    /// <summary>
+    /// Ownership was proven and the handoff reached the playing mode, but <c>hasLoadedGame</c> was
+    /// false, so the world is not readable. Defined behaviour: the attempt is <b>consumed without an
+    /// observation</b> (it is provably over), and the refusal is counted separately.
+    /// </summary>
+    OwnedButWorldNotLoaded,
+
+    /// <summary>
+    /// An owned load enumerator finished (<c>MoveNext()==false</c>) while the game was still in the
+    /// loading mode: the load failed or was abandoned. The attempt is consumed without an observation.
+    /// </summary>
+    LoadFailed,
 }
 
 /// <summary>How completion is correlated with the start signal.</summary>
@@ -86,6 +120,14 @@ public enum CorrelationMode
     /// to show that a tokenless design cannot tell a stale completion from a fresh one.
     /// </summary>
     PendingOnly = 1,
+
+    /// <summary>
+    /// P.2: the completion edge names the load state machine object it just advanced. The identity
+    /// is a value the game itself carries (the <c>IEnumerator&lt;int&gt;</c> created by
+    /// <c>SaveGame.getLoadEnumerator</c> and stored in <c>Game1.currentLoader</c>), not a token this
+    /// prototype invents. See <see cref="WorldReadyCoordinator.Advance"/>.
+    /// </summary>
+    StateMachineIdentity = 2,
 }
 
 /// <summary>
@@ -105,6 +147,13 @@ public enum AttributionBasis
 
     /// <summary>The loader reference captured at start equals the one read at completion.</summary>
     LoaderReference = 1,
+
+    /// <summary>
+    /// P.2: the completion edge reported the load state machine it advanced, and that object is the
+    /// one captured for the pending attempt. This is the only basis for which
+    /// <see cref="WorldReadyObservation.AttemptOwnershipProven"/> is true.
+    /// </summary>
+    LoadStateMachine = 2,
 }
 
 /// <summary>One accepted internal observation.</summary>
@@ -138,12 +187,13 @@ public sealed class WorldReadyObservation
     }
 
     /// <summary>
-    /// Always false for the two-hook design: no signal carries an explicit attempt token, so this
-    /// coordinator never claims that a completion is provably owned by the pending attempt.
+    /// True only when the completion edge carried the pending attempt's own load state machine
+    /// object (P.2). The legacy loader-reference basis keeps this false: reference equality between
+    /// two reads of a global is not ownership.
     /// </summary>
     public bool AttemptOwnershipProven
     {
-        get { return false; }
+        get { return Basis == AttributionBasis.LoadStateMachine; }
     }
 
     public int GameMode { get; }
@@ -179,6 +229,49 @@ public enum SignalKind
     StartRefused,
     CompletionAccepted,
     CompletionRefused,
+
+    /// <summary>P.2: the loading-mode driver advanced the pending load state machine (no state change).</summary>
+    LoadAdvanced,
+}
+
+/// <summary>What one load-advance signal turned out to be.</summary>
+public enum AdvanceOutcomeKind
+{
+    /// <summary>The signal was not about a pending load attempt.</summary>
+    None = 0,
+
+    /// <summary>The enumerator advanced and the load is still in progress (mode 6, more work).</summary>
+    InProgress,
+
+    /// <summary>The enumerator reached the playing mode and produced one observation.</summary>
+    Completed,
+
+    /// <summary>The owned attempt reached a terminal state without an observation.</summary>
+    Failed,
+
+    /// <summary>The signal was refused; see <see cref="LoadAdvanceOutcome.Refusal"/>.</summary>
+    Refused,
+}
+
+/// <summary>Result of one load-advance signal (P.2 completion edge).</summary>
+public sealed class LoadAdvanceOutcome
+{
+    public AdvanceOutcomeKind Kind { get; internal set; }
+
+    public RefusalKind Refusal { get; internal set; }
+
+    public long AttemptId { get; internal set; }
+
+    /// <summary>True when the reported object was the pending attempt's own state machine.</summary>
+    public bool OwnershipVerified { get; internal set; }
+
+    /// <summary>True when the refusal deliberately left the pending attempt untouched.</summary>
+    public bool PendingPreserved { get; internal set; }
+
+    /// <summary>True when the signal consumed (cleared) the pending attempt.</summary>
+    public bool PendingCleared { get; internal set; }
+
+    public WorldReadyObservation? Observation { get; internal set; }
 }
 
 /// <summary>One entry of the coordinator's ordered signal trace (diagnostics only).</summary>
@@ -241,8 +334,20 @@ public sealed class SignalRecord
 /// </summary>
 public sealed class WorldReadyCoordinator
 {
-    /// <summary><c>Game1.loadScreenGameMode</c>, the only mode a real read start runs in.</summary>
+    /// <summary>
+    /// <b>Mode 6 is <c>Game1</c>'s <i>loadingMode</i>, not <c>loadScreenGameMode</c>.</b> In
+    /// 1.6.15.24354 the literal fields are <c>titleScreenGameMode=0</c>, <c>loadScreenGameMode=1</c>,
+    /// <c>newGameMode=2</c>, <c>playingGameMode=3</c>, <c>logoScreenGameMode=4</c>; mode 6 is the
+    /// name "loadingMode" in <c>Game1.GameModeToString</c>. <c>SaveGame.LoadAfterPermissionCheck</c>
+    /// sets mode 6 before it stores the load enumerator, and <c>Game1.UpdateTitleScreen</c>
+    /// dispatches <c>UpdateTitleScreenDuringLoadingMode</c> on mode 6, so 6 is the mode a real load
+    /// attempt starts in. The name is kept for source compatibility with P.1 call sites; use
+    /// <see cref="LoadingGameMode"/> in new code.
+    /// </summary>
     public const int LoadScreenGameMode = 6;
+
+    /// <summary><c>Game1</c> mode 6, the loading mode a load attempt starts in (see above).</summary>
+    public const int LoadingGameMode = 6;
 
     /// <summary><c>Game1.playingGameMode</c>.</summary>
     public const int PlayingGameMode = 3;
@@ -256,6 +361,16 @@ public sealed class WorldReadyCoordinator
         public object? Loader;
         public long ResetEpoch;
         public int StartThreadId;
+
+        /// <summary>
+        /// The object that proves which attempt a completion belongs to. For a P.2 load attempt this
+        /// is the <c>IEnumerator&lt;int&gt;</c> state machine created by
+        /// <c>SaveGame.getLoadEnumerator</c>; <see cref="IdentityProven"/> is true only when the
+        /// start edge obtained that object directly from the load attempt itself.
+        /// </summary>
+        public object? Identity;
+
+        public bool IdentityProven;
     }
 
     private readonly object _gate = new object();
@@ -278,6 +393,8 @@ public sealed class WorldReadyCoordinator
     private long _resetCount;
     private long _completedResetCount;
     private long _signalsDropped;
+    private long _advancesObserved;
+    private long _ownedTerminalWithoutObservation;
 
     public WorldReadyCoordinator(CorrelationMode mode = CorrelationMode.LoaderIdentity,
         bool honorResetInProgress = true)
@@ -729,12 +846,24 @@ public sealed class WorldReadyCoordinator
                 return outcome;
             }
 
+            // P.2: when the coordinator is in identity mode, the ownership-carrying edge is
+            // Advance(...). A signal arriving through the legacy edge (the OnDayStarted hook) carries
+            // no attempt identity at all, so it must not be allowed to consume a proven attempt.
+            if (_mode == CorrelationMode.StateMachineIdentity && pending.IdentityProven)
+            {
+                outcome.Refusal = RefusalKind.MissingAttemptIdentity;
+                outcome.PendingPreserved = true;
+                NoteRefusalLocked(outcome.Refusal);
+                NoteSignalLocked(SignalKind.CompletionRefused, pending.Id, _resetEpoch,
+                    outcome.Refusal, threadId);
+                return outcome;
+            }
+
             if (_gameLoopThreadId == 0)
             {
                 RefuseAndClearLocked(pending, RefusalKind.UnknownGameLoopThread, outcome, threadId);
                 return outcome;
             }
-
             if (threadId != _gameLoopThreadId)
             {
                 RefuseAndClearLocked(pending, RefusalKind.WrongThread, outcome, threadId);
@@ -762,8 +891,7 @@ public sealed class WorldReadyCoordinator
 
             var basis = AttributionBasis.None;
             if (pending.Kind == AttemptKind.Load)
-            {
-                if (_mode == CorrelationMode.LoaderIdentity && !ReferenceEquals(loader, pending.Loader))
+            {                if (_mode == CorrelationMode.LoaderIdentity && !ReferenceEquals(loader, pending.Loader))
                 {
                     // Do not clear: a stale completion must never swallow a newer attempt.
                     outcome.Refusal = RefusalKind.StaleLoaderEvidence;
@@ -800,6 +928,268 @@ public sealed class WorldReadyCoordinator
                 threadId);
             return outcome;
         }
+    }
+
+    // ---------------------------------------------------------------- P.2 attempt ownership
+
+    /// <summary>Number of load-advance signals the coordinator has been given.</summary>
+    public long AdvancesObserved
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _advancesObserved;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Owned attempts that reached a terminal state without producing an observation (thread or
+    /// readiness guard failed, or the load failed). Kept separate so "observed" and "provably over
+    /// but unusable" are never conflated.
+    /// </summary>
+    public long OwnedTerminalWithoutObservation
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _ownedTerminalWithoutObservation;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The P.2 start edge: registers a load attempt together with the state machine object that
+    /// proves which attempt a later completion belongs to.
+    ///
+    /// <para><paramref name="identity"/> must be the <c>IEnumerator&lt;int&gt;</c> the load attempt
+    /// created (<c>Game1.currentLoader</c> at <c>loadForNewGame</c> time), not a token this
+    /// coordinator invents. The epoch is read <i>before</i> the game fields and passed in, exactly as
+    /// in P.1, so the reset window semantics are unchanged.</para>
+    /// </summary>
+    public bool BeginLoad(object identity, int gameMode, long observedResetEpoch, int threadId,
+        out long attemptId, out RefusalKind refusal)
+    {
+        lock (_gate)
+        {
+            attemptId = 0;
+            refusal = RefusalKind.None;
+
+            if (identity is null)
+            {
+                return RefuseStartLocked(RefusalKind.StartWithoutLoaderEvidence, threadId,
+                    ref refusal);
+            }
+
+            if (observedResetEpoch != _resetEpoch)
+            {
+                return RefuseStartLocked(RefusalKind.ResetEpochChanged, threadId, ref refusal);
+            }
+
+            if (_honorResetInProgress && _resetting)
+            {
+                return RefuseStartLocked(RefusalKind.ResetInProgress, threadId, ref refusal);
+            }
+
+            if (gameMode != LoadingGameMode)
+            {
+                return RefuseStartLocked(RefusalKind.StartOutsideLoadMode, threadId, ref refusal);
+            }
+
+            if (_pending != null)
+            {
+                _supersededAttempts++;
+            }
+
+            var id = ++_nextAttemptId;
+            _pending = new PendingAttempt
+            {
+                Id = id,
+                Kind = AttemptKind.Load,
+                Loader = identity,
+                Identity = identity,
+                IdentityProven = true,
+                ResetEpoch = _resetEpoch,
+                StartThreadId = threadId,
+            };
+
+            attemptId = id;
+            NoteSignalLocked(SignalKind.StartAccepted, id, _resetEpoch, RefusalKind.None, threadId);
+            return true;
+        }
+    }
+
+    private bool RefuseStartLocked(RefusalKind refusal, int threadId, ref RefusalKind result)
+    {
+        result = refusal;
+        NoteRefusalLocked(refusal);
+        NoteSignalLocked(SignalKind.StartRefused, 0, _resetEpoch, refusal, threadId);
+        return false;
+    }
+
+    /// <summary>
+    /// The P.2 completion edge: the loading-mode driver advanced the load state machine.
+    ///
+    /// <para><paramref name="identity"/> is the object whose <c>MoveNext()</c> was just called, taken
+    /// from a local in the injected code — not re-read from a global. <paramref name="gameMode"/> is
+    /// read after the advance, so a value of <see cref="PlayingGameMode"/> means the enumerator itself
+    /// flipped the mode, which is the game's own success handoff.</para>
+    ///
+    /// <para><b>Ownership is checked before anything else is consumed, cancelled or cleared.</b>
+    /// A missing, unknown, stale or foreign identity always preserves the pending attempt, so a late
+    /// signal can never destroy a newer one.</para>
+    /// </summary>
+    public LoadAdvanceOutcome Advance(object? identity, int gameMode, bool moved,
+        bool hasLoadedGame, int threadId)
+    {
+        lock (_gate)
+        {
+            _advancesObserved++;
+            var outcome = new LoadAdvanceOutcome();
+
+            if (_resetting)
+            {
+                return RefuseAdvanceLocked(outcome, RefusalKind.ResetInProgress, threadId,
+                    preserve: true);
+            }
+
+            var pending = _pending;
+            if (pending is null)
+            {
+                outcome.Kind = AdvanceOutcomeKind.None;
+                outcome.Refusal = _lastConsumedAttemptId != 0
+                    ? RefusalKind.AlreadyConsumed
+                    : RefusalKind.NoPendingAttempt;
+                NoteRefusalLocked(outcome.Refusal);
+                NoteSignalLocked(SignalKind.CompletionRefused, 0, _resetEpoch, outcome.Refusal,
+                    threadId);
+                return outcome;
+            }
+
+            // (1) Ownership first. Nothing below this point runs for an unowned identity.
+            if (identity is null || !pending.IdentityProven || pending.Identity is null)
+            {
+                return RefuseAdvanceLocked(outcome, RefusalKind.MissingAttemptIdentity, threadId,
+                    preserve: true);
+            }
+
+            if (!ReferenceEquals(identity, pending.Identity))
+            {
+                return RefuseAdvanceLocked(outcome, RefusalKind.ForeignAttemptIdentity, threadId,
+                    preserve: true);
+            }
+
+            outcome.OwnershipVerified = true;
+            outcome.AttemptId = pending.Id;
+
+            // (2) The enumerator finished while still in the loading mode: failed/abandoned load.
+            if (!moved && gameMode != PlayingGameMode)
+            {
+                var refusal = gameMode == 0 ? RefusalKind.TitleMode : RefusalKind.LoadFailed;
+                return ConsumeOwnedLocked(pending, outcome, AdvanceOutcomeKind.Failed, refusal,
+                    threadId);
+            }
+
+            // (3) Still loading.
+            if (gameMode != PlayingGameMode)
+            {
+                outcome.Kind = AdvanceOutcomeKind.InProgress;
+                NoteSignalLocked(SignalKind.LoadAdvanced, pending.Id, _resetEpoch, RefusalKind.None,
+                    threadId);
+                return outcome;
+            }
+
+            // (4) Owned attempt reached the playing mode: this is the success handoff.
+            if (_gameLoopThreadId == 0)
+            {
+                // Ownership is proven, but there is no thread authority to judge the signal. Defined
+                // behaviour: preserve the attempt and refuse; it is not evidence the attempt ended.
+                return RefuseOwnedLocked(pending, outcome, RefusalKind.UnknownGameLoopThread,
+                    threadId, preserve: true);
+            }
+
+            if (threadId != _gameLoopThreadId)
+            {
+                // Ownership proven, thread guard failed => preserve (an off-thread advance is not
+                // trustworthy evidence that the attempt is over).
+                return RefuseOwnedLocked(pending, outcome, RefusalKind.OwnedButWrongThread, threadId,
+                    preserve: true);
+            }
+
+            if (!hasLoadedGame)
+            {
+                // Ownership proven, readiness guard failed => the attempt is provably over, so it is
+                // consumed without an observation.
+                return ConsumeOwnedLocked(pending, outcome, AdvanceOutcomeKind.Failed,
+                    RefusalKind.OwnedButWorldNotLoaded, threadId);
+            }
+
+            var observation = new WorldReadyObservation(
+                pending.Id,
+                pending.Kind,
+                AttributionBasis.LoadStateMachine,
+                gameMode,
+                hasLoadedGame,
+                threadId,
+                pending.ResetEpoch);
+
+            _pending = null;
+            _lastConsumedAttemptId = pending.Id;
+            _observations.Add(observation);
+
+            outcome.Kind = AdvanceOutcomeKind.Completed;
+            outcome.PendingCleared = true;
+            outcome.Observation = observation;
+            NoteSignalLocked(SignalKind.CompletionAccepted, pending.Id, _resetEpoch, RefusalKind.None,
+                threadId);
+            return outcome;
+        }
+    }
+
+    private LoadAdvanceOutcome RefuseAdvanceLocked(LoadAdvanceOutcome outcome, RefusalKind refusal,
+        int threadId, bool preserve)
+    {
+        outcome.Kind = AdvanceOutcomeKind.Refused;
+        outcome.Refusal = refusal;
+        outcome.PendingPreserved = preserve;
+        NoteRefusalLocked(refusal);
+        NoteSignalLocked(SignalKind.CompletionRefused, 0, _resetEpoch, refusal, threadId);
+        return outcome;
+    }
+
+    private LoadAdvanceOutcome RefuseOwnedLocked(PendingAttempt pending, LoadAdvanceOutcome outcome,
+        RefusalKind refusal, int threadId, bool preserve)
+    {
+        outcome.Kind = AdvanceOutcomeKind.Refused;
+        outcome.Refusal = refusal;
+        outcome.PendingPreserved = preserve;
+        if (!preserve)
+        {
+            _pending = null;
+            outcome.PendingCleared = true;
+            _ownedTerminalWithoutObservation++;
+        }
+
+        NoteRefusalLocked(refusal);
+        NoteSignalLocked(SignalKind.CompletionRefused, pending.Id, _resetEpoch, refusal, threadId);
+        return outcome;
+    }
+
+    private LoadAdvanceOutcome ConsumeOwnedLocked(PendingAttempt pending, LoadAdvanceOutcome outcome,
+        AdvanceOutcomeKind kind, RefusalKind refusal, int threadId)
+    {
+        _pending = null;
+        _lastConsumedAttemptId = pending.Id;
+        _ownedTerminalWithoutObservation++;
+
+        outcome.Kind = kind;
+        outcome.Refusal = refusal;
+        outcome.PendingCleared = true;
+        NoteRefusalLocked(refusal);
+        NoteSignalLocked(SignalKind.CompletionRefused, pending.Id, _resetEpoch, refusal, threadId);
+        return outcome;
     }
 
     private void RefuseAndClearLocked(PendingAttempt pending, RefusalKind refusal,
