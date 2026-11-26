@@ -20,7 +20,8 @@ public sealed class PrototypeTargets
     public PrototypeTargets(ModuleDefinition module, MethodDefinition loadForNewGame,
         MethodDefinition onDayStarted, MethodDefinition resetGameStateOnTitleScreen,
         MethodReference getGameMode, FieldDefinition hasLoadedGame, FieldDefinition currentLoader,
-        MethodDefinition updateTitleScreenDuringLoadingMode)
+        MethodDefinition updateTitleScreenDuringLoadingMode, MethodDefinition loadAfterPermissionCheck,
+        MethodReference loaderCreationCall)
     {
         Module = module;
         LoadForNewGame = loadForNewGame;
@@ -30,6 +31,8 @@ public sealed class PrototypeTargets
         HasLoadedGame = hasLoadedGame;
         CurrentLoader = currentLoader;
         UpdateTitleScreenDuringLoadingMode = updateTitleScreenDuringLoadingMode;
+        LoadAfterPermissionCheck = loadAfterPermissionCheck;
+        LoaderCreationCall = loaderCreationCall;
     }
 
     public ModuleDefinition Module { get; }
@@ -52,6 +55,18 @@ public sealed class PrototypeTargets
     /// the game advances <c>currentLoader</c> and observes its terminal result.
     /// </summary>
     public MethodDefinition UpdateTitleScreenDuringLoadingMode { get; }
+
+    /// <summary>
+    /// The P.3 attempt-creation edge: <c>SaveGame.LoadAfterPermissionCheck()</c>, whose tail creates the
+    /// load state machine and stores it in <c>Game1.currentLoader</c>.
+    /// </summary>
+    public MethodDefinition LoadAfterPermissionCheck { get; }
+
+    /// <summary>
+    /// The exact creation call the injected sequence intercepts (<c>SaveGame.getLoadEnumerator(...)</c>),
+    /// so verification can require that the identity still comes from that call's return value.
+    /// </summary>
+    public MethodReference LoaderCreationCall { get; }
 }
 
 /// <summary>The hook methods to call, with the exact prototypes this injector emits.</summary>
@@ -59,7 +74,7 @@ public sealed class PrototypeHooks
 {
     public PrototypeHooks(MethodReference resetBegan, MethodReference resetCompleted,
         MethodReference getResetEpoch, MethodReference worldLoading, MethodReference dayCompleted,
-        MethodReference loadAdvanced)
+        MethodReference loadAdvanced, MethodReference loadEnumeratorCreated)
     {
         ResetBegan = resetBegan;
         ResetCompleted = resetCompleted;
@@ -67,6 +82,7 @@ public sealed class PrototypeHooks
         WorldLoading = worldLoading;
         DayCompleted = dayCompleted;
         LoadAdvanced = loadAdvanced;
+        LoadEnumeratorCreated = loadEnumeratorCreated;
     }
 
     /// <summary><c>void ResetBegan()</c>.</summary>
@@ -90,6 +106,14 @@ public sealed class PrototypeHooks
     /// was just called, held in a local — not re-read from <c>currentLoader</c>.
     /// </summary>
     public MethodReference LoadAdvanced { get; }
+
+    /// <summary>
+    /// <c>void LoadEnumeratorCreated(long resetEpoch, int gameMode, object identity)</c>: the P.3
+    /// attempt-creation edge. <c>identity</c> is the load state machine returned by
+    /// <c>getLoadEnumerator</c>, taken from that call's result before it is stored in
+    /// <c>currentLoader</c>.
+    /// </summary>
+    public MethodReference LoadEnumeratorCreated { get; }
 }
 
 /// <summary>Counts returned by one injection pass.</summary>
@@ -124,6 +148,12 @@ public sealed class PrototypeInjectionResult
     public int AdvanceMaxStackBefore { get; internal set; }
 
     public int AdvanceMaxStackAfter { get; internal set; }
+
+    public int LoaderCreationCalls { get; internal set; }
+
+    public int LoaderCreationMaxStackBefore { get; internal set; }
+
+    public int LoaderCreationMaxStackAfter { get; internal set; }
 }
 
 /// <summary>Structural verification of one (possibly already written) module.</summary>
@@ -175,6 +205,25 @@ public sealed class PrototypeVerification
     /// <summary>P.2: true when the injected region is outside every try/handler region.</summary>
     public bool AdvanceSiteUnprotected { get; internal set; }
 
+    /// <summary>P.3: <c>LoadEnumeratorCreated</c> call sites in <c>LoadAfterPermissionCheck</c>.</summary>
+    public int LoaderCreationCalls { get; internal set; }
+
+    /// <summary>
+    /// P.3: true when the creation edge takes its identity from the local that received the
+    /// <c>getLoadEnumerator</c> result, and that local is what the original <c>stsfld currentLoader</c>
+    /// still stores.
+    /// </summary>
+    public bool LoaderCreationIdentityFromFactory { get; internal set; }
+
+    /// <summary>P.3: true when the original <c>stsfld currentLoader</c> is still executed exactly once.</summary>
+    public bool LoaderWriteIntact { get; internal set; }
+
+    /// <summary>P.3: true when the injected creation site is outside every try/handler region.</summary>
+    public bool LoaderCreationSiteUnprotected { get; internal set; }
+
+    /// <summary>P.3: true when the creation edge reads the epoch before the mode and the identity.</summary>
+    public bool LoaderCreationEpochFirst { get; internal set; }
+
     /// <summary>
     /// True when the start call site reads the epoch before <c>gameMode</c> and the loader. This is
     /// the instruction order the reset/start race depends on.
@@ -217,11 +266,22 @@ public sealed class PrototypeVerification
 ///   ldsfld Game1::currentLoader
 ///   call   DayCompleted(int, bool, object)
 ///   ret
+///
+/// SaveGame.LoadAfterPermissionCheck(), between getLoadEnumerator and its store:
+///   call   SaveGame::getLoadEnumerator(string, bool, bool)   ; the state machine (P.3 attempt identity)
+///   stloc  V_identity                                        ; kept, never re-read from the field
+///   call   GetResetEpoch()                                   ; epoch FIRST
+///   call   Game1::get_gameMode()                             ; then the mode
+///   ldloc  V_identity
+///   call   LoadEnumeratorCreated(long, int, object)
+///   ldloc  V_identity
+///   stsfld Game1::currentLoader                               ; the original store, unchanged
 /// </code>
 /// </summary>
 public static class PrototypeInjector
 {
     public const string DefaultGame1Type = "StardewValley.Game1";
+    public const string DefaultSaveGameType = "StardewValley.SaveGame";
     public const string StartHookName = "WorldLoading";
     public const string CompletionHookName = "DayCompleted";
     public const string ResetEntryHookName = "ResetBegan";
@@ -230,6 +290,8 @@ public static class PrototypeInjector
     public const string ResetMethodName = "ResetGameStateOnTitleScreen";
     public const string AdvanceHookName = "LoadAdvanced";
     public const string AdvanceMethodName = "UpdateTitleScreenDuringLoadingMode";
+    public const string LoaderCreationHookName = "LoadEnumeratorCreated";
+    public const string LoaderCreationMethodName = "LoadAfterPermissionCheck";
 
     private static readonly string[] NoParameters = Array.Empty<string>();
 
@@ -251,8 +313,15 @@ public static class PrototypeInjector
         "System.Object", "System.Int32", "System.Boolean", "System.Boolean",
     };
 
-    /// <summary>Resolves the three methods and three state members by exact structural shape.</summary>
-    public static PrototypeTargets Resolve(ModuleDefinition module, string game1TypeName = DefaultGame1Type)
+    /// <summary>Parameters of <c>LoadEnumeratorCreated(long, int, object)</c>, in push order.</summary>
+    private static readonly string[] LoaderCreationHookSignature =
+    {
+        "System.Int64", "System.Int32", "System.Object",
+    };
+
+    /// <summary>Resolves the four methods, the creation boundary and three state members by exact shape.</summary>
+    public static PrototypeTargets Resolve(ModuleDefinition module, string game1TypeName = DefaultGame1Type,
+        string saveGameTypeName = DefaultSaveGameType)
     {
         var type = module.GetType(game1TypeName)
                    ?? throw new PrototypeInjectionException("type not found: " + game1TypeName);
@@ -348,8 +417,143 @@ public static class PrototypeInjector
                 "currentLoader must be a reference type, found " + currentLoader.FieldType.FullName);
         }
 
+        var saveGame = module.GetType(saveGameTypeName)
+                       ?? throw new PrototypeInjectionException(
+                           "type not found: " + saveGameTypeName);
+        var creationMatches = saveGame.Methods.Where(m =>
+            string.Equals(m.Name, LoaderCreationMethodName, StringComparison.Ordinal) &&
+            m.IsStatic &&
+            m.ReturnType.FullName == "System.Void" &&
+            m.Parameters.Count == 0 &&
+            m.HasBody && m.Body.Instructions.Count > 0).ToList();
+        if (creationMatches.Count != 1)
+        {
+            throw new PrototypeInjectionException(
+                "expected exactly one static void " + saveGameTypeName + "::" + LoaderCreationMethodName +
+                "(); found " + Describe(saveGame, LoaderCreationMethodName));
+        }
+
+        var creationCall = FindLoaderCreationCall(creationMatches[0], currentLoader);
+
         return new PrototypeTargets(module, loadMatches[0], dayMatches[0], resetMatches[0],
-            getGameMode, hasLoadedGame, currentLoader, advanceMatches[0]);
+            getGameMode, hasLoadedGame, currentLoader, advanceMatches[0], creationMatches[0],
+            creationCall);
+    }
+
+    /// <summary>
+    /// Finds the single <c>call getLoadEnumerator(...)</c> whose result is stored straight into
+    /// <c>currentLoader</c>. That pair is the attempt-creation boundary: the object identity and the
+    /// field store happen at the same instant, on the thread that performed the load request.
+    ///
+    /// <para>Two shapes are recognised so the same resolver works before and after injection: the
+    /// pristine <c>call; stsfld currentLoader</c>, and the injected
+    /// <c>call; stloc V; …; ldloc V; stsfld currentLoader</c> form.</para>
+    /// </summary>
+    private static MethodReference FindLoaderCreationCall(MethodDefinition method,
+        FieldDefinition currentLoader)
+    {
+        var instructions = method.Body.Instructions;
+        MethodReference? found = null;
+        var stores = 0;
+        for (var i = 0; i < instructions.Count; i++)
+        {
+            if (IsCurrentLoaderStore(instructions[i], currentLoader))
+            {
+                stores++;
+            }
+
+            if (instructions[i].OpCode != OpCodes.Call ||
+                instructions[i].Operand is not MethodReference call)
+            {
+                continue;
+            }
+
+            if (call.ReturnType.IsValueType || call.ReturnType is PointerType)
+            {
+                continue;
+            }
+
+            if (!StoresIntentionally(instructions, i, currentLoader))
+            {
+                continue;
+            }
+
+            if (found != null)
+            {
+                throw new PrototypeInjectionException(
+                    "ambiguous creation boundary in " + method.FullName +
+                    ": more than one call result is stored into currentLoader");
+            }
+
+            found = call;
+        }
+
+        if (stores != 1)
+        {
+            throw new PrototypeInjectionException(
+                "unsupported shape: " + method.FullName + " writes currentLoader " + stores +
+                " times (expected exactly 1)");
+        }
+
+        if (found is null)
+        {
+            var tail = new System.Text.StringBuilder();
+            for (var i = Math.Max(0, instructions.Count - 8); i < instructions.Count; i++)
+            {
+                tail.Append(" | ").Append(i).Append(':').Append(instructions[i].OpCode.Code)
+                    .Append(' ').Append(instructions[i].Operand);
+            }
+
+            throw new PrototypeInjectionException(
+                "unsupported shape: " + method.FullName +
+                " has no 'call <factory>; stsfld currentLoader' creation boundary; tail:" + tail);
+        }
+
+        return found;
+    }
+
+    private static bool IsCurrentLoaderStore(Instruction instruction, FieldDefinition currentLoader)
+    {
+        return instruction.OpCode == OpCodes.Stsfld &&
+               instruction.Operand is FieldReference field &&
+               field.FullName == currentLoader.FullName;
+    }
+
+    /// <summary>
+    /// True when the value produced by the call at <paramref name="callIndex"/> is what is stored into
+    /// <c>currentLoader</c>, either directly or through the injected identity local.
+    /// </summary>
+    private static bool StoresIntentionally(IList<Instruction> instructions, int callIndex,
+        FieldDefinition currentLoader)
+    {
+        var next = callIndex + 1;
+        if (next >= instructions.Count)
+        {
+            return false;
+        }
+
+        if (IsCurrentLoaderStore(instructions[next], currentLoader))
+        {
+            return true;
+        }
+
+        if (instructions[next].OpCode != OpCodes.Stloc ||
+            instructions[next].Operand is not VariableDefinition identity)
+        {
+            return false;
+        }
+
+        for (var j = next + 1; j + 1 < instructions.Count && j <= next + 8; j++)
+        {
+            if (instructions[j].OpCode == OpCodes.Ldloc &&
+                ReferenceEquals(instructions[j].Operand, identity) &&
+                IsCurrentLoaderStore(instructions[j + 1], currentLoader))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>Places all three hooks. Refuses an already-injected or unsupported method.</summary>
@@ -363,15 +567,20 @@ public static class PrototypeInjector
         RequireHookShape(hooks.DayCompleted, CompletionHookName, "System.Void",
             CompletionHookSignature);
         RequireHookShape(hooks.LoadAdvanced, AdvanceHookName, "System.Void", AdvanceHookSignature);
+        RequireHookShape(hooks.LoadEnumeratorCreated, LoaderCreationHookName, "System.Void",
+            LoaderCreationHookSignature);
 
         var load = targets.LoadForNewGame;
         var day = targets.OnDayStarted;
         var reset = targets.ResetGameStateOnTitleScreen;
         var advance = targets.UpdateTitleScreenDuringLoadingMode;
+        var creation = targets.LoadAfterPermissionCheck;
 
         var existing = CountCalls(reset, hooks.ResetBegan) + CountCalls(reset, hooks.ResetCompleted) +
                        CountCalls(load, hooks.WorldLoading) + CountCalls(load, hooks.GetResetEpoch) +
-                       CountCalls(day, hooks.DayCompleted) + CountCalls(advance, hooks.LoadAdvanced);
+                       CountCalls(day, hooks.DayCompleted) + CountCalls(advance, hooks.LoadAdvanced) +
+                       CountCalls(creation, hooks.LoadEnumeratorCreated) +
+                       CountCalls(creation, hooks.GetResetEpoch);
         if (existing > 0)
         {
             throw new PrototypeInjectionException(
@@ -389,6 +598,8 @@ public static class PrototypeInjector
             ResetMaxStackAfter = reset.Body.MaxStackSize,
             AdvanceMaxStackBefore = advance.Body.MaxStackSize,
             AdvanceMaxStackAfter = advance.Body.MaxStackSize,
+            LoaderCreationMaxStackBefore = creation.Body.MaxStackSize,
+            LoaderCreationMaxStackAfter = creation.Body.MaxStackSize,
         };
 
         InjectResetEntry(targets, hooks, result);
@@ -396,7 +607,88 @@ public static class PrototypeInjector
         InjectEntry(targets, hooks, result);
         InjectCompletion(targets, hooks, result);
         InjectAdvance(targets, hooks, result);
+        InjectLoaderCreation(targets, hooks, result);
         return result;
+    }
+
+    /// <summary>
+    /// Places the P.3 attempt-creation edge between <c>getLoadEnumerator</c> and its store.
+    ///
+    /// <para>The original tail is:</para>
+    /// <code>
+    /// call  SaveGame::getLoadEnumerator(string, bool, bool)   ; the state machine, on the stack
+    /// stsfld Game1::currentLoader
+    /// ret
+    /// </code>
+    ///
+    /// <para>After injection the returned object is held in a fresh local, the reset epoch and the mode
+    /// are read, the hook receives the local (never a re-read of the field), and the original
+    /// <c>stsfld</c> stores that same local. The attempt identity is therefore the object this
+    /// boundary produced, at the instant it was produced.</para>
+    /// </summary>
+    private static void InjectLoaderCreation(PrototypeTargets targets, PrototypeHooks hooks,
+        PrototypeInjectionResult result)
+    {
+        var method = targets.LoadAfterPermissionCheck;
+        var body = method.Body;
+        var instructions = body.Instructions;
+
+        var callIndex = -1;
+        for (var i = 0; i + 1 < instructions.Count; i++)
+        {
+            if (instructions[i].OpCode == OpCodes.Call &&
+                instructions[i].Operand is MethodReference candidate &&
+                candidate.FullName == targets.LoaderCreationCall.FullName &&
+                instructions[i + 1].OpCode == OpCodes.Stsfld &&
+                instructions[i + 1].Operand is FieldReference storeTarget &&
+                storeTarget.FullName == targets.CurrentLoader.FullName)
+            {
+                callIndex = i;
+                break;
+            }
+        }
+
+        if (callIndex < 0)
+        {
+            throw new PrototypeInjectionException(
+                "unsupported shape: " + method.FullName +
+                " no longer holds 'call " + targets.LoaderCreationCall.Name +
+                "; stsfld currentLoader'");
+        }
+
+        var call = instructions[callIndex];
+        if (IsInsideTry(call, body) || IsInsideHandler(call, body))
+        {
+            throw new PrototypeInjectionException(
+                "unsupported control flow: the creation boundary of " + method.FullName +
+                " is inside a protected region");
+        }
+
+        var identityLocal = new VariableDefinition(targets.CurrentLoader.FieldType);
+        body.Variables.Add(identityLocal);
+        body.InitLocals = true;
+
+        var il = body.GetILProcessor();
+        var afterCall = call;
+        foreach (var emitted in new[]
+                 {
+                     il.Create(OpCodes.Stloc, identityLocal),
+                     il.Create(OpCodes.Call, hooks.GetResetEpoch),
+                     il.Create(OpCodes.Call, targets.GetGameMode),
+                     il.Create(OpCodes.Ldloc, identityLocal),
+                     il.Create(OpCodes.Call, hooks.LoadEnumeratorCreated),
+                     il.Create(OpCodes.Ldloc, identityLocal),
+                 })
+        {
+            il.InsertAfter(afterCall, emitted);
+            afterCall = emitted;
+        }
+
+        body.MaxStackSize = Math.Max(body.MaxStackSize, 3);
+        result.LoaderCreationCalls = 1;
+        result.LoaderCreationMaxStackAfter = body.MaxStackSize;
+
+        WidenShortBranches(method);
     }
 
     /// <summary>
@@ -706,12 +998,134 @@ public static class PrototypeInjector
             CompletionHookSignature, report);
         RequireHookShape(hooks.LoadAdvanced, AdvanceHookName, "System.Void", AdvanceHookSignature,
             report);
+        RequireHookShape(hooks.LoadEnumeratorCreated, LoaderCreationHookName, "System.Void",
+            LoaderCreationHookSignature, report);
 
         VerifyReset(targets, hooks, report);
         VerifyStart(targets, hooks, report);
         VerifyCompletion(targets, hooks, report);
         VerifyAdvance(targets, hooks, report);
+        VerifyLoaderCreation(targets, hooks, report);
         return report;
+    }
+
+    /// <summary>
+    /// Checks the P.3 creation edge: one <c>LoadEnumeratorCreated</c> call placed immediately between
+    /// the <c>getLoadEnumerator</c> call and the original <c>stsfld currentLoader</c>, fed from the
+    /// local that holds that call's result, with the epoch read first and the write still single.
+    /// </summary>
+    private static void VerifyLoaderCreation(PrototypeTargets targets, PrototypeHooks hooks,
+        PrototypeVerification report)
+    {
+        var method = targets.LoadAfterPermissionCheck;
+        var body = method.Body;
+        var instructions = body.Instructions;
+
+        report.LoaderCreationCalls = CountCalls(method, hooks.LoadEnumeratorCreated);
+        if (report.LoaderCreationCalls != 1)
+        {
+            report.Fail("LoadEnumeratorCreated call sites != 1: " + report.LoaderCreationCalls);
+        }
+
+        var stores = 0;
+        foreach (var ins in instructions)
+        {
+            if (ins.OpCode == OpCodes.Stsfld && ins.Operand is FieldReference field &&
+                field.FullName == targets.CurrentLoader.FullName)
+            {
+                stores++;
+            }
+        }
+
+        report.LoaderWriteIntact = stores == 1;
+        if (!report.LoaderWriteIntact)
+        {
+            report.Fail("LoadAfterPermissionCheck writes currentLoader " + stores +
+                        " times (expected exactly 1)");
+        }
+
+        var hookIndex = -1;
+        for (var i = 0; i < instructions.Count; i++)
+        {
+            if (IsCallOf(instructions[i], hooks.LoadEnumeratorCreated))
+            {
+                hookIndex = i;
+                break;
+            }
+        }
+
+        if (hookIndex < 0)
+        {
+            report.LoaderCreationIdentityFromFactory = false;
+            report.LoaderCreationSiteUnprotected = false;
+            report.LoaderCreationEpochFirst = false;
+            report.Fail("LoadEnumeratorCreated call site not found for structural verification");
+            return;
+        }
+
+        // Exact injected layout (see InjectLoaderCreation):
+        //   -5 call getLoadEnumerator | -4 stloc ID | -3 GetResetEpoch | -2 get_gameMode
+        //   -1 ldloc ID | +0 LoadEnumeratorCreated | +1 ldloc ID | +2 stsfld currentLoader
+        VariableDefinition? identityLocal = null;
+        var ok = hookIndex >= 5 && hookIndex + 2 < instructions.Count;
+        if (ok)
+        {
+            ok = instructions[hookIndex - 5].OpCode == OpCodes.Call &&
+                 instructions[hookIndex - 5].Operand is MethodReference factory &&
+                 factory.FullName == targets.LoaderCreationCall.FullName &&
+                 instructions[hookIndex - 4].OpCode == OpCodes.Stloc &&
+                 instructions[hookIndex - 4].Operand is VariableDefinition v &&
+                 v.VariableType.FullName == targets.CurrentLoader.FieldType.FullName;
+            if (ok)
+            {
+                identityLocal = (VariableDefinition)instructions[hookIndex - 4].Operand!;
+            }
+        }
+
+        report.LoaderCreationIdentityFromFactory = ok;
+        if (!ok)
+        {
+            report.Fail("LoadEnumeratorCreated identity does not come from the getLoadEnumerator result");
+        }
+
+        report.LoaderCreationEpochFirst =
+            hookIndex >= 3 &&
+            IsMethodCall(instructions[hookIndex - 3], hooks.GetResetEpoch) &&
+            IsMethodCall(instructions[hookIndex - 2], targets.GetGameMode) &&
+            instructions[hookIndex - 1].OpCode == OpCodes.Ldloc &&
+            ReferenceEquals(instructions[hookIndex - 1].Operand, identityLocal);
+        if (!report.LoaderCreationEpochFirst)
+        {
+            report.Fail("LoadEnumeratorCreated call site is not GetResetEpoch, get_gameMode, ldloc ID");
+        }
+
+        // The identity must not be re-read from the field anywhere in the injected window.
+        for (var i = hookIndex - 5; i <= hookIndex; i++)
+        {
+            if (IsFieldLoad(instructions[i], targets.CurrentLoader))
+            {
+                report.Fail("LoadEnumeratorCreated receives a re-read of currentLoader");
+                report.LoaderCreationIdentityFromFactory = false;
+            }
+        }
+
+        var storeOk = instructions[hookIndex + 1].OpCode == OpCodes.Ldloc &&
+                      ReferenceEquals(instructions[hookIndex + 1].Operand, identityLocal) &&
+                      instructions[hookIndex + 2].OpCode == OpCodes.Stsfld &&
+                      instructions[hookIndex + 2].Operand is FieldReference target &&
+                      target.FullName == targets.CurrentLoader.FullName;
+        if (!storeOk)
+        {
+            report.LoaderWriteIntact = false;
+            report.Fail("the original stsfld currentLoader no longer stores the created state machine");
+        }
+
+        report.LoaderCreationSiteUnprotected = !IsInsideTry(instructions[hookIndex], body) &&
+                                              !IsInsideHandler(instructions[hookIndex], body);
+        if (!report.LoaderCreationSiteUnprotected)
+        {
+            report.Fail("the LoadEnumeratorCreated call site is inside a protected region");
+        }
     }
 
     /// <summary>

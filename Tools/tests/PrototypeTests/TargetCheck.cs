@@ -29,6 +29,7 @@ internal static class TargetCheck
         PrototypeInjector.StartHookName,
         PrototypeInjector.CompletionHookName,
         PrototypeInjector.AdvanceHookName,
+        PrototypeInjector.LoaderCreationHookName,
     };
 
     private static readonly string[] ExpectedChangedMethods =
@@ -37,6 +38,7 @@ internal static class TargetCheck
         "System.Void StardewValley.Game1::OnDayStarted()",
         "System.Void StardewValley.Game1::ResetGameStateOnTitleScreen()",
         "System.Void StardewValley.Game1::UpdateTitleScreenDuringLoadingMode()",
+        "System.Void StardewValley.SaveGame::LoadAfterPermissionCheck()",
     };
 
     public static int Apply(string inputPath, string outputPath, string? refsDirectory)
@@ -163,6 +165,15 @@ internal static class TargetCheck
                           verification.AdvanceGuardsIntact);
         Console.WriteLine("EVIDENCE verify_advance_site_unprotected = " +
                           verification.AdvanceSiteUnprotected);
+        Console.WriteLine("EVIDENCE verify_creation_calls          = " +
+                          verification.LoaderCreationCalls);
+        Console.WriteLine("EVIDENCE verify_creation_from_factory   = " +
+                          verification.LoaderCreationIdentityFromFactory);
+        Console.WriteLine("EVIDENCE verify_creation_write_intact   = " + verification.LoaderWriteIntact);
+        Console.WriteLine("EVIDENCE verify_creation_epoch_first    = " +
+                          verification.LoaderCreationEpochFirst);
+        Console.WriteLine("EVIDENCE verify_creation_unprotected    = " +
+                          verification.LoaderCreationSiteUnprotected);
         Console.WriteLine("EVIDENCE mvid_changed                  = " + (written.Mvid != originalMvid));
 
         if (string.Join("|", written.AssemblyReferences.Select(a => a.FullName)) != refsBefore)
@@ -281,14 +292,16 @@ internal static class TargetCheck
         var worldLoading = bridge.Methods.FirstOrDefault(m => m.Name == PrototypeInjector.StartHookName);
         var dayCompleted = bridge.Methods.FirstOrDefault(m => m.Name == PrototypeInjector.CompletionHookName);
         var loadAdvanced = bridge.Methods.FirstOrDefault(m => m.Name == PrototypeInjector.AdvanceHookName);
+        var loadEnumeratorCreated =
+            bridge.Methods.FirstOrDefault(m => m.Name == PrototypeInjector.LoaderCreationHookName);
         if (resetBegan is null || resetCompleted is null || getEpoch is null || worldLoading is null ||
-            dayCompleted is null || loadAdvanced is null)
+            dayCompleted is null || loadAdvanced is null || loadEnumeratorCreated is null)
         {
             return null;
         }
 
         return new PrototypeHooks(resetBegan, resetCompleted, getEpoch, worldLoading, dayCompleted,
-            loadAdvanced);
+            loadAdvanced, loadEnumeratorCreated);
     }
 
     private static void CheckBridgeFields(TypeDefinition bridge, List<string> failures)
@@ -298,7 +311,8 @@ internal static class TargetCheck
                      "ResetBeganCalls", "ResetCompletedCalls", "GetResetEpochCalls", "EpochCounter",
                      "LastResetEpochAtStart", "LastResetEpochOnExit", "WorldLoadingCalls",
                      "DayCompletedCalls", "LastLoadedGame", "LastHasLoadedGame", "LastGameMode",
-                     "LastLoaderWasNull",
+                     "LastLoaderWasNull", "LoadEnumeratorCreatedCalls", "LastCreationResetEpoch",
+                     "LastCreationGameMode", "LastCreationLoaderWasNull",
                  })
         {
             var field = bridge.Fields.FirstOrDefault(f => f.Name == name);

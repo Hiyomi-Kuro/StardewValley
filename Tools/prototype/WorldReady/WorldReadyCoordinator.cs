@@ -232,6 +232,36 @@ public enum SignalKind
 
     /// <summary>P.2: the loading-mode driver advanced the pending load state machine (no state change).</summary>
     LoadAdvanced,
+
+    /// <summary>
+    /// P.3: <c>Game1.loadForNewGame(bool)</c> was entered. This is a <b>non-owning</b> observation:
+    /// it can never create, override, consume or cancel a pending attempt, because the closure that
+    /// runs it holds no reference to the load state machine (see
+    /// <see cref="WorldReadyCoordinator.NoteLoadEntry"/>).
+    /// </summary>
+    LoadEntered,
+}
+
+/// <summary>What a <c>loadForNewGame</c> entry turned out to be (P.3).</summary>
+public enum LoadEntryObservation
+{
+    /// <summary><c>loadForNewGame(false)</c>: a new game. Deliberately stays UNKNOWN.</summary>
+    NewGame = 0,
+
+    /// <summary>The entered load's global loader is the pending attempt's own state machine.</summary>
+    MatchesPending = 1,
+
+    /// <summary>An existing save was entered with no pending attempt at all.</summary>
+    NoPendingAttempt = 2,
+
+    /// <summary>The pending attempt has no proven state-machine identity.</summary>
+    UnprovenPending = 3,
+
+    /// <summary>
+    /// The entered load read a global loader that is not the pending attempt's own object: either a
+    /// stale attempt's entry, or a newer attempt replaced the field. Nothing is changed.
+    /// </summary>
+    MismatchedLoader = 4,
 }
 
 /// <summary>What one load-advance signal turned out to be.</summary>
@@ -251,6 +281,13 @@ public enum AdvanceOutcomeKind
 
     /// <summary>The signal was refused; see <see cref="LoadAdvanceOutcome.Refusal"/>.</summary>
     Refused,
+
+    /// <summary>
+    /// P.3: the owned enumerator returned <c>true</c> but the mode was back at the title screen, i.e.
+    /// the load body itself called <c>ExitToTitle</c> after flipping the mode. The attempt is over and
+    /// is consumed without an observation.
+    /// </summary>
+    Cancelled,
 }
 
 /// <summary>Result of one load-advance signal (P.2 completion edge).</summary>
@@ -311,9 +348,13 @@ public sealed class SignalRecord
 /// Internal state coordinator for the SaveLoaded research contract.
 ///
 /// <para><b>Contract.</b> One successful world entry produces at most one internal observation.
-/// An attempt starts at <c>Game1.loadForNewGame(bool)</c>, completes at the normal return of
-/// <c>Game1.OnDayStarted()</c>, and is invalidated by the reset boundary at
-/// <c>Game1.ResetGameStateOnTitleScreen()</c>.</para>
+/// A load attempt starts at the <b>creation</b> of its load state machine
+/// (<c>SaveGame.LoadAfterPermissionCheck</c>, immediately after <c>getLoadEnumerator</c> returns),
+/// completes at the normal return of the loading-mode advance in
+/// <c>Game1.UpdateTitleScreenDuringLoadingMode</c>, and is invalidated by the reset boundary at
+/// <c>Game1.ResetGameStateOnTitleScreen()</c>. <c>Game1.loadForNewGame(bool)</c> is a
+/// <b>non-owning</b> observation only (P.3): the closure that calls it carries no reference to the
+/// attempt's state machine, so it must never be allowed to claim one.</para>
 ///
 /// <para><b>Reset epoch.</b> The reset boundary increments an epoch. A start path must read that
 /// epoch <i>before</i> it reads <c>gameMode</c>/<c>currentLoader</c> and pass it to
@@ -351,6 +392,9 @@ public sealed class WorldReadyCoordinator
 
     /// <summary><c>Game1.playingGameMode</c>.</summary>
     public const int PlayingGameMode = 3;
+
+    /// <summary><c>Game1.titleScreenGameMode</c>.</summary>
+    public const int TitleScreenGameMode = 0;
 
     private const int MaxSignals = 1024;
 
@@ -395,6 +439,11 @@ public sealed class WorldReadyCoordinator
     private long _signalsDropped;
     private long _advancesObserved;
     private long _ownedTerminalWithoutObservation;
+    private long _loadEntriesObserved;
+    private long _loadEntryIdentityMatches;
+    private long _loadEntryIdentityMismatches;
+    private long _loadEntryWithoutPending;
+    private long _newGameEntriesObserved;
 
     public WorldReadyCoordinator(CorrelationMode mode = CorrelationMode.LoaderIdentity,
         bool honorResetInProgress = true)
@@ -960,14 +1009,148 @@ public sealed class WorldReadyCoordinator
         }
     }
 
+    /// <summary>How many accepted (identity-proven) load attempts were created.</summary>
+    public long AttemptsCreated
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _nextAttemptId;
+            }
+        }
+    }
+
+    /// <summary>How many <c>loadForNewGame</c> entries were observed (owning or not).</summary>
+    public long LoadEntriesObserved
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _loadEntriesObserved;
+            }
+        }
+    }
+
+    /// <summary>Entries whose global loader <b>was</b> the pending attempt's own object.</summary>
+    public long LoadEntryIdentityMatches
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _loadEntryIdentityMatches;
+            }
+        }
+    }
+
+    /// <summary>Entries whose global loader was a <b>different</b> object than the pending identity.</summary>
+    public long LoadEntryIdentityMismatches
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _loadEntryIdentityMismatches;
+            }
+        }
+    }
+
+    /// <summary>Entries of an existing save that arrived with nothing pending.</summary>
+    public long LoadEntryWithoutPending
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _loadEntryWithoutPending;
+            }
+        }
+    }
+
+    /// <summary><c>loadForNewGame(false)</c> entries: new games, deliberately left UNKNOWN.</summary>
+    public long NewGameEntriesObserved
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _newGameEntriesObserved;
+            }
+        }
+    }
+
     /// <summary>
-    /// The P.2 start edge: registers a load attempt together with the state machine object that
-    /// proves which attempt a later completion belongs to.
+    /// P.3 <b>non-owning</b> entry edge: <c>Game1.loadForNewGame(bool)</c> was entered.
     ///
-    /// <para><paramref name="identity"/> must be the <c>IEnumerator&lt;int&gt;</c> the load attempt
-    /// created (<c>Game1.currentLoader</c> at <c>loadForNewGame</c> time), not a token this
-    /// coordinator invents. The epoch is read <i>before</i> the game fields and passed in, exactly as
-    /// in P.1, so the reset window semantics are unchanged.</para>
+    /// <para><b>Why this cannot own an attempt.</b> In <c>StardewValley</c> 1.6.15.24354 the body that
+    /// calls <c>loadForNewGame(true)</c> is <c>SaveGame/&lt;&gt;c::&lt;getLoadEnumerator&gt;b__123_2</c>,
+    /// an instance method of the <b>cached static</b> <c>&lt;&gt;c</c> singleton whose only state read
+    /// is <c>Game1.game1</c>. Neither the delegate nor its target holds the
+    /// <c>&lt;getLoadEnumerator&gt;d__123</c> state machine, so at this point the process has no causal
+    /// path back to the attempt that started the thread. Reading the global
+    /// <c>Game1.currentLoader</c> here would therefore let a <b>delayed</b> attempt claim whatever
+    /// attempt happens to own the field now.</para>
+    ///
+    /// <para>This method only records what it saw. It never creates, supersedes, consumes or
+    /// cancels a pending attempt, so a late entry can neither establish nor overwrite a newer
+    /// attempt's pending state.</para>
+    /// </summary>
+    public LoadEntryObservation NoteLoadEntry(bool loadedGame, object? globalLoader, int gameMode,
+        int threadId)
+    {
+        lock (_gate)
+        {
+            if (!loadedGame)
+            {
+                _newGameEntriesObserved++;
+                NoteSignalLocked(SignalKind.LoadEntered, 0, _resetEpoch, RefusalKind.None, threadId);
+                return LoadEntryObservation.NewGame;
+            }
+
+            _loadEntriesObserved++;
+            var pending = _pending;
+            LoadEntryObservation observation;
+            if (pending is null)
+            {
+                observation = LoadEntryObservation.NoPendingAttempt;
+                _loadEntryWithoutPending++;
+            }
+            else if (!pending.IdentityProven || pending.Identity is null)
+            {
+                observation = LoadEntryObservation.UnprovenPending;
+            }
+            else if (ReferenceEquals(globalLoader, pending.Identity))
+            {
+                observation = LoadEntryObservation.MatchesPending;
+                _loadEntryIdentityMatches++;
+            }
+            else
+            {
+                observation = LoadEntryObservation.MismatchedLoader;
+                _loadEntryIdentityMismatches++;
+            }
+
+            NoteSignalLocked(SignalKind.LoadEntered, pending?.Id ?? 0, _resetEpoch,
+                RefusalKind.None, threadId);
+            return observation;
+        }
+    }
+
+    /// <summary>
+    /// The P.3 start edge: registers a load attempt at the <b>creation point</b> of its state machine,
+    /// together with that state machine object itself.
+    ///
+    /// <para><paramref name="identity"/> must be the <c>IEnumerator&lt;int&gt;</c> object that
+    /// <c>SaveGame.getLoadEnumerator</c> just created and that <c>SaveGame.LoadAfterPermissionCheck</c>
+    /// is about to store in <c>Game1.currentLoader</c> — the value taken straight from the return of
+    /// the creation call, not a re-read of the field. Identity and reset epoch are therefore bound at
+    /// the same instant, on the same thread, at the boundary that produced the object.</para>
+    ///
+    /// <para>A real load attempt registers the load state machine itself as the attempt identity, so
+    /// the completion edge can prove ownership. A new game has no such object and keeps the
+    /// identity-unproven path (its ownership stays UNKNOWN on purpose).</para>
     /// </summary>
     public bool BeginLoad(object identity, int gameMode, long observedResetEpoch, int threadId,
         out long attemptId, out RefusalKind refusal)
@@ -1084,12 +1267,25 @@ public sealed class WorldReadyCoordinator
             outcome.OwnershipVerified = true;
             outcome.AttemptId = pending.Id;
 
-            // (2) The enumerator finished while still in the loading mode: failed/abandoned load.
+            // (2) The enumerator finished while it was not in the playing mode: failed/abandoned load.
+            // The primary failure edge sets mode 9 (selectGameScreen) before returning false; a reset
+            // that cleared the loader can also leave mode 0.
             if (!moved && gameMode != PlayingGameMode)
             {
-                var refusal = gameMode == 0 ? RefusalKind.TitleMode : RefusalKind.LoadFailed;
+                var refusal = gameMode == TitleScreenGameMode
+                    ? RefusalKind.TitleMode
+                    : RefusalKind.LoadFailed;
                 return ConsumeOwnedLocked(pending, outcome, AdvanceOutcomeKind.Failed, refusal,
                     threadId);
+            }
+
+            // (2b) The enumerator still had work but the mode is back at the title screen: the load
+            // body itself called ExitToTitle() after its own mode flip (MoveNext IL_1910-1913). The
+            // attempt is over and must not be observed, and it must not stay pending forever.
+            if (moved && gameMode == TitleScreenGameMode)
+            {
+                return ConsumeOwnedLocked(pending, outcome, AdvanceOutcomeKind.Cancelled,
+                    RefusalKind.TitleMode, threadId);
             }
 
             // (3) Still loading.

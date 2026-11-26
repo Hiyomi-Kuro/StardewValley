@@ -42,6 +42,24 @@ public static class SyntheticGate
 
     public static bool Paused { get; set; }
 
+    /// <summary>The state machine returned by the last <see cref="CreateLoader"/> call.</summary>
+    public static System.Collections.IEnumerator? LastCreated;
+
+    /// <summary>Script handed to the next created <see cref="TestLoader"/> (MoveNext results).</summary>
+    public static bool[] NextLoaderScript = { true, true };
+
+    /// <summary>
+    /// Stands in for <c>SaveGame.getLoadEnumerator</c>: it returns a fresh state-machine object, so the
+    /// fixture's creation edge can prove that the identity it hands to the hook is the object this
+    /// call produced (not a global re-read).
+    /// </summary>
+    public static System.Collections.IEnumerator CreateLoader()
+    {
+        var loader = new TestLoader(NextLoaderScript);
+        LastCreated = loader;
+        return loader;
+    }
+
     /// <summary>Injected-into-fixture body call, placed after the reset entry hook.</summary>
     public static void MidReset()
     {
@@ -85,6 +103,7 @@ public static class SyntheticGate
 internal sealed class SyntheticFixture
 {
     public const string Game1Type = "Synthetic.Game1";
+    public const string SaveGameType = "Synthetic.SaveGame";
     public const string GateType = "Phase21PrototypeTests.SyntheticGate";
 
     public string AssemblyName = "";
@@ -95,12 +114,15 @@ internal sealed class SyntheticFixture
     public MethodDefinition ResetGameStateOnTitleScreen = null!;
     public MethodDefinition UpdateTitleScreenDuringLoadingMode = null!;
     public MethodDefinition GetGameMode = null!;
+    public MethodDefinition LoadAfterPermissionCheck = null!;
+    public MethodDefinition LoadEnumeratorFactory = null!;
     public MethodReference ResetBeganHook = null!;
     public MethodReference ResetCompletedHook = null!;
     public MethodReference GetResetEpochHook = null!;
     public MethodReference StartHook = null!;
     public MethodReference CompletionHook = null!;
     public MethodReference AdvanceHook = null!;
+    public MethodReference LoadEnumeratorCreatedHook = null!;
 
     public FieldDefinition GameMode = null!;
     public FieldDefinition HasLoadedGame = null!;
@@ -117,13 +139,13 @@ internal sealed class SyntheticFixture
         get
         {
             return new PrototypeHooks(ResetBeganHook, ResetCompletedHook, GetResetEpochHook, StartHook,
-                CompletionHook, AdvanceHook);
+                CompletionHook, AdvanceHook, LoadEnumeratorCreatedHook);
         }
     }
 
     public static SyntheticFixture Build(string tag, bool withState = true, bool withFinally = true,
         bool retInsideTry = false, bool handlerOnlyRet = false, bool throws = false,
-        ResetShape resetShape = ResetShape.Normal, bool withAdvance = true)
+        ResetShape resetShape = ResetShape.Normal, bool withAdvance = true, bool withCreation = true)
     {
         var fixture = new SyntheticFixture();
         fixture.AssemblyName = "SyntheticGame." + tag;
@@ -217,7 +239,49 @@ internal sealed class SyntheticFixture
             BuildAdvanceMethod(module, fixture);
         }
 
+        if (withState && withCreation)
+        {
+            BuildCreationMethod(module, fixture);
+        }
+
         return fixture;
+    }
+
+    /// <summary>
+    /// Mirrors the tail of <c>SaveGame.LoadAfterPermissionCheck</c>: the mode is set first, the load
+    /// state machine is created, and the creation result is stored straight into
+    /// <c>currentLoader</c>. The injector's creation edge requires exactly this pair.
+    /// </summary>
+    private static void BuildCreationMethod(ModuleDefinition module, SyntheticFixture fixture)
+    {
+        var saveGame = new TypeDefinition("Synthetic", "SaveGame",
+            TypeAttributes.Public | TypeAttributes.Class | TypeAttributes.Abstract |
+            TypeAttributes.Sealed | TypeAttributes.BeforeFieldInit, module.TypeSystem.Object);
+        module.Types.Add(saveGame);
+
+        var factory = new MethodDefinition("getLoadEnumerator",
+            MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig,
+            module.ImportReference(typeof(System.Collections.IEnumerator)));
+        var factoryIl = factory.Body.GetILProcessor();
+        factoryIl.Emit(OpCodes.Call,
+            GateMethod(module, "CreateLoader",
+                module.ImportReference(typeof(System.Collections.IEnumerator))));
+        factoryIl.Emit(OpCodes.Ret);
+        saveGame.Methods.Add(factory);
+        fixture.LoadEnumeratorFactory = factory;
+
+        var creation = new MethodDefinition(PrototypeInjector.LoaderCreationMethodName,
+            MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig,
+            module.TypeSystem.Void);
+        var il = creation.Body.GetILProcessor();
+        il.Emit(OpCodes.Ldc_I4_6);
+        il.Emit(OpCodes.Stsfld, fixture.GameMode);
+        il.Emit(OpCodes.Call, factory);
+        il.Emit(OpCodes.Stsfld, fixture.CurrentLoader);
+        il.Emit(OpCodes.Ret);
+        creation.Body.MaxStackSize = 2;
+        saveGame.Methods.Add(creation);
+        fixture.LoadAfterPermissionCheck = creation;
     }
 
     /// <summary>
@@ -447,6 +511,12 @@ internal sealed class SyntheticFixture
 
     private static MethodReference GateReference(ModuleDefinition module)
     {
+        return GateMethod(module, "MidReset", module.TypeSystem.Void);
+    }
+
+    private static MethodReference GateMethod(ModuleDefinition module, string name,
+        TypeReference returnType)
+    {
         var existing = module.AssemblyReferences.FirstOrDefault(a => a.Name == "Phase21.PrototypeTests");
         if (existing is null)
         {
@@ -456,11 +526,10 @@ internal sealed class SyntheticFixture
         }
 
         var type = new TypeReference("Phase21PrototypeTests", "SyntheticGate", module, existing);
-        var method = new MethodReference("MidReset", module.TypeSystem.Void, type)
+        return new MethodReference(name, returnType, type)
         {
             HasThis = false,
         };
-        return method;
     }
 
     private static void EmitNormalBody(ModuleDefinition module, SyntheticFixture fixture, bool withFinally)
@@ -663,6 +732,18 @@ internal sealed class SyntheticFixture
         fixture.AdvanceHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int32));
         fixture.AdvanceHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Boolean));
         fixture.AdvanceHook.Parameters.Add(new ParameterDefinition(module.TypeSystem.Boolean));
+
+        fixture.LoadEnumeratorCreatedHook = new MethodReference(
+            PrototypeInjector.LoaderCreationHookName, module.TypeSystem.Void, type)
+        {
+            HasThis = false,
+        };
+        fixture.LoadEnumeratorCreatedHook.Parameters.Add(
+            new ParameterDefinition(module.TypeSystem.Int64));
+        fixture.LoadEnumeratorCreatedHook.Parameters.Add(
+            new ParameterDefinition(module.TypeSystem.Int32));
+        fixture.LoadEnumeratorCreatedHook.Parameters.Add(
+            new ParameterDefinition(module.TypeSystem.Object));
     }
 }
 

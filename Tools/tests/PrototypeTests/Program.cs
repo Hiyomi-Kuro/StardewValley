@@ -92,6 +92,203 @@ internal static class Program
         LateCompletionReadsBLoader();
         ResetThreadCases();
         AttemptOwnershipCases();
+        CreationEdgeCases();
+    }
+
+    // ------------------------------------------- section 1b: P.3 creation-point ownership
+
+    /// <summary>
+    /// P.3: the attempt identity is bound at the creation point of the load state machine, and the
+    /// <c>loadForNewGame</c> entry is a non-owning observation. These cases pin the counterexample the
+    /// P.2 wiring still allowed (a delayed attempt claiming whichever attempt owns
+    /// <c>Game1.currentLoader</c>) and the rules that close it.
+    /// </summary>
+    private static void CreationEdgeCases()
+    {
+        CreationBindsIdentityOnce();
+        StaleLoadEntryCannotClaimNewAttempt();
+        LegacyStartEdgeWouldStealAttempt();
+        LoadEntryAfterCompletionCreatesNothing();
+        CreationWithoutAdvanceIsNeverObserved();
+        SecondCreationSupersedesFirst();
+        AdvanceMovedUnderTitleConsumes();
+        AdvanceFalseUnderSelectGameFails();
+        NewGameEntryDoesNotClearLoadPending();
+    }
+
+    private static void CreationBindsIdentityOnce()
+    {
+        var c = NewOwnershipCoordinator();
+        var loader = new TestLoader(true, true, true);
+        var begun = c.BeginLoad(loader, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid,
+            out var id, out var refusal);
+        var entry = c.NoteLoadEntry(true, loader, WorldReadyCoordinator.LoadingGameMode, Tid);
+        var outcome = c.Advance(loader, WorldReadyCoordinator.PlayingGameMode, true, true, Tid);
+        Check("creation_edge_binds_identity",
+            begun && entry == LoadEntryObservation.MatchesPending &&
+            outcome.Kind == AdvanceOutcomeKind.Completed && c.ObservationCount == 1 &&
+            outcome.AttemptId == id && outcome.Observation is { AttemptOwnershipProven: true } &&
+            c.SupersededAttempts == 0,
+            "begun=" + begun + ", refusal=" + refusal + ", entry=" + entry + ", kind=" + outcome.Kind +
+            ", observations=" + c.ObservationCount);
+    }
+
+    /// <summary>
+    /// The counterexample from the brief: A's worker task has not entered <c>loadForNewGame</c> yet,
+    /// a reset happened, B already stored L_B, and A's entry then reads the global L_B. With the
+    /// creation-point wiring this can only be recorded; B keeps its pending attempt and completes once.
+    /// </summary>
+    private static void StaleLoadEntryCannotClaimNewAttempt()
+    {
+        var c = NewOwnershipCoordinator();
+        var loaderB = new TestLoader(true, true, true);
+        c.BeginLoad(loaderB, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out var idB, out _);
+
+        // A's delayed worker: no causal link to any attempt, so only the global is visible.
+        var entry = c.NoteLoadEntry(true, loaderB, WorldReadyCoordinator.LoadingGameMode, Tid);
+
+        var stillB = c.PendingAttemptId == idB;
+        var observationsBefore = c.ObservationCount;
+        var outcome = c.Advance(loaderB, WorldReadyCoordinator.PlayingGameMode, true, true, Tid);
+        Check("stale_load_entry_cannot_claim_new_attempt",
+            entry == LoadEntryObservation.MatchesPending && stillB && observationsBefore == 0 &&
+            c.SupersededAttempts == 0 && c.LoadEntryIdentityMatches == 1 &&
+            outcome.Kind == AdvanceOutcomeKind.Completed && outcome.AttemptId == idB &&
+            c.ObservationCount == 1,
+            "entry=" + entry + ", pendingStillB=" + stillB + ", superseded=" + c.SupersededAttempts +
+            ", observations=" + c.ObservationCount + ", attempt=" + outcome.AttemptId + "/" + idB);
+    }
+
+    /// <summary>
+    /// Negative control: the P.2 start edge called <c>BeginLoad</c> with whatever
+    /// <c>Game1.currentLoader</c> held at the delayed entry, so A's late entry <b>did</b> supersede B
+    /// and B's real success was then attributed to A's attempt id. Pinned here so the change cannot be
+    /// reverted silently.
+    /// </summary>
+    private static void LegacyStartEdgeWouldStealAttempt()
+    {
+        var c = NewOwnershipCoordinator();
+        var loaderB = new TestLoader(true, true, true);
+        c.BeginLoad(loaderB, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out var idB, out _);
+
+        // P.2 shape: the delayed entry calls BeginLoad(global currentLoader).
+        var accepted = c.BeginLoad(loaderB, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid,
+            out var idA, out _);
+        var stolen = accepted && idA != idB && c.PendingAttemptId == idA && c.SupersededAttempts == 1;
+        var outcome = c.Advance(loaderB, WorldReadyCoordinator.PlayingGameMode, true, true, Tid);
+        Check("legacy_start_edge_would_steal_attempt",
+            stolen && outcome.AttemptId == idA && c.ObservationCount == 1,
+            "stolen=" + stolen + ", attemptWasA=" + (outcome.AttemptId == idA) +
+            ", superseded=" + c.SupersededAttempts + ", observations=" + c.ObservationCount);
+    }
+
+    private static void LoadEntryAfterCompletionCreatesNothing()
+    {
+        var c = NewOwnershipCoordinator();
+        var loaderB = new TestLoader(true, true, true);
+        c.BeginLoad(loaderB, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out _, out _);
+        c.Advance(loaderB, WorldReadyCoordinator.PlayingGameMode, true, true, Tid);
+
+        var entry = c.NoteLoadEntry(true, loaderB, WorldReadyCoordinator.PlayingGameMode, Tid);
+        Check("load_entry_after_completion_creates_nothing",
+            entry == LoadEntryObservation.NoPendingAttempt && c.ObservationCount == 1 &&
+            c.PendingAttemptId == 0 && c.LoadEntryWithoutPending == 1 && c.SupersededAttempts == 0,
+            "entry=" + entry + ", observations=" + c.ObservationCount + ", pending=" +
+            c.PendingAttemptId);
+    }
+
+    /// <summary>
+    /// Creation without a single effective advance must never produce an observation; the reset
+    /// boundary is what closes it, and it is counted as cancelled rather than superseded.
+    /// </summary>
+    private static void CreationWithoutAdvanceIsNeverObserved()
+    {
+        var c = NewOwnershipCoordinator();
+        var loader = new TestLoader(true);
+        c.BeginLoad(loader, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out var id, out _);
+        var created = c.PendingAttemptId == id && c.AttemptsCreated == 1 && c.AdvancesObserved == 0 &&
+                      c.ObservationCount == 0;
+
+        c.TryBeginReset(Tid, "test", out _, out _);
+        Check("creation_without_advance_is_never_observed",
+            created && c.CancelledAttempts == 1 && c.PendingAttemptId == 0 && c.ObservationCount == 0,
+            "created=" + created + ", cancelled=" + c.CancelledAttempts + ", observations=" +
+            c.ObservationCount);
+    }
+
+    private static void SecondCreationSupersedesFirst()
+    {
+        var c = NewOwnershipCoordinator();
+        var a = new TestLoader(true, true);
+        var b = new TestLoader(true, true);
+        c.BeginLoad(a, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out var idA, out _);
+        c.BeginLoad(b, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out var idB, out _);
+        var superseded = idA != idB && c.PendingAttemptId == idB && c.SupersededAttempts == 1;
+
+        var stale = c.Advance(a, WorldReadyCoordinator.LoadingGameMode, true, true, Tid);
+        var fresh = c.Advance(b, WorldReadyCoordinator.PlayingGameMode, true, true, Tid);
+        Check("second_creation_supersedes_first",
+            superseded && stale.Refusal == RefusalKind.ForeignAttemptIdentity &&
+            stale.PendingPreserved && fresh.Kind == AdvanceOutcomeKind.Completed &&
+            c.ObservationCount == 1,
+            "superseded=" + c.SupersededAttempts + ", stale=" + stale.Refusal + ", fresh=" +
+            fresh.Kind + ", observations=" + c.ObservationCount);
+    }
+
+    /// <summary>
+    /// <c>ExitToTitle</c> inside <c>MoveNext</c> after the mode flip leaves <c>moved=true</c> and mode
+    /// 0. That is a cancelled attempt, not "still loading" (which would leak the pending forever) and
+    /// not a success.
+    /// </summary>
+    private static void AdvanceMovedUnderTitleConsumes()
+    {
+        var c = NewOwnershipCoordinator();
+        var loader = new TestLoader(true);
+        c.BeginLoad(loader, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out _, out _);
+        var outcome = c.Advance(loader, WorldReadyCoordinator.TitleScreenGameMode, true, true, Tid);
+        Check("advance_moved_under_title_consumes",
+            outcome.Kind == AdvanceOutcomeKind.Cancelled && outcome.Refusal == RefusalKind.TitleMode &&
+            outcome.PendingCleared && c.ObservationCount == 0 && c.PendingAttemptId == 0 &&
+            c.OwnedTerminalWithoutObservation == 1,
+            "kind=" + outcome.Kind + ", refusal=" + outcome.Refusal + ", observations=" +
+            c.ObservationCount + ", pending=" + c.PendingAttemptId);
+    }
+
+    /// <summary>
+    /// The real failure edge sets mode 9 (<c>selectGameScreen</c>) and returns false; the P.2 note said
+    /// "still mode 6". Both are consumed without an observation, but the reason must be <c>LoadFailed</c>.
+    /// </summary>
+    private static void AdvanceFalseUnderSelectGameFails()
+    {
+        var c = NewOwnershipCoordinator();
+        var loader = new TestLoader(false);
+        c.BeginLoad(loader, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out _, out _);
+        var outcome = c.Advance(loader, 9, false, false, Tid);
+        Check("advance_false_under_select_game_fails",
+            outcome.Kind == AdvanceOutcomeKind.Failed && outcome.Refusal == RefusalKind.LoadFailed &&
+            outcome.PendingCleared && c.ObservationCount == 0,
+            "kind=" + outcome.Kind + ", refusal=" + outcome.Refusal + ", observations=" +
+            c.ObservationCount);
+    }
+
+    /// <summary>
+    /// A new-game entry is not allowed to destroy a pending load attempt: new games stay UNKNOWN, so
+    /// the load attempt keeps its identity and can still finish.
+    /// </summary>
+    private static void NewGameEntryDoesNotClearLoadPending()
+    {
+        var c = NewOwnershipCoordinator();
+        var loader = new TestLoader(true, true);
+        c.BeginLoad(loader, WorldReadyCoordinator.LoadingGameMode, c.ResetEpoch, Tid, out var id, out _);
+        var entry = c.NoteLoadEntry(false, null, 2, Tid);
+        var preserved = c.PendingAttemptId == id;
+        var outcome = c.Advance(loader, WorldReadyCoordinator.PlayingGameMode, true, true, Tid);
+        Check("new_game_entry_does_not_clear_load_pending",
+            entry == LoadEntryObservation.NewGame && preserved && c.NewGameEntriesObserved == 1 &&
+            c.SupersededAttempts == 0 && outcome.Kind == AdvanceOutcomeKind.Completed &&
+            c.ObservationCount == 1,
+            "entry=" + entry + ", preserved=" + preserved + ", superseded=" + c.SupersededAttempts +
+            ", observations=" + c.ObservationCount);
     }
 
     private static void ColdStartAndNoStart()
@@ -1010,12 +1207,182 @@ internal static class Program
         SyntheticAdvanceWrongThread();
         SyntheticAdvanceMissingRejected();
         SyntheticAdvanceHookShapeRejected();
+        SyntheticCreationCases();
+    }
+
+    // -------------------------------------------------- section 2b: P.3 creation edge (executed)
+
+    private static void SyntheticCreationCases()
+    {
+        SyntheticCreationShape();
+        SyntheticCreationIdentityIsFactoryResult();
+        SyntheticCreationCompletesOnce();
+        SyntheticStaleEntryDoesNotSteal();
+        SyntheticCreationEdgeMissingRejected();
+    }
+
+    private static void SyntheticCreationShape()
+    {
+        var fixture = SyntheticFixture.Build("create-shape");
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type,
+            SyntheticFixture.SaveGameType);
+        var result = PrototypeInjector.Inject(targets, fixture.Hooks);
+        var verification = PrototypeInjector.Verify(targets, fixture.Hooks);
+        Check("synthetic_creation_shape",
+            result.LoaderCreationCalls == 1 && verification.Ok &&
+            verification.LoaderCreationCalls == 1 &&
+            verification.LoaderCreationIdentityFromFactory && verification.LoaderWriteIntact &&
+            verification.LoaderCreationSiteUnprotected && verification.LoaderCreationEpochFirst &&
+            result.LoaderCreationMaxStackBefore == 2 && result.LoaderCreationMaxStackAfter == 3,
+            "calls=" + verification.LoaderCreationCalls + ", fromFactory=" +
+            verification.LoaderCreationIdentityFromFactory + ", writeIntact=" +
+            verification.LoaderWriteIntact + ", epochFirst=" + verification.LoaderCreationEpochFirst +
+            ", unprotected=" + verification.LoaderCreationSiteUnprotected + ", maxstack=" +
+            result.LoaderCreationMaxStackBefore + "->" + result.LoaderCreationMaxStackAfter +
+            ", problems=" + string.Join("; ", verification.Problems));
+    }
+
+    /// <summary>
+    /// The identity the hook receives must be the object the creation call returned, not a value read
+    /// back from <c>currentLoader</c>.
+    /// </summary>
+    private static void SyntheticCreationIdentityIsFactoryResult()
+    {
+        var fixture = SyntheticFixture.Build("create-id");
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type,
+            SyntheticFixture.SaveGameType);
+        PrototypeInjector.Inject(targets, fixture.Hooks);
+        var assembly = Load(fixture, "create-id");
+
+        var sink = new RecordingSink();
+        PrototypeBridge.Install(sink);
+        try
+        {
+            SyntheticGate.NextLoaderScript = new[] { true, true };
+            InvokeCreation(assembly);
+            var identity = sink.LastCreationIdentity;
+            var stored = GetStatic<object>(assembly, "currentLoader");
+            Check("synthetic_creation_identity_is_factory_result",
+                sink.CreationCount == 1 && identity is not null &&
+                ReferenceEquals(identity, SyntheticGate.LastCreated) &&
+                ReferenceEquals(identity, stored) && sink.LastCreationGameMode == 6,
+                "calls=" + sink.CreationCount + ", isFactory=" +
+                ReferenceEquals(identity, SyntheticGate.LastCreated) + ", isStored=" +
+                ReferenceEquals(identity, stored) + ", mode=" + sink.LastCreationGameMode);
+        }
+        finally
+        {
+            PrototypeBridge.Install(null);
+        }
+    }
+
+    /// <summary>
+    /// Creation -> non-owning entry -> advance twice: exactly one observation, owned by the created
+    /// state machine, and a duplicate advance cannot produce a second one.
+    /// </summary>
+    private static void SyntheticCreationCompletesOnce()
+    {
+        var fixture = SyntheticFixture.Build("create-once");
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type,
+            SyntheticFixture.SaveGameType);
+        PrototypeInjector.Inject(targets, fixture.Hooks);
+        var assembly = Load(fixture, "create-once");
+
+        var coordinator = NewOwnershipCoordinator();
+        PrototypeBridge.Install(new CoordinatorSink(coordinator));
+        try
+        {
+            SyntheticGate.NextLoaderScript = new[] { true, true };
+            InvokeCreation(assembly);
+            var pending = coordinator.PendingAttemptId;
+            var created = coordinator.AttemptsCreated == 1 && pending != 0;
+
+            InvokeLoad(assembly, true);
+            var entryMatches = coordinator.LoadEntryIdentityMatches == 1;
+
+            SetStatic(assembly, "hasLoadedGame", true);
+            InvokeAdvance(assembly);
+            var stillPending = coordinator.PendingAttemptId == pending;
+
+            // The enumerator itself performs the success handoff by flipping the mode.
+            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.PlayingGameMode);
+            InvokeAdvance(assembly);
+            var observed = coordinator.ObservationCount;
+            InvokeAdvance(assembly);
+
+            Check("synthetic_creation_completes_once",
+                created && entryMatches && stillPending && observed == 1 &&
+                coordinator.ObservationCount == 1 &&
+                coordinator.Observations[0].AttemptOwnershipProven &&
+                coordinator.Observations[0].AttemptId == pending,
+                "created=" + created + ", entryMatches=" + entryMatches + ", stillPending=" +
+                stillPending + ", observations=" + coordinator.ObservationCount);
+        }
+        finally
+        {
+            PrototypeBridge.Install(null);
+        }
+    }
+
+    /// <summary>
+    /// The brief's counterexample, executed through the injected IL: A's delayed worker enters
+    /// <c>loadForNewGame(true)</c> after B already owns <c>currentLoader</c>. The entry may only be
+    /// recorded; B keeps the pending attempt and completes exactly once.
+    /// </summary>
+    private static void SyntheticStaleEntryDoesNotSteal()
+    {
+        var fixture = SyntheticFixture.Build("create-stale");
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type,
+            SyntheticFixture.SaveGameType);
+        PrototypeInjector.Inject(targets, fixture.Hooks);
+        var assembly = Load(fixture, "create-stale");
+
+        var coordinator = NewOwnershipCoordinator();
+        PrototypeBridge.Install(new CoordinatorSink(coordinator));
+        try
+        {
+            SyntheticGate.NextLoaderScript = new[] { true, true };
+            InvokeCreation(assembly);
+            var pendingB = coordinator.PendingAttemptId;
+
+            // A's entry: the same global loader, but A has no identity of its own.
+            InvokeLoad(assembly, true);
+            var stillB = coordinator.PendingAttemptId == pendingB;
+            var superseded = coordinator.SupersededAttempts;
+            var observationsBefore = coordinator.ObservationCount;
+
+            SetStatic(assembly, "hasLoadedGame", true);
+            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.PlayingGameMode);
+            InvokeAdvance(assembly);
+
+            Check("synthetic_stale_entry_does_not_steal",
+                stillB && superseded == 0 && observationsBefore == 0 &&
+                coordinator.ObservationCount == 1 &&
+                coordinator.Observations[0].AttemptId == pendingB &&
+                coordinator.LoadEntryIdentityMatches == 1,
+                "stillB=" + stillB + ", superseded=" + superseded + ", observations=" +
+                coordinator.ObservationCount + ", attempt=" +
+                (coordinator.ObservationCount == 1 ? coordinator.Observations[0].AttemptId : 0) + "/" +
+                pendingB);
+        }
+        finally
+        {
+            PrototypeBridge.Install(null);
+        }
+    }
+
+    private static void SyntheticCreationEdgeMissingRejected()
+    {
+        var fixture = SyntheticFixture.Build("create-missing", withCreation: false);
+        CheckThrows("synthetic_creation_edge_missing_rejected", () =>
+            PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type,
+                SyntheticFixture.SaveGameType));
     }
 
     private static void SyntheticAdvanceShape()
     {
         var fixture = SyntheticFixture.Build("adv-shape");
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         var result = PrototypeInjector.Inject(targets, fixture.Hooks);
         var verification = PrototypeInjector.Verify(targets, fixture.Hooks);
         Check("synthetic_advance_shape",
@@ -1036,7 +1403,7 @@ internal static class Program
     private static void SyntheticAdvanceCompletesOnce()
     {
         var fixture = SyntheticFixture.Build("adv-once");
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(targets, fixture.Hooks);
         var assembly = Load(fixture, "adv-once");
 
@@ -1045,11 +1412,9 @@ internal static class Program
         PrototypeBridge.Install(sink);
         try
         {
-            var loader = new TestLoader(true, true, true);
-            SetStatic(assembly, "currentLoader", loader);
-            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadingGameMode);
+            SyntheticGate.NextLoaderScript = new[] { true, true, true };
+            InvokeCreation(assembly);
             SetStatic(assembly, "hasLoadedGame", true);
-            InvokeLoad(assembly, true);
 
             var pending = coordinator.PendingAttemptId;
             InvokeAdvance(assembly);
@@ -1087,7 +1452,7 @@ internal static class Program
     private static void SyntheticAdvanceForeignIdentity()
     {
         var fixture = SyntheticFixture.Build("adv-foreign");
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(targets, fixture.Hooks);
         var assembly = Load(fixture, "adv-foreign");
 
@@ -1096,19 +1461,17 @@ internal static class Program
         PrototypeBridge.Install(sink);
         try
         {
-            var loaderA = new TestLoader(true, true, true);
-            SetStatic(assembly, "currentLoader", loaderA);
-            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadingGameMode);
+            SyntheticGate.NextLoaderScript = new[] { true, true, true };
+            InvokeCreation(assembly);
+            var loaderA = SyntheticGate.LastCreated;
             SetStatic(assembly, "hasLoadedGame", true);
-            InvokeLoad(assembly, true);
 
             InvokeReset(assembly);
 
-            var loaderB = new TestLoader(true, true, true);
-            SetStatic(assembly, "currentLoader", loaderB);
-            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadingGameMode);
+            SyntheticGate.NextLoaderScript = new[] { true, true, true };
+            InvokeCreation(assembly);
+            var loaderB = SyntheticGate.LastCreated;
             SetStatic(assembly, "hasLoadedGame", true);
-            InvokeLoad(assembly, true);
             var bId = coordinator.PendingAttemptId;
 
             // A's stale advance can only see the loading mode and A's own object.
@@ -1136,7 +1499,7 @@ internal static class Program
     private static void SyntheticAdvanceWrongThread()
     {
         var fixture = SyntheticFixture.Build("adv-thread");
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(targets, fixture.Hooks);
         var assembly = Load(fixture, "adv-thread");
 
@@ -1144,11 +1507,9 @@ internal static class Program
         PrototypeBridge.Install(new CoordinatorSink(coordinator));
         try
         {
-            var loader = new TestLoader(true, true, true);
-            SetStatic(assembly, "currentLoader", loader);
-            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadingGameMode);
+            SyntheticGate.NextLoaderScript = new[] { true, true, true };
+            InvokeCreation(assembly);
             SetStatic(assembly, "hasLoadedGame", true);
-            InvokeLoad(assembly, true);
             var pending = coordinator.PendingAttemptId;
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.PlayingGameMode);
 
@@ -1174,13 +1535,13 @@ internal static class Program
     {
         var fixture = SyntheticFixture.Build("adv-missing", withAdvance: false);
         CheckThrows("synthetic_advance_edge_missing_rejected", () =>
-            PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type));
+            PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType));
     }
 
     private static void SyntheticAdvanceHookShapeRejected()
     {
         var fixture = SyntheticFixture.Build("adv-hookshape");
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         var bad = new MethodReference(PrototypeInjector.AdvanceHookName, fixture.Module.TypeSystem.Void,
             fixture.AdvanceHook.DeclaringType)
         {
@@ -1188,7 +1549,8 @@ internal static class Program
         };
         bad.Parameters.Add(new ParameterDefinition(fixture.Module.TypeSystem.Object));
         var badHooks = new PrototypeHooks(fixture.ResetBeganHook, fixture.ResetCompletedHook,
-            fixture.GetResetEpochHook, fixture.StartHook, fixture.CompletionHook, bad);
+            fixture.GetResetEpochHook, fixture.StartHook, fixture.CompletionHook, bad,
+            fixture.LoadEnumeratorCreatedHook);
         CheckThrows("synthetic_advance_hook_shape_rejected", () =>
             PrototypeInjector.Inject(targets, badHooks));
     }
@@ -1196,7 +1558,7 @@ internal static class Program
     private static void SyntheticSuccess()
     {
         var fixture = SyntheticFixture.Build("ok");
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         var result = PrototypeInjector.Inject(targets, fixture.Hooks);
         var verification = PrototypeInjector.Verify(targets, fixture.Hooks);
         Check("synthetic_injection_shape",
@@ -1240,23 +1602,23 @@ internal static class Program
             PrototypeBridge.Install(null);
         }
 
-        // End-to-end: real hook IL -> bridge -> coordinator.
+        // End-to-end: real hook IL -> bridge -> coordinator. P.3: the attempt is registered at the
+        // creation boundary (SaveGame.LoadAfterPermissionCheck), not at loadForNewGame.
         var coordinator = NewCoordinator();
         var sink = new CoordinatorSink(coordinator);
         PrototypeBridge.Install(sink);
         try
         {
-            var loader = new TestLoader();
-            SetStatic(assembly, "currentLoader", loader);
-            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
-            InvokeLoad(assembly, true);
-            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.PlayingGameMode);
+            SyntheticGate.NextLoaderScript = new[] { true, false };
+            InvokeCreation(assembly);
             SetStatic(assembly, "hasLoadedGame", true);
-            InvokeDayStarted(assembly);
+            InvokeAdvance(assembly);
+            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.PlayingGameMode);
+            InvokeAdvance(assembly);
 
             Check("synthetic_end_to_end_one_observation",
                 coordinator.ObservationCount == 1 &&
-                coordinator.Observations[0].AttributionProven &&
+                coordinator.Observations[0].AttemptOwnershipProven &&
                 coordinator.Observations[0].Kind == AttemptKind.Load,
                 "observations=" + coordinator.ObservationCount + ", notes=" + string.Join("; ", sink.Notes));
         }
@@ -1269,7 +1631,7 @@ internal static class Program
     private static void SyntheticBranchToRet()
     {
         var fixture = SyntheticFixture.Build("branch", withFinally: false);
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(targets, fixture.Hooks);
         var verification = PrototypeInjector.Verify(targets, fixture.Hooks);
 
@@ -1311,7 +1673,7 @@ internal static class Program
     private static void SyntheticExceptionNoCompletion()
     {
         var fixture = SyntheticFixture.Build("throw", throws: true);
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(targets, fixture.Hooks);
 
         var assembly = Load(fixture, "throw");
@@ -1343,7 +1705,7 @@ internal static class Program
     {
         var fixture = SyntheticFixture.Build("missing-state", withState: false);
         CheckThrows("synthetic_missing_state_rejected", () =>
-            PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type));
+            PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType));
 
         var ambiguous = SyntheticFixture.Build("ambiguous");
         var second = new MethodDefinition("loadForNewGame",
@@ -1354,26 +1716,26 @@ internal static class Program
         second.Body.GetILProcessor().Emit(OpCodes.Ret);
         ambiguous.Game1.Methods.Add(second);
         CheckThrows("synthetic_ambiguous_overload_rejected", () =>
-            PrototypeInjector.Resolve(ambiguous.Module, SyntheticFixture.Game1Type));
+            PrototypeInjector.Resolve(ambiguous.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType));
 
         var retInTry = SyntheticFixture.Build("ret-in-try", retInsideTry: true);
-        var retInTryTargets = PrototypeInjector.Resolve(retInTry.Module, SyntheticFixture.Game1Type);
+        var retInTryTargets = PrototypeInjector.Resolve(retInTry.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         CheckThrows("synthetic_ret_in_try_rejected", () =>
             PrototypeInjector.Inject(retInTryTargets, retInTry.Hooks));
 
         var handlerOnly = SyntheticFixture.Build("handler-only", handlerOnlyRet: true);
-        var handlerTargets = PrototypeInjector.Resolve(handlerOnly.Module, SyntheticFixture.Game1Type);
+        var handlerTargets = PrototypeInjector.Resolve(handlerOnly.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         CheckThrows("synthetic_handler_only_ret_rejected", () =>
             PrototypeInjector.Inject(handlerTargets, handlerOnly.Hooks));
 
         var twice = SyntheticFixture.Build("twice");
-        var twiceTargets = PrototypeInjector.Resolve(twice.Module, SyntheticFixture.Game1Type);
+        var twiceTargets = PrototypeInjector.Resolve(twice.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(twiceTargets, twice.Hooks);
         CheckThrows("synthetic_double_inject_rejected", () =>
             PrototypeInjector.Inject(twiceTargets, twice.Hooks));
 
         var bypass = SyntheticFixture.Build("bypass", withFinally: false);
-        var bypassTargets = PrototypeInjector.Resolve(bypass.Module, SyntheticFixture.Game1Type);
+        var bypassTargets = PrototypeInjector.Resolve(bypass.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         var ret = bypass.OnDayStarted.Body.Instructions.Last();
         var bil = bypass.OnDayStarted.Body.GetILProcessor();
         bil.InsertBefore(ret, bil.Create(OpCodes.Call, bypass.CompletionHook));
@@ -1412,7 +1774,7 @@ internal static class Program
             CatchType = fixture.Module.ImportReference(typeof(Exception)),
         });
 
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(targets, fixture.Hooks);
         var eh = method.Body.ExceptionHandlers[0];
         var hookStart = ret.Previous!.Previous!.Previous!.Previous!;
@@ -1439,7 +1801,7 @@ internal static class Program
     private static void SyntheticStaleCompletionThroughHooks()
     {
         var fixture = SyntheticFixture.Build("stale");
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(targets, fixture.Hooks);
 
         var assembly = Load(fixture, "stale");
@@ -1447,33 +1809,39 @@ internal static class Program
         PrototypeBridge.Install(new CoordinatorSink(coordinator));
         try
         {
-            var loaderA = new TestLoader();
-            SetStatic(assembly, "currentLoader", loaderA);
-            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
-            InvokeLoad(assembly, true);
+            SyntheticGate.NextLoaderScript = new[] { true, true };
+            InvokeCreation(assembly);
+            var loaderA = SyntheticGate.LastCreated;
 
             coordinator.ResetWorld(Tid, "cancel A");
 
-            var loaderB = new TestLoader();
-            SetStatic(assembly, "currentLoader", loaderB);
-            InvokeLoad(assembly, true);
+            SyntheticGate.NextLoaderScript = new[] { true, true };
+            InvokeCreation(assembly);
+            var loaderB = SyntheticGate.LastCreated;
             var pendingB = coordinator.PendingAttemptId;
 
-            // A stale completion would read whatever is in currentLoader; make it read A's object.
+            // Legacy (LoaderIdentity) completion edge: A's late completion reads A's loader and is
+            // refused as stale, so B survives; B's own completion is then accepted by reference
+            // equality — which is exactly why the identity mode is required (P.2 §4.4).
             SetStatic(assembly, "currentLoader", loaderA);
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.PlayingGameMode);
             SetStatic(assembly, "hasLoadedGame", true);
             InvokeDayStarted(assembly);
             var preserved = coordinator.PendingAttemptId == pendingB;
+            var staleRefusals = coordinator.RefusalCount(RefusalKind.StaleLoaderEvidence);
 
             SetStatic(assembly, "currentLoader", loaderB);
             InvokeDayStarted(assembly);
 
             Check("synthetic_stale_completion_preserves_b",
-                preserved && coordinator.ObservationCount == 1 &&
-                coordinator.RefusalCount(RefusalKind.StaleLoaderEvidence) == 1,
+                preserved && staleRefusals == 1 && coordinator.ObservationCount == 1 &&
+                coordinator.Observations[0].AttemptId == pendingB &&
+                coordinator.Observations[0].AttemptOwnershipProven == false,
                 "preserved=" + preserved + ", observations=" + coordinator.ObservationCount +
-                ", staleRefusals=" + coordinator.RefusalCount(RefusalKind.StaleLoaderEvidence));
+                ", staleRefusals=" + staleRefusals + ", basis=" +
+                (coordinator.ObservationCount == 1
+                    ? coordinator.Observations[0].Basis.ToString()
+                    : "-"));
         }
         finally
         {
@@ -1485,7 +1853,7 @@ internal static class Program
     private static void SyntheticResetThroughHooks()
     {
         var fixture = SyntheticFixture.Build("reset-ok");
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(targets, fixture.Hooks);
         var assembly = Load(fixture, "reset-ok");
 
@@ -1494,11 +1862,9 @@ internal static class Program
         PrototypeBridge.Install(sink);
         try
         {
-            var loader = new TestLoader();
-            SetStatic(assembly, "currentLoader", loader);
-            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
+            SyntheticGate.NextLoaderScript = new[] { true, false };
+            InvokeCreation(assembly);
             SetStatic(assembly, "hasLoadedGame", true);
-            InvokeLoad(assembly, true);
 
             InvokeReset(assembly);
 
@@ -1520,17 +1886,15 @@ internal static class Program
                 ", hasLoadedGame=" + GetStatic<bool>(assembly, "hasLoadedGame"));
 
             // A start after the completed reset is accepted under the new epoch.
-            var loaderB = new TestLoader();
-            SetStatic(assembly, "currentLoader", loaderB);
-            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
-            InvokeLoad(assembly, true);
-            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.PlayingGameMode);
+            SyntheticGate.NextLoaderScript = new[] { true, false };
+            InvokeCreation(assembly);
             SetStatic(assembly, "hasLoadedGame", true);
-            InvokeDayStarted(assembly);
+            InvokeAdvance(assembly);
+            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.PlayingGameMode);
+            InvokeAdvance(assembly);
             Check("synthetic_epoch_read_before_mode",
                 coordinator.ObservationCount == 1 &&
-                coordinator.Observations[0].ResetEpoch == 1 &&
-                GetStatic<int>(assembly, "LoadCount") == 2,
+                coordinator.Observations[0].ResetEpoch == 1,
                 "observations=" + coordinator.ObservationCount +
                 ", observedEpoch=" + (coordinator.ObservationCount == 1
                     ? coordinator.Observations[0].ResetEpoch
@@ -1550,7 +1914,7 @@ internal static class Program
     private static void SyntheticStaleStartRace()
     {
         var fixture = SyntheticFixture.Build("reset-race");
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(targets, fixture.Hooks);
         var assembly = Load(fixture, "reset-race");
 
@@ -1564,8 +1928,10 @@ internal static class Program
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
             SetStatic(assembly, "hasLoadedGame", true);
 
-            // Worker reads the epoch (0) and blocks before the coordinator records the start.
-            var worker = new Thread(() => InvokeLoad(assembly, true));
+            // Worker creates the state machine, reads the epoch (0) and blocks before the coordinator
+            // records the start. P.3: the creation edge is where identity and epoch are bound.
+            sink.PauseOnCreation = true;
+            var worker = new Thread(() => InvokeCreation(assembly));
             worker.Start();
             if (!sink.Reached.Wait(TimeSpan.FromSeconds(30)))
             {
@@ -1577,18 +1943,17 @@ internal static class Program
             var epochAfterReset = coordinator.ResetEpoch;
             sink.Resume.Set();
             worker.Join(TimeSpan.FromSeconds(30));
+            sink.PauseOnCreation = false;
 
             var staleRefused = coordinator.RefusalCount(RefusalKind.ResetEpochChanged) == 1;
 
             // B starts under the new epoch and completes exactly once.
-            var loaderB = new TestLoader();
-            SetStatic(assembly, "currentLoader", loaderB);
-            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
-            InvokeLoad(assembly, true);
+            SyntheticGate.NextLoaderScript = new[] { true, false };
+            InvokeCreation(assembly);
             var bId = coordinator.PendingAttemptId;
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.PlayingGameMode);
             SetStatic(assembly, "hasLoadedGame", true);
-            InvokeDayStarted(assembly);
+            InvokeAdvance(assembly);
 
             var order = SignalPath(coordinator);
             Check("synthetic_stale_epoch_start_refused_e2e",
@@ -1614,7 +1979,7 @@ internal static class Program
     private static void SyntheticMidResetWindow()
     {
         var fixture = SyntheticFixture.Build("reset-window");
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(targets, fixture.Hooks);
         var assembly = Load(fixture, "reset-window");
 
@@ -1639,7 +2004,7 @@ internal static class Program
                 }
 
                 // Inside the window: epoch is current, the fields are the previous world's.
-                InvokeLoad(assembly, true);
+                InvokeCreation(assembly);
                 SyntheticGate.Release();
             });
             during.Start();
@@ -1652,13 +2017,11 @@ internal static class Program
             var noPendingInWindow = coordinator.PendingAttemptId == 0;
 
             // After the reset completed, a fresh start and completion are accepted exactly once.
-            var loaderB = new TestLoader();
-            SetStatic(assembly, "currentLoader", loaderB);
-            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
-            InvokeLoad(assembly, true);
+            SyntheticGate.NextLoaderScript = new[] { true, false };
+            InvokeCreation(assembly);
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.PlayingGameMode);
             SetStatic(assembly, "hasLoadedGame", true);
-            InvokeDayStarted(assembly);
+            InvokeAdvance(assembly);
 
             Check("synthetic_mid_reset_window_start_refused_e2e",
                 refusedInWindow && noPendingInWindow && coordinator.ObservationCount == 1 &&
@@ -1684,7 +2047,7 @@ internal static class Program
     private static void SyntheticLateCompletionReadsBLoader()
     {
         var fixture = SyntheticFixture.Build("reset-late");
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(targets, fixture.Hooks);
         var assembly = Load(fixture, "reset-late");
 
@@ -1692,20 +2055,21 @@ internal static class Program
         PrototypeBridge.Install(new CoordinatorSink(coordinator));
         try
         {
-            var loaderA = new TestLoader();
-            SetStatic(assembly, "currentLoader", loaderA);
-            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
-            InvokeLoad(assembly, true);
+            SyntheticGate.NextLoaderScript = new[] { true, true };
+            InvokeCreation(assembly);
+            var loaderA = SyntheticGate.LastCreated;
 
             InvokeReset(assembly);
 
-            var loaderB = new TestLoader();
-            SetStatic(assembly, "currentLoader", loaderB);
-            SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
-            InvokeLoad(assembly, true);
+            SyntheticGate.NextLoaderScript = new[] { true, true };
+            InvokeCreation(assembly);
+            var loaderB = SyntheticGate.LastCreated;
             var bId = coordinator.PendingAttemptId;
 
-            // A's delayed completion runs now; the completion edge reads currentLoader == L_B.
+            // A's delayed completion runs now; the legacy edge reads currentLoader == L_B and accepts
+            // it as B's success purely by reference equality. That is the P.1 counterexample: the
+            // attempt id and thread come from B's registration, not from A's signal.
+            SetStatic(assembly, "currentLoader", loaderB);
             SetStatic(assembly, "_gameMode", (byte)WorldReadyCoordinator.PlayingGameMode);
             SetStatic(assembly, "hasLoadedGame", true);
             InvokeDayStarted(assembly);
@@ -1735,12 +2099,12 @@ internal static class Program
     private static void SyntheticResetExceptionLeavesLatch()
     {
         var throwing = SyntheticFixture.Build("reset-throws", resetShape: ResetShape.ThrowsBeforeCleanup);
-        var throwingTargets = PrototypeInjector.Resolve(throwing.Module, SyntheticFixture.Game1Type);
+        var throwingTargets = PrototypeInjector.Resolve(throwing.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(throwingTargets, throwing.Hooks);
         var throwingAssembly = Load(throwing, "reset-throws");
 
         var normal = SyntheticFixture.Build("reset-heal");
-        var normalTargets = PrototypeInjector.Resolve(normal.Module, SyntheticFixture.Game1Type);
+        var normalTargets = PrototypeInjector.Resolve(normal.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(normalTargets, normal.Hooks);
         var normalAssembly = Load(normal, "reset-heal");
 
@@ -1765,17 +2129,15 @@ internal static class Program
 
             var latchStuck = coordinator.ResetInProgress && coordinator.CompletedResetCount == 0;
 
-            // A start while the latch is stuck is refused.
-            InvokeLoad(throwingAssembly, true);
+            // A start while the latch is stuck is refused. P.3: the start edge is the creation boundary.
+            InvokeCreation(throwingAssembly);
             var startRefused = coordinator.RefusalCount(RefusalKind.ResetInProgress) == 1;
 
             // A later reset that does reach its normal return heals the latch.
             InvokeReset(normalAssembly);
             var healed = !coordinator.ResetInProgress;
 
-            SetStatic(throwingAssembly, "currentLoader", new TestLoader());
-            SetStatic(throwingAssembly, "_gameMode", (byte)WorldReadyCoordinator.LoadScreenGameMode);
-            InvokeLoad(throwingAssembly, true);
+            InvokeCreation(throwingAssembly);
             var startAccepted = coordinator.PendingAttemptId != 0;
 
             Check("synthetic_reset_exception_leaves_latch",
@@ -1793,18 +2155,18 @@ internal static class Program
     private static void SyntheticResetShapeRejections()
     {
         var retInTry = SyntheticFixture.Build("reset-ret-try", resetShape: ResetShape.RetInsideTry);
-        var retInTryTargets = PrototypeInjector.Resolve(retInTry.Module, SyntheticFixture.Game1Type);
+        var retInTryTargets = PrototypeInjector.Resolve(retInTry.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         CheckThrows("synthetic_reset_ret_in_try_rejected", () =>
             PrototypeInjector.Inject(retInTryTargets, retInTry.Hooks));
 
         var handlerOnly = SyntheticFixture.Build("reset-handler-only",
             resetShape: ResetShape.HandlerOnlyRet);
-        var handlerOnlyTargets = PrototypeInjector.Resolve(handlerOnly.Module, SyntheticFixture.Game1Type);
+        var handlerOnlyTargets = PrototypeInjector.Resolve(handlerOnly.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         CheckThrows("synthetic_reset_handler_only_ret_rejected", () =>
             PrototypeInjector.Inject(handlerOnlyTargets, handlerOnly.Hooks));
 
         var withFinally = SyntheticFixture.Build("reset-finally", resetShape: ResetShape.WithFinally);
-        var withFinallyTargets = PrototypeInjector.Resolve(withFinally.Module, SyntheticFixture.Game1Type);
+        var withFinallyTargets = PrototypeInjector.Resolve(withFinally.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         var result = PrototypeInjector.Inject(withFinallyTargets, withFinally.Hooks);
         var verification = PrototypeInjector.Verify(withFinallyTargets, withFinally.Hooks);
         Check("synthetic_reset_with_finally_accepted",
@@ -1822,7 +2184,7 @@ internal static class Program
     private static void SyntheticEpochOrderRegression()
     {
         var fixture = SyntheticFixture.Build("epoch-order", withFinally: false);
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(targets, fixture.Hooks);
 
         // Rewrite the start sequence as: get_gameMode, ldarg, GetResetEpoch, currentLoader, call.
@@ -1863,7 +2225,7 @@ internal static class Program
     private static void SyntheticResetEHEndBoundary()
     {
         var fixture = SyntheticFixture.Build("reset-eh-end", resetShape: ResetShape.HandlerEndsAtRet);
-        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type);
+        var targets = PrototypeInjector.Resolve(fixture.Module, SyntheticFixture.Game1Type, SyntheticFixture.SaveGameType);
         PrototypeInjector.Inject(targets, fixture.Hooks);
         var eh = fixture.ResetGameStateOnTitleScreen.Body.ExceptionHandlers[0];
         var ret = fixture.ResetGameStateOnTitleScreen.Body.Instructions.Last();
@@ -1946,6 +2308,17 @@ internal static class Program
                          BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance)
                      ?? throw new InvalidOperationException("UpdateTitleScreenDuringLoadingMode missing");
         method.Invoke(instance, null);
+    }
+
+    /// <summary>Invokes the injected attempt-creation edge (<c>SaveGame.LoadAfterPermissionCheck</c>).</summary>
+    private static void InvokeCreation(Assembly assembly)
+    {
+        var type = assembly.GetType(SyntheticFixture.SaveGameType)
+                   ?? throw new InvalidOperationException("synthetic SaveGame missing");
+        var method = type.GetMethod(PrototypeInjector.LoaderCreationMethodName,
+                         BindingFlags.Public | BindingFlags.Static)
+                     ?? throw new InvalidOperationException("LoadAfterPermissionCheck missing");
+        method.Invoke(null, null);
     }
 
     private static void SetStatic(Assembly assembly, string fieldName, object? value)
@@ -2033,6 +2406,22 @@ internal static class Program
             LoadingThreadId = threadId;
         }
 
+        public int CreationCount;
+        public long LastCreationEpoch = -1;
+        public int LastCreationGameMode = -1;
+        public object? LastCreationIdentity;
+        public int CreationThreadId;
+
+        public void OnLoadEnumeratorCreated(long resetEpoch, int gameMode, object identity,
+            int threadId)
+        {
+            CreationCount++;
+            LastCreationEpoch = resetEpoch;
+            LastCreationGameMode = gameMode;
+            LastCreationIdentity = identity;
+            CreationThreadId = threadId;
+        }
+
         public void OnDayCompleted(int gameMode, bool hasLoadedGame, object? loader, int threadId)
         {
             CompletedCount++;
@@ -2071,6 +2460,9 @@ internal static class Program
         public readonly ManualResetEventSlim Reached = new ManualResetEventSlim(false);
         public readonly ManualResetEventSlim Resume = new ManualResetEventSlim(false);
 
+        /// <summary>P.3: pause inside the creation edge instead of the loadForNewGame entry.</summary>
+        public bool PauseOnCreation;
+
         public PausingSink(WorldReadyCoordinator coordinator)
         {
             _inner = new CoordinatorSink(coordinator);
@@ -2106,6 +2498,21 @@ internal static class Program
         public void OnDayCompleted(int gameMode, bool hasLoadedGame, object? loader, int threadId)
         {
             _inner.OnDayCompleted(gameMode, hasLoadedGame, loader, threadId);
+        }
+
+        public void OnLoadEnumeratorCreated(long resetEpoch, int gameMode, object identity,
+            int threadId)
+        {
+            if (PauseOnCreation)
+            {
+                Reached.Set();
+                if (!Resume.Wait(TimeSpan.FromSeconds(30)))
+                {
+                    throw new TimeoutException("creation-start race gate was never released");
+                }
+            }
+
+            _inner.OnLoadEnumeratorCreated(resetEpoch, gameMode, identity, threadId);
         }
 
         public void OnLoadAdvanced(object? loader, int gameMode, bool moved, bool hasLoadedGame,

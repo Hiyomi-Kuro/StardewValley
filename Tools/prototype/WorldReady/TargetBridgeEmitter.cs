@@ -57,6 +57,13 @@ public static class TargetBridgeEmitter
             AddField(type, "LastAdvanceHasLoadedGame", module.TypeSystem.Boolean);
         var lastAdvanceLoaderWasNull =
             AddField(type, "LastAdvanceLoaderWasNull", module.TypeSystem.Boolean);
+        var loadEnumeratorCreatedCalls =
+            AddField(type, "LoadEnumeratorCreatedCalls", module.TypeSystem.Int32);
+        var lastCreationResetEpoch =
+            AddField(type, "LastCreationResetEpoch", module.TypeSystem.Int64);
+        var lastCreationGameMode = AddField(type, "LastCreationGameMode", module.TypeSystem.Int32);
+        var lastCreationLoaderWasNull =
+            AddField(type, "LastCreationLoaderWasNull", module.TypeSystem.Boolean);
 
         // void ResetBegan(): ResetBeganCalls++; EpochCounter++;
         var resetBegan = NewStaticVoid(module, type, PrototypeInjector.ResetEntryHookName);
@@ -142,8 +149,26 @@ public static class TargetBridgeEmitter
         EmitNullCheck(advanceIl, lastAdvanceLoaderWasNull, 0);
         advanceIl.Emit(OpCodes.Ret);
 
+        // void LoadEnumeratorCreated(long resetEpoch, int gameMode, object identity)
+        var loadEnumeratorCreated = NewStaticVoid(module, type,
+            PrototypeInjector.LoaderCreationHookName);
+        loadEnumeratorCreated.Parameters.Add(new ParameterDefinition("resetEpoch",
+            ParameterAttributes.None, module.TypeSystem.Int64));
+        loadEnumeratorCreated.Parameters.Add(new ParameterDefinition("gameMode",
+            ParameterAttributes.None, module.TypeSystem.Int32));
+        loadEnumeratorCreated.Parameters.Add(new ParameterDefinition("identity",
+            ParameterAttributes.None, module.TypeSystem.Object));
+        var creationIl = loadEnumeratorCreated.Body.GetILProcessor();
+        EmitIntIncrement(creationIl, loadEnumeratorCreatedCalls);
+        creationIl.Emit(OpCodes.Ldarg_0);
+        creationIl.Emit(OpCodes.Stsfld, lastCreationResetEpoch);
+        creationIl.Emit(OpCodes.Ldarg_1);
+        creationIl.Emit(OpCodes.Stsfld, lastCreationGameMode);
+        EmitNullCheck(creationIl, lastCreationLoaderWasNull, 2);
+        creationIl.Emit(OpCodes.Ret);
+
         return new PrototypeHooks(resetBegan, resetCompleted, getEpoch, worldLoading, dayCompleted,
-            loadAdvanced);
+            loadAdvanced, loadEnumeratorCreated);
     }
 
     private static MethodDefinition NewStaticVoid(ModuleDefinition module, TypeDefinition type, string name)

@@ -14,6 +14,14 @@ public interface IWorldReadySink
 
     void OnWorldLoading(long resetEpoch, bool loadedGame, int gameMode, object? loader, int threadId);
 
+    /// <summary>
+    /// P.3 start edge: <c>SaveGame.LoadAfterPermissionCheck</c> created a load state machine and is
+    /// about to store it in <c>Game1.currentLoader</c>. <paramref name="identity"/> is the object
+    /// returned by <c>getLoadEnumerator</c>; <paramref name="resetEpoch"/> is read at that same
+    /// boundary, before the store, and <paramref name="gameMode"/> is the mode observed there.
+    /// </summary>
+    void OnLoadEnumeratorCreated(long resetEpoch, int gameMode, object identity, int threadId);
+
     void OnDayCompleted(int gameMode, bool hasLoadedGame, object? loader, int threadId);
 
     /// <summary>
@@ -75,6 +83,17 @@ public static class PrototypeBridge
     {
         var sink = Volatile.Read(ref _sink);
         sink?.OnWorldLoading(resetEpoch, loadedGame, gameMode, loader,
+            Environment.CurrentManagedThreadId);
+    }
+
+    /// <summary>
+    /// Injected between <c>SaveGame.getLoadEnumerator</c> and the <c>stsfld Game1.currentLoader</c>
+    /// that stores its result. <paramref name="identity"/> is the created state machine itself.
+    /// </summary>
+    public static void LoadEnumeratorCreated(long resetEpoch, int gameMode, object identity)
+    {
+        var sink = Volatile.Read(ref _sink);
+        sink?.OnLoadEnumeratorCreated(resetEpoch, gameMode, identity,
             Environment.CurrentManagedThreadId);
     }
 
@@ -157,18 +176,34 @@ public sealed class CoordinatorSink : IWorldReadySink
     public void OnWorldLoading(long resetEpoch, bool loadedGame, int gameMode, object? loader,
         int threadId)
     {
-        // P.2: a real load attempt registers the load state machine itself as the attempt identity, so
-        // the completion edge can prove ownership. A new game has no such object and keeps the
-        // identity-unproven path (its ownership stays UNKNOWN on purpose).
-        var begun = loadedGame && loader is not null
-            ? _coordinator.BeginLoad(loader, gameMode, resetEpoch, threadId, out _, out var refusal)
-            : _coordinator.TryBeginAttempt(loadedGame, gameMode, loader, threadId, resetEpoch, out _,
-                out refusal);
-
-        if (!begun)
+        // P.3: this edge is non-owning. The closure that calls loadForNewGame(bool) is the cached
+        // static SaveGame/<>c::<getLoadEnumerator>b__123_2, which holds no reference to the
+        // <getLoadEnumerator>d__123 state machine, so reading Game1.currentLoader here would let a
+        // delayed attempt claim whichever attempt owns the field at that moment. It is recorded and
+        // never allowed to create, supersede, consume or cancel an attempt.
+        var observation = _coordinator.NoteLoadEntry(loadedGame, loader, gameMode, threadId);
+        if (observation == LoadEntryObservation.MatchesPending ||
+            observation == LoadEntryObservation.NewGame)
         {
-            Note("start refused: " + refusal + " (loadedGame=" + loadedGame + ", gameMode=" +
-                 gameMode + ", epoch=" + resetEpoch + ", thread=" + threadId + ")");
+            return;
+        }
+
+        Note("load entry " + observation + ": loadedGame=" + loadedGame + ", gameMode=" + gameMode +
+             ", thread=" + threadId + " (pending preserved: " +
+             _coordinator.PendingAttemptId + ")");
+    }
+
+    /// <summary>
+    /// P.3 start edge: the state machine was just created by <c>getLoadEnumerator</c> and is about to
+    /// be stored in <c>Game1.currentLoader</c>. Identity and epoch are bound here, at the boundary
+    /// that produced the object.
+    /// </summary>
+    public void OnLoadEnumeratorCreated(long resetEpoch, int gameMode, object identity, int threadId)
+    {
+        if (!_coordinator.BeginLoad(identity, gameMode, resetEpoch, threadId, out _, out var refusal))
+        {
+            Note("load state machine refused: " + refusal + " (epoch=" + resetEpoch + ", gameMode=" +
+                 gameMode + ", thread=" + threadId + ")");
         }
     }
 
